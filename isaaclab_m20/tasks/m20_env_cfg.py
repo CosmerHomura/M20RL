@@ -80,14 +80,38 @@ class ObservationsCfg:
 
 @configclass
 class RewardsCfg:
-    flat_orientation = RewardTermCfg(func=rewards.flat_orientation, weight=2.0)
+    """Standard legged-locomotion reward set with a zero velocity command.
+
+    Weights follow legged_gym (Rudin et al.) and IsaacLab's AnymalC task; see
+    docs/algorithm.md for the table and the reasoning behind each term.
+    """
+
+    # -- task: exp tracking kernels evaluated at a zero command ---------------
+    track_lin_vel_xy = RewardTermCfg(
+        func=rewards.track_lin_vel_xy_zero, weight=1.5, params={"sigma": 0.25})
+    track_ang_vel_z = RewardTermCfg(
+        func=rewards.track_ang_vel_z_zero, weight=0.75, params={"sigma": 0.25})
+
+    # -- base stability -------------------------------------------------------
+    lin_vel_z = RewardTermCfg(func=rewards.lin_vel_z_l2, weight=-2.0)
+    ang_vel_xy = RewardTermCfg(func=rewards.ang_vel_xy_l2, weight=-0.05)
+    flat_orientation = RewardTermCfg(func=rewards.flat_orientation_l2, weight=-2.5)
     base_height = RewardTermCfg(
-        func=rewards.base_height, weight=2.0,
-        params={"target_height": 0.50, "sigma": 20.0})
-    base_motion = RewardTermCfg(func=rewards.base_motion, weight=1.0)
-    joint_torques = RewardTermCfg(func=rewards.joint_torques, weight=1e-5)
-    action_rate = RewardTermCfg(func=rewards.action_rate, weight=0.01)
-    alive = RewardTermCfg(func=mdp.is_alive, weight=0.2)
+        func=rewards.base_height_l2, weight=-20.0, params={"target_height": 0.50})
+
+    # -- posture and smoothness ----------------------------------------------
+    joint_deviation = RewardTermCfg(func=rewards.joint_deviation_l1, weight=-0.5)
+    joint_vel = RewardTermCfg(func=rewards.joint_vel_l2, weight=-1e-4)
+    joint_acc = RewardTermCfg(func=rewards.joint_acc_l2, weight=-2.5e-7)
+    joint_torques = RewardTermCfg(func=rewards.joint_torques_l2, weight=-1e-5)
+    action_rate = RewardTermCfg(func=rewards.action_rate_l2, weight=-0.01)
+
+    # -- survival -------------------------------------------------------------
+    # The large negative termination term is what stops the policy from learning
+    # to fall over: without it, ending the episode early avoids the per-step
+    # smoothness/torque penalties and is the cheaper option.
+    termination_penalty = RewardTermCfg(func=mdp.is_terminated, weight=-200.0)
+    alive = RewardTermCfg(func=mdp.is_alive, weight=0.15)
 
 
 @configclass

@@ -8,24 +8,33 @@
 
 ## 1. 奖励函数
 
-每个环境每步的即时奖励是 6 个分项加权求和。所有分项在 `rewards.py` 里实现，权重在 `m20_env_cfg.py` 的 `RewardsCfg` 里给。
+采用 legged_gym（Rudin et al., *Learning to Walk in Minutes*）与 IsaacLab `AnymalC` 任务的标准奖励集，把速度指令固定为零，即"站稳"。
 
 | 分项 | 权重 | 公式 | 含义 |
 | --- | --- | --- | --- |
-| `flat_orientation` | 2.0 | `-(gx² + gy²)` | 机身保持水平（`g` 是重力在机体系下的投影，水平时 gx=gy=0） |
-| `base_height` | 2.0 | `exp(-20·(h − 0.50)²)` | 基座高度接近 0.50 m（σ=20，偏离越大惩罚越陡） |
-| `base_motion` | 1.0 | `-(Σ lin² + Σ ang²)` | 禁止漂移：机身线速度、角速度平方和越小越好 |
-| `joint_torques` | 1e-5 | `-Σ τ²` | 省力矩（权重极低，避免和重力补偿打架） |
-| `action_rate` | 0.01 | `-Σ (aₜ − aₜ₋₁)²` | 动作平滑，抑制抖振 |
-| `alive` | 0.2 | `+1` | 存活奖励（只要没触发终止就 +0.2） |
+| `track_lin_vel_xy` | **+1.5** | `exp(-‖v_xy‖² / 0.25)` | 线速度跟踪核，指令为 0 → 越静止越接近 1 |
+| `track_ang_vel_z` | **+0.75** | `exp(-ω_z² / 0.25)` | 偏航角速度跟踪核，指令为 0 |
+| `lin_vel_z` | −2.0 | `-v_z²` | 禁止上下颠簸 |
+| `ang_vel_xy` | −0.05 | `-Σ ω_xy²` | 禁止翻滚/俯仰角速度 |
+| `flat_orientation` | −2.5 | `-(gx² + gy²)` | 机身水平（`g` 为重力在机体系的投影） |
+| `base_height` | **−20.0** | `-(h − 0.50)²` | 基座高度二次惩罚（论文用的是二次型，不是 exp 奖励） |
+| `joint_deviation` | −0.5 | `-Σ abs(q − q_default)` | 关节偏离默认站立姿态（legged_gym 的 `stand_still`） |
+| `joint_vel` | −1e-4 | `-Σ q̇²` | 关节速度正则 |
+| `joint_acc` | −2.5e-7 | `-Σ q̈²` | 关节加速度正则，抑制高频抖动 |
+| `joint_torques` | −1e-5 | `-Σ τ²` | 省力矩 |
+| `action_rate` | −0.01 | `-Σ(aₜ − aₜ₋₁)²` | 动作平滑 |
+| `termination_penalty` | **−200** | `-1[非超时终止]` | 摔倒的重大惩罚 |
+| `alive` | +0.15 | `+1` | 存活奖励 |
 
-**设计意图**：核心是 `base_height` + `flat_orientation`（撑住不倒、别趴下），`base_motion` 防止它靠滑行/乱动刷存活。`joint_torques` 和 `action_rate` 是正则项，权重刻意压得很低——直驱力矩下 PPO 要学重力补偿，罚太重会鼓励它"不发力"从而直接塌掉。
+**`termination_penalty` 是最关键的一项**。缺少它时，摔倒的代价接近零，而 `action_rate` / `joint_torques` 等正则项是每步累积的——于是"尽快摔倒结束回合"反而收益更高，策略会主动学怎么更快结束（表现为 episode length 持续下降）。论文里这一项通常是 −200 到 −400。
+
+**`base_height` 必须是二次惩罚**：`-20·(h−h*)²`。换成 `exp` 奖励形式时，远离目标高度的区域梯度几乎为零，等于没有推力。
 
 **终止条件**（触发即本回合结束、重置）：
 
 - `base_height`：基座高度 < 0.25 m（趴下）
 - `bad_orientation`：倾角 > 0.7 rad（翻倒）
-- `time_out`：满 10 s（50 Hz × 200 步）
+- `time_out`：满 10 s（50 Hz × 200 步），**超时不触发 `termination_penalty`**
 
 ## 2. 网络设计
 
