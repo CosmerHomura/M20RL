@@ -1,86 +1,67 @@
-# M20 PPO Gait Training
+# M20 轮足机器人速度跟踪（Isaac Lab + rsl_rl）
 
-在 MuJoCo 中用 stable-baselines3 的 PPO 训练 M20 轮足机器人追踪速度指令 `(vx, vy, yaw_rate)`。
+用 Isaac Lab 的 ManagerBasedRLEnv 训练 M20 轮足机器人原地站稳（静态站立），PPO 端到端输出关节力矩（无 PD），后端是 rsl_rl，GPU 上可并行 4096 个环境。
 
-- 设计文档：`docs/superpowers/specs/2026-11-06-m20-ppo-gait-training-design.md`
-- 实现计划：`docs/superpowers/plans/2026-11-06-m20-ppo-gait-training.md`
-- 性能基准：`docs/benchmark.md`
-- 云端（Linux/GPU）部署：`docs/cloud.md`
+详细安装与排错见 [docs/isaaclab_setup.md](docs/isaaclab_setup.md)，奖励函数/网络结构/PPO 更新流程见 [docs/algorithm.md](docs/algorithm.md)。
 
-## 环境与动作
+## 环境要求
 
-- 控制频率 50 Hz（`sim_dt=0.002`，10 个子步），每回合上限 500 步（10 s）。
-- 观测 60 维：机身系线速度 3 + 角速度 3 + 重力投影 3 + 指令 3 + 关节角 16 + 关节速度 16 + 上一拍动作 16。
-- 动作 16 维 ∈ [-1, 1]，顺序 `fl, fr, hl, hr × (hipx, hipy, knee, wheel)`：
-  - 腿部：目标角偏移，`q_target = q_default + a × 0.4 rad`，内部 PD（kp=100、kd=5，500 Hz）跟踪后饱和到 ±76.4 N·m。
-  - 轮部：直接力矩 `a × 21.6 N·m`。
-- 奖励：前向/侧向/偏航追踪、机身水平、高度、省力、动作平滑、零指令静止，外加存活奖励。
-- 终止：高度 < 0.25 m、俯仰/横滚 > 0.7 rad、机身碰撞体触地。
+- Isaac Sim 5.1 + IsaacLab 2.3.2（Python 3.11，driver ≥ 580）
+- rl 后端：`pip install "isaaclab[rsl-rl]" --extra-index-url https://pypi.nvidia.com`
+- 首次启动前 `export OMNI_KIT_ACCEPT_EULA=YES`
+
+## 目录
+
+```text
+model/
+├── urdf/              # 官方 URDF（训练资产由它导入生成）
+├── M20_urdf.usd       # 生成的训练 USD（不进 git）
+├── usd/               # 官方 USD（组合层，需要完整的 configuration/ 子层）
+└── M20.xml + meshes/  # 官方 MJCF（备用）
+isaaclab_m20/
+├── assets/m20.py      # ArticulationCfg：USD、初始姿态、PD 增益
+├── tasks/             # 场景/观测/动作/指令/奖励 + gym 注册
+└── scripts/
+    ├── check_m20.py   # 加载 USD，打印关节/质量，验证资产
+    ├── train.py
+    └── play.py
+```
 
 ## 快速开始
 
-```bash
-python -m venv .venv
-.venv/Scripts/python.exe -m pip install -r requirements.txt
-.venv/Scripts/python.exe -m pytest -q
-```
-
-脚本必须以模块方式运行（`python -m scripts.xxx`），否则 `import m20rl` 会失败。
-
-### 检查环境（M0）
+仓库根目录执行（脚本是模块入口，不能 `cd` 进 `scripts/`）：
 
 ```bash
-.venv/Scripts/python.exe -m scripts.check_env
+# 1. 从官方 URDF 导入一次训练 USD，然后验证（16 个关节、总质量 ≈38.5 kg）
+python -m isaaclab_m20.scripts.check_m20 --headless --convert urdf
+
+# 2. 训练（静态站立）
+python -m isaaclab_m20.scripts.train --headless --num_envs 4096
+
+# 3. 播放（加载最新 checkpoint，16 个环境）
+python -m isaaclab_m20.scripts.play --num_envs 16
+
+# 4. 无界面录视频
+python -m isaaclab_m20.scripts.play --num_envs 16 --headless --video
+
+# 5. 曲线
+tensorboard --logdir logs/rsl_rl --bind_all --port 6006
 ```
 
-打开 MuJoCo viewer，用随机动作观察模型、默认站姿与关节正负号。
+## 控制与观测
 
-### 训练
+- 物理 200 Hz（`sim.dt=0.005`），策略 50 Hz（`decimation=4`），回合 10 s。
+- **静态站立任务**：没有速度指令，目标就是原地站稳、保持高度、机身水平、不漂移。
+- 观测 57 维：机身线速度 3 + 角速度 3 + 重力投影 3 + 关节角 16 + 关节速度 16 + 上一拍动作 16。
+- 动作 16 维 ∈ [-1, 1]，**直接力矩控制（无 PD）**：腿 12 维 × 76.4 N·m、轮 4 维 × 21.6 N·m，PPO 端到端学重力补偿。
+- 奖励：机身水平、高度（0.50 m）、禁止漂移、省力矩、动作平滑、存活。
+- 终止：高度 < 0.25 m、倾角 > 0.7 rad、超时。
 
-```bash
-# M1：只追前向速度
-.venv/Scripts/python.exe -m scripts.train --reward-mode forward_only --total-timesteps 5000000 --run-name m1_forward
+## 调参入口
 
-# M2：完整速度指令追踪
-.venv/Scripts/python.exe -m scripts.train --reward-mode full --total-timesteps 20000000 --run-name m2_full
-```
-
-常用参数：`--n-envs`、`--device`、`--seed`、`--no-eval`、`--log-root`。
-输出目录 `logs/<run-name>/` 含 `tb/`（TensorBoard）、`checkpoints/`、`best_model/`、`final_model.zip`、`final_vecnormalize.pkl`。
-
-```bash
-.venv/Scripts/python.exe -m tensorboard.main --logdir logs/m1_forward/tb
-```
-
-### 回放与录像
-
-```bash
-# 实时可视化
-.venv/Scripts/python.exe -m scripts.play --model logs/m1_forward/final_model \
-    --vecnormalize logs/m1_forward/final_vecnormalize.pkl --command 0.4 0 0
-
-# 录视频（需要 imageio-ffmpeg）
-.venv/Scripts/python.exe -m scripts.play --model logs/m1_forward/final_model \
-    --vecnormalize logs/m1_forward/final_vecnormalize.pkl --command 0.4 0 0 \
-    --video logs/m1_forward/rollout.mp4
-```
-
-`--command VX VY YAW` 在该次回放中固定不变。**必须复用训练时的 `final_vecnormalize.pkl`**，否则观测分布不一致，策略会失效。
-
-### 训练时实时观看
-
-训练环境跑在子进程里，viewer 挂不上去。另开一个终端，用 `watch.py` 盯着 run 目录，它会自动加载最新的 checkpoint（每 100k 步一次）在 viewer 里跑：
-
-```bash
-.venv/Scripts/python.exe -m scripts.watch --run logs/m2_full
-# 每回合随机指令：
-.venv/Scripts/python.exe -m scripts.watch --run logs/m2_full --random-commands
-```
-
-### 性能基准
-
-```bash
-.venv/Scripts/python.exe -m scripts.benchmark --steps 1000 --out docs/benchmark.md
-```
-
-本机（12 逻辑核，CPU-only torch）实测：10 环境约 4100–4500 env-steps/s，训练约 800–2000 train-steps/s。GPU 不会有帮助——MuJoCo 在 CPU 上仿真，策略网络很小，传输开销大于计算收益。
+| 想改的东西 | 文件 |
+| --- | --- |
+| 奖励权重、指令范围、终止条件 | `isaaclab_m20/tasks/m20_env_cfg.py` |
+| 奖励函数 | `isaaclab_m20/tasks/rewards.py` |
+| PPO 超参 | `isaaclab_m20/tasks/agents/rsl_rl_ppo_cfg.py` |
+| PD 增益、力矩上限、默认姿态 | `isaaclab_m20/assets/m20.py` |

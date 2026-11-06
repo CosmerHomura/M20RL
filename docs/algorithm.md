@@ -1,0 +1,78 @@
+# 训练算法设计（静态站立）
+
+本文说明当前静态站立任务的奖励函数、策略/价值网络结构，以及 PPO 一整个迭代里「采集 → 计算优势 → 更新网络」的完整流程。配置入口见 `isaaclab_m20/tasks/`：
+
+- 奖励权重与观测/动作：`tasks/m20_env_cfg.py`
+- 奖励公式：`tasks/rewards.py`
+- 网络与 PPO 超参：`tasks/agents/rsl_rl_ppo_cfg.py`
+
+## 1. 奖励函数
+
+每个环境每步的即时奖励是 6 个分项加权求和。所有分项在 `rewards.py` 里实现，权重在 `m20_env_cfg.py` 的 `RewardsCfg` 里给。
+
+| 分项 | 权重 | 公式 | 含义 |
+| --- | --- | --- | --- |
+| `flat_orientation` | 2.0 | `-(gx² + gy²)` | 机身保持水平（`g` 是重力在机体系下的投影，水平时 gx=gy=0） |
+| `base_height` | 2.0 | `exp(-20·(h − 0.50)²)` | 基座高度接近 0.50 m（σ=20，偏离越大惩罚越陡） |
+| `base_motion` | 1.0 | `-(Σ lin² + Σ ang²)` | 禁止漂移：机身线速度、角速度平方和越小越好 |
+| `joint_torques` | 1e-5 | `-Σ τ²` | 省力矩（权重极低，避免和重力补偿打架） |
+| `action_rate` | 0.01 | `-Σ (aₜ − aₜ₋₁)²` | 动作平滑，抑制抖振 |
+| `alive` | 0.2 | `+1` | 存活奖励（只要没触发终止就 +0.2） |
+
+**设计意图**：核心是 `base_height` + `flat_orientation`（撑住不倒、别趴下），`base_motion` 防止它靠滑行/乱动刷存活。`joint_torques` 和 `action_rate` 是正则项，权重刻意压得很低——直驱力矩下 PPO 要学重力补偿，罚太重会鼓励它"不发力"从而直接塌掉。
+
+**终止条件**（触发即本回合结束、重置）：
+
+- `base_height`：基座高度 < 0.25 m（趴下）
+- `bad_orientation`：倾角 > 0.7 rad（翻倒）
+- `time_out`：满 10 s（50 Hz × 200 步）
+
+## 2. 网络设计
+
+rsl_rl 的 Actor-Critic，两个 MLP 共享同一份观测输入（`obs_groups` 里 actor 和 critic 都吃 `policy` 组）。
+
+```
+观测 o ∈ R^57
+  │
+  ├─ Actor  (策略)    57 → 512 → 256 → 128 → μ∈R^16
+  │                     ELU    ELU    ELU    (对角高斯, init σ=1.0)
+  │
+  └─ Critic (价值)    57 → 512 → 256 → 128 → V∈R^1
+                        ELU    ELU    ELU
+```
+
+- **观测 57 维**：`base_lin_vel(3) + base_ang_vel(3) + projected_gravity(3) + joint_pos(16) + joint_vel(16) + last_action(16)`。
+- **动作 16 维** ∈ [-1,1]，映射为直接力矩：腿 12 维 × 76.4 N·m，轮 4 维 × 21.6 N·m（`JointEffortActionCfg`，`IdealActuatorCfg` 零刚度零阻尼，即无 PD）。
+- **激活** ELU，三层 MLP [512, 256, 128]；**无观测归一化**（`actor_obs_normalization=False`）。
+- **策略头**：输出均值，方差固定为 `init_noise_std=1.0` 的对角高斯（不学方差），采样得到动作。
+
+关键超参（`RslRlPpoAlgorithmCfg`）：γ=0.99、λ(GAE)=0.95、clip=0.2、熵系数 0.01、价值损失系数 1.0、`num_learning_epochs=5`、`num_mini_batches=4`、lr=1e-3（`schedule="adaptive"`，KL 超 0.01 就降 lr）、`max_grad_norm=1.0`。
+
+## 3. 运行与更新流程
+
+**时间尺度**：物理 200 Hz（`sim.dt=0.005`），策略 50 Hz（`decimation=4`，每 4 个物理步出一次动作）。回合 10 s = 200 个策略步。
+
+**一次 PPO 迭代**：
+
+1. **采集**：4096 个并行环境各推 `num_steps_per_env=24` 步，得到 4096 × 24 = **98,304** 条 (oₜ, aₜ, rₜ, oₜ₊₁, done) 样本。
+2. **算优势**：Critic 给出每步 `V(o)`，用 GAE（γ=0.99、λ=0.95）沿时间反向算优势 `Âₜ`，回报 `Rₜ = Âₜ + V(oₜ)` 作为价值回归目标。
+3. **多轮更新**：把 98,304 条样本打乱分成 4 个 minibatch，循环 `num_learning_epochs=5` 遍，每遍对 Actor 和 Critic 各做一次梯度下降：
+   - **Critic**：`loss_V = 0.5·(V − R)²`，权重 1.0；
+   - **Actor**：PPO-clip 目标 `min(rₜ·Â, clip(rₜ, 1±0.2)·Â) + 0.01·熵`，`rₜ = π(a|o)/π_old(a|o)`；
+   - 梯度范数裁剪到 1.0。
+4. **自适应学习率**：每遍后若新旧策略 KL 超过 `desired_kl=0.01`，lr 自动减半式下调。
+5. 清空 buffer，用更新后的策略进入下一轮采集。
+
+**训练总量**：`max_iterations=2000` 轮 × 98,304 步 ≈ 2 亿步。每 `save_interval=100` 轮存一个 `checkpoints/model_*.pt`。
+
+**为什么直驱力矩开局会大面积趴下**：没有 PD 兜底，随机初始化的策略输出的是乱力矩，机器人生成就倒。这属正常——`base_height`/`flat_orientation` 的信号会把策略逐步拉向"撑住"的力矩组合，通常几百轮内趴下率开始下降。
+
+## 4. 看板指标
+
+| 指标 | 期望趋势 |
+| --- | --- |
+| `Episode_Reward/base_height` | 往 1 爬（高度到位） |
+| `Episode_Reward/flat_orientation` | 往 0 收（越平越好，本就是负分） |
+| `Episode_Reward/base_motion` | 往 0 收（不再漂移） |
+| `Episode_Termination/base_height` / `bad_orientation` | 从 ~100% 往 0 降 |
+| `Loss/learning_rate` | 自适应，学不动时自动降 |

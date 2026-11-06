@@ -3,5 +3,9 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 logs/
+videos/
+model/*.usd
+model/*.usd.metadata
+model/configuration/
 *.zip
 *.pkl
