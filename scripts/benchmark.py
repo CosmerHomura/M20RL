@@ -8,13 +8,13 @@ import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 
-from m20rl.config import EnvConfig
+from m20rl.config import EnvConfig, TrainConfig
 from m20rl.env import M20Env
 
 
-def make_env(rank: int, reward_mode: str = "forward_only"):
+def make_env(rank: int):
     def _thunk():
-        return M20Env(env_config=EnvConfig(reward_mode=reward_mode))
+        return M20Env(env_config=EnvConfig())
     return _thunk
 
 
@@ -26,7 +26,8 @@ def _vec_env(n_envs: int):
 def bench_stepping(n_envs: int, steps: int = 2000) -> float:
     venv = _vec_env(n_envs)
     venv.reset()
-    actions = np.random.uniform(-1, 1, (n_envs, 16)).astype(np.float32)
+    n_actions = venv.action_space.shape[0]
+    actions = np.random.uniform(-1, 1, (n_envs, n_actions)).astype(np.float32)
     start = time.perf_counter()
     for _ in range(steps):
         venv.step(actions)
@@ -38,16 +39,17 @@ def bench_stepping(n_envs: int, steps: int = 2000) -> float:
 def bench_training(device: str, total_timesteps: int = 10_000, n_envs: int = 10) -> float:
     venv = _vec_env(n_envs)
     venv = VecNormalize(venv, norm_obs=True, norm_reward=True)
+    cfg = TrainConfig()
     model = PPO(
         "MlpPolicy",
         venv,
-        n_steps=512,
-        batch_size=256,
-        n_epochs=4,
-        policy_kwargs={"net_arch": [256, 256]},
+        n_steps=cfg.n_steps,
+        batch_size=cfg.batch_size,
+        n_epochs=cfg.n_epochs,
+        policy_kwargs=cfg.policy_kwargs,
         device=device,
         verbose=0,
-        seed=0,
+        seed=cfg.seed,
     )
     start = time.perf_counter()
     model.learn(total_timesteps=total_timesteps, progress_bar=False)
@@ -75,7 +77,7 @@ def main():
     if torch.cuda.is_available():
         devices.append("cuda")
     else:
-        print("CUDA not available — skipping GPU benchmark")
+        print("CUDA not available - skipping GPU benchmark")
         lines.append("- CUDA not available, GPU benchmark skipped")
 
     for device in devices:
