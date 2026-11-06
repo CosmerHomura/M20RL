@@ -49,3 +49,50 @@ def test_reset_height_within_randomisation_range():
         e.reset(seed=seed)
         assert 0.495 - 1e-9 <= e.data.qpos[2] <= 0.520 + 1e-9
     e.close()
+
+
+def test_step_returns_gymnasium_tuple(env):
+    obs, reward, terminated, truncated, info = env.step(np.zeros(16, dtype=np.float32))
+    assert obs.shape == (60,)
+    assert isinstance(reward, float)
+    assert isinstance(terminated, bool)
+    assert isinstance(truncated, bool)
+    assert "reward_components" in info
+
+
+def test_reward_components_present(env):
+    _, _, _, _, info = env.step(np.zeros(16))
+    expected = {
+        "track_vx", "track_vy", "track_yaw", "orientation",
+        "height", "energy", "smooth", "still", "alive",
+    }
+    assert expected.issubset(info["reward_components"])
+
+
+def test_action_is_clipped_to_torque_limits(env):
+    env.step(np.full(16, 10.0))
+    assert np.all(np.abs(env.tau) <= env.action_scale + 1e-9)
+
+
+def test_fall_terminates_episode():
+    e = M20Env()
+    e.reset(seed=0)
+    e.data.qpos[2] = 0.10
+    mujoco.mj_forward(e.model, e.data)
+    _, _, terminated, _, info = e.step(np.zeros(16))
+    assert terminated is True
+    assert info["reward_components"]["fall_penalty"] < 0.0
+    e.close()
+
+
+def test_episode_truncates_at_limit():
+    e = M20Env(env_config=EnvConfig(episode_steps=5))
+    e.reset(seed=0)
+    e._is_terminated = lambda: False
+    for _ in range(4):
+        _, _, terminated, truncated, _ = e.step(np.zeros(16))
+        assert terminated is False
+        assert truncated is False
+    _, _, terminated, truncated, _ = e.step(np.zeros(16))
+    assert truncated is True
+    e.close()

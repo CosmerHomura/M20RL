@@ -125,8 +125,84 @@ class M20Env(gym.Env):
         return np.zeros(3, dtype=np.float64)
 
     # --------------------------------------------------------------- gym API
+    def _roll_pitch(self):
+        rot = self.data.xmat[self.base_body_id].reshape(3, 3)
+        roll = np.arctan2(rot[2, 1], rot[2, 2])
+        pitch = np.arcsin(np.clip(-rot[2, 0], -1.0, 1.0))
+        return roll, pitch
+
+    def _is_terminated(self):
+        if self.data.qpos[2] < self.cfg.fall_height:
+            return True
+        roll, pitch = self._roll_pitch()
+        if abs(roll) > self.cfg.fall_tilt or abs(pitch) > self.cfg.fall_tilt:
+            return True
+        for i in range(self.data.ncon):
+            contact = self.data.contact[i]
+            if contact.geom1 in self.base_geom_ids or contact.geom2 in self.base_geom_ids:
+                return True
+        return False
+
+    def _compute_reward(self, action, prev_action):
+        lin_vel, ang_vel = self._base_velocity()
+        vx, vy = lin_vel[0], lin_vel[1]
+        yaw_rate = ang_vel[2]
+        height = self.data.qpos[2]
+        gravity = self._projected_gravity()
+        cmd = self.command
+        w = self.rcfg.weights()
+
+        track_vx = np.exp(-self.rcfg.sigma * (vx - cmd[0]) ** 2)
+        track_vy = np.exp(-self.rcfg.sigma * (vy - cmd[1]) ** 2)
+        track_yaw = np.exp(-self.rcfg.sigma * (yaw_rate - cmd[2]) ** 2)
+        orientation = -(gravity[0] ** 2 + gravity[1] ** 2)
+        height_term = np.exp(
+            -self.rcfg.height_sigma * (height - self.cfg.standing_height) ** 2)
+        energy = -np.sum(self.tau ** 2)
+        smooth = -np.sum((action - prev_action) ** 2)
+        if np.linalg.norm(cmd) < self.rcfg.still_command_threshold:
+            still = -(vx ** 2 + vy ** 2)
+        else:
+            still = 0.0
+
+        components = {
+            "track_vx": w["track_vx"] * float(track_vx),
+            "track_vy": w["track_vy"] * float(track_vy),
+            "track_yaw": w["track_yaw"] * float(track_yaw),
+            "orientation": w["orientation"] * float(orientation),
+            "height": w["height"] * float(height_term),
+            "energy": w["energy"] * float(energy),
+            "smooth": w["smooth"] * float(smooth),
+            "still": w["still"] * float(still),
+            "alive": w["alive"],
+        }
+        return float(sum(components.values())), components
+
     def step(self, action):
-        raise NotImplementedError
+        action = np.clip(np.asarray(action, dtype=np.float64), -1.0, 1.0)
+        prev_action = self.last_action
+        self.tau = action * self.action_scale
+        self.data.ctrl[self.ctrl_ids] = self.tau
+        for _ in range(self.cfg.n_substeps):
+            mujoco.mj_step(self.model, self.data)
+
+        self.step_count += 1
+        reward, components = self._compute_reward(action, prev_action)
+        terminated = self._is_terminated()
+        if terminated:
+            reward -= self.rcfg.fall_penalty
+            components["fall_penalty"] = -self.rcfg.fall_penalty
+
+        truncated = self.step_count >= self.cfg.episode_steps
+        self.last_action = action
+        obs = self._get_obs()
+
+        if self.step_count % self.cfg.command_resample_steps == 0:
+            self.command = self._sample_command()
+
+        return obs, float(reward), bool(terminated), bool(truncated), {
+            "reward_components": components,
+        }
 
     def render(self):
         if self.render_mode == "human":
