@@ -4,8 +4,13 @@ __pycache__/
 .pytest_cache/
 logs/
 videos/
+# Generated/large assets: keep the repo code-only, pull assets separately.
 model/*.usd
 model/*.usd.metadata
+model/usd/
+model/urdf/
 model/configuration/
+model/M20.xml
+model/meshes/
 *.zip
 *.pkl
