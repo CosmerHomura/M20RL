@@ -126,3 +126,16 @@ def test_command_is_resampled_periodically():
         seen.add(tuple(np.round(e.command, 6)))
     assert len(seen) > 1
     e.close()
+
+
+def test_rgb_array_render():
+    e = M20Env(render_mode="rgb_array", render_size=(120, 160))
+    e.reset(seed=0)
+    frame = e.render()
+    assert frame.shape == (120, 160, 3)
+    assert frame.dtype == np.uint8
+    e.close()
+
+
+def test_render_without_mode_returns_none(env):
+    assert env.render() is None

@@ -218,8 +218,8 @@ class M20Env(gym.Env):
     def render(self):
         if self.render_mode == "human":
             if self.viewer is None:
-                import mujoco.viewer
-                self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
+                from mujoco import viewer
+                self.viewer = viewer.launch_passive(self.model, self.data)
             self.viewer.sync()
             return None
         if self.render_mode == "rgb_array":
