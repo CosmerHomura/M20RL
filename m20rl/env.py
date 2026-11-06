@@ -219,12 +219,12 @@ class M20Env(gym.Env):
     def step(self, action):
         action = np.clip(np.asarray(action, dtype=np.float64), -1.0, 1.0)
         prev_action = self.last_action
-        # Run the PD loop at the physics rate: at 50 Hz the gains would be
-        # discretely unstable for the light distal links.
-        for _ in range(self.cfg.n_substeps):
+        # Update the PD loop faster than the policy output: at 50 Hz the
+        # gains would be discretely unstable for the light distal links.
+        for _ in range(0, self.cfg.n_substeps, self.cfg.pd_substeps):
             self.tau = self._action_to_torque(action)
             self.data.ctrl[self.ctrl_ids] = self.tau
-            mujoco.mj_step(self.model, self.data)
+            mujoco.mj_step(self.model, self.data, nstep=self.cfg.pd_substeps)
 
         self.step_count += 1
         reward, components = self._compute_reward(action, prev_action)

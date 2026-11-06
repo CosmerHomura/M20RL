@@ -3,6 +3,7 @@ import argparse
 import time
 from pathlib import Path
 
+import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import CallbackList, EvalCallback
 from stable_baselines3.common.monitor import Monitor
@@ -38,6 +39,10 @@ def main():
     parser.add_argument("--no-eval", action="store_true")
     parser.add_argument("--log-root", default="logs")
     args = parser.parse_args()
+
+    # The policy MLP is tiny; extra BLAS threads only add synchronisation
+    # overhead and compete with the environment processes.
+    torch.set_num_threads(2)
 
     cfg = TrainConfig(seed=args.seed)
     if args.total_timesteps is not None:

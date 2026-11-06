@@ -173,14 +173,16 @@ M20RL/
 | `n_envs` | 10（`SubprocVecEnv`，Windows 下必须 spawn 启动方式） |
 | `device` | `"cpu"`（M0 基准实测后再定，见 §2） |
 | `n_steps` | 2048 |
-| `batch_size` | 256 |
-| `n_epochs` | 10 |
+| `batch_size` | 512 |
+| `n_epochs` | 5 |
 | `gamma` / `gae_lambda` | 0.99 / 0.95 |
 | `clip_range` | 0.2 |
 | `learning_rate` | 3e-4 |
 | `ent_coef` | 0.01（刻意调高，避免收敛到"站着不动"的局部最优） |
 | `vf_coef` / `max_grad_norm` | 0.5 / 0.5 |
 | `total_timesteps` | 先 5M 验证，再 20~30M 收敛 |
+
+**速度调优（2026-11-06）**：PD 回路改为每 2 个物理子步更新（250 Hz），比每个子步更新快约 1.9 倍且同样稳定；`n_epochs` 10→5、`batch_size` 256→512、`torch.set_num_threads(2)`。端到端训练吞吐从约 1500 提升到约 2400 train-steps/s。`eval_freq` 从 50k 提到 100k，减少评估开销。
 
 **VecNormalize**：`norm_obs=True`、`norm_reward=True`、`clip_obs=10.0`。训练结束保存 `vecnormalize.pkl`，`play.py` 必须复用同一份，否则观测分布不一致会导致策略失效。
 

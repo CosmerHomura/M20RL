@@ -81,5 +81,6 @@ def test_train_config_defaults():
     assert cfg.device == "cpu"
     assert cfg.policy_kwargs == {"net_arch": [256, 256]}
     assert cfg.n_steps == 2048
-    assert cfg.batch_size == 256
+    assert cfg.batch_size == 512
+    assert cfg.n_epochs == 5
     assert cfg.ent_coef == 0.01

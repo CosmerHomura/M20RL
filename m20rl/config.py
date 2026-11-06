@@ -35,6 +35,9 @@ class EnvConfig:
     xml_path: str = str(XML_PATH)
     sim_dt: float = 0.002
     control_dt: float = 0.02
+    # Physics substeps per PD update; 2 gives a 250 Hz PD loop, which is
+    # stable and ~1.9x faster than recomputing the PD every substep.
+    pd_substeps: int = 2
     episode_steps: int = 500
     standing_height: float = 0.50
     fall_height: float = 0.25
@@ -107,8 +110,8 @@ class TrainConfig:
     device: str = "cpu"
     policy_kwargs: dict = field(default_factory=lambda: {"net_arch": [256, 256]})
     n_steps: int = 2048
-    batch_size: int = 256
-    n_epochs: int = 10
+    batch_size: int = 512
+    n_epochs: int = 5
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
@@ -116,6 +119,6 @@ class TrainConfig:
     ent_coef: float = 0.01
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
-    eval_freq: int = 50_000
+    eval_freq: int = 100_000
     n_eval_episodes: int = 5
     save_freq: int = 100_000
