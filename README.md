@@ -66,6 +66,16 @@ python -m venv .venv
 
 `--command VX VY YAW` 在该次回放中固定不变。**必须复用训练时的 `final_vecnormalize.pkl`**，否则观测分布不一致，策略会失效。
 
+### 训练时实时观看
+
+训练环境跑在子进程里，viewer 挂不上去。另开一个终端，用 `watch.py` 盯着 run 目录，它会自动加载最新的 checkpoint（每 100k 步一次）在 viewer 里跑：
+
+```bash
+.venv/Scripts/python.exe -m scripts.watch --run logs/m2_full
+# 每回合随机指令：
+.venv/Scripts/python.exe -m scripts.watch --run logs/m2_full --random-commands
+```
+
 ### 性能基准
 
 ```bash
