@@ -2,7 +2,7 @@
 from pathlib import Path
 
 import isaaclab.sim as sim_utils
-from isaaclab.actuators import IdealActuatorCfg
+from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg
 
 # USD imported from the official DeepRoboticsLab/deep_robotics_model M20 URDF.
@@ -48,18 +48,23 @@ M20_CFG = ArticulationCfg(
     ),
     soft_joint_pos_limit_factor=1.0,
     actuators={
-        # Direct torque control: IdealActuatorCfg has zero stiffness/damping, so
-        # the PPO policy commands the joint effort directly (no PD layer).
+        # Direct torque control, no PD layer: stiffness and damping are both
+        # zero, so the implicit drive contributes no torque of its own and the
+        # effort target written by JointEffortActionCfg is applied as-is.
         # Gravity compensation is learned end-to-end by the policy.
-        "legs": IdealActuatorCfg(
+        "legs": ImplicitActuatorCfg(
             joint_names_expr=[".*_hipx_joint", ".*_hipy_joint", ".*_knee_joint"],
             effort_limit_sim=76.4,
             velocity_limit_sim=40.0,
+            stiffness=0.0,
+            damping=0.0,
         ),
-        "wheels": IdealActuatorCfg(
+        "wheels": ImplicitActuatorCfg(
             joint_names_expr=[".*_wheel_joint"],
             effort_limit_sim=21.6,
             velocity_limit_sim=200.0,
+            stiffness=0.0,
+            damping=0.0,
         ),
     },
 )
