@@ -5,6 +5,7 @@
 - 设计文档：`docs/superpowers/specs/2026-11-06-m20-ppo-gait-training-design.md`
 - 实现计划：`docs/superpowers/plans/2026-11-06-m20-ppo-gait-training.md`
 - 性能基准：`docs/benchmark.md`
+- 云端（Linux/GPU）部署：`docs/cloud.md`
 
 ## 环境与动作
 
