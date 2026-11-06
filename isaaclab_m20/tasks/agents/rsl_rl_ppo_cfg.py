@@ -14,9 +14,9 @@ class M20RslRlPpoRunnerCfg(RslRlOnPolicyRunnerCfg):
     save_interval = 100
     experiment_name = "m20_wheeled"
     empirical_normalization = False
-    # Keep actions inside [-1, 1] so JointEffortActionCfg's scale is the real
-    # torque limit; the runner default of 100 lets the policy command ~3x the
-    # 76.4 N·m leg limit, which is a large part of the early-twitchiness.
+    # Keep actions inside [-1, 1] so the action scale (0.25 rad / 20 rad/s) is
+    # the real command range; the runner default of 100 lets the policy ask for
+    # ~100x the intended target amplitude.
     clip_actions = 1.0
     # Single observation group: both actor and critic consume "policy".
     obs_groups = {"policy": ["policy"], "critic": ["policy"]}

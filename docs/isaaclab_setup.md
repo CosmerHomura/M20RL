@@ -158,15 +158,17 @@ python -m isaaclab_m20.scripts.play --checkpoint <path> --headless --video
 
 ## 7. 控制与观测速查
 
-**当前任务是静态站立**：无速度指令，目标原地站稳、保持高度 0.50 m、机身水平、不漂移。PPO 直接输出力矩（无 PD）。
+**当前任务是静态站立**：无速度指令，目标原地站稳、保持高度 0.50 m、机身水平、不漂移。PPO 输出关节**位置目标**，PD 伺服环在 200 Hz 跟踪成力矩。
 
 观测 57 维：base_lin_vel(3) + base_ang_vel(3) + projected_gravity(3) + joint_pos(16) + joint_vel(16) + last_action(16)。
 
 | 项 | 配置 |
 | --- | --- |
 | 控制频率 | 50 Hz（`sim.dt=0.005` × `decimation=4`） |
-| 动作 | `JointEffortActionCfg`，直接力矩：腿 12 维 × 76.4 N·m、轮 4 维 × 21.6 N·m |
-| 执行器 | `ImplicitActuatorCfg`（stiffness/damping = 0，无 PD） |
+| 腿动作 | `JointPositionActionCfg(scale=0.25, use_default_offset=True)` |
+| 轮动作 | `JointVelocityActionCfg(scale=20)`，`use_default_offset=False` |
+| PD 伺服 | 腿 kp=80 / kd=2，轮 kp=0 / kd=2，200 Hz |
+| 力矩上限 | 腿 76.4 N·m，轮 21.6 N·m |
 | 奖励 | 水平 2.0、高度 2.0（σ=20）、禁漂移 1.0、省力矩 1e-5、动作平滑 0.01、存活 0.2 |
 | 终止 | 高度 < 0.25、倾角 > 0.7、超时 |
 

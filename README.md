@@ -1,6 +1,6 @@
 # M20 轮足机器人速度跟踪（Isaac Lab + rsl_rl）
 
-用 Isaac Lab 的 ManagerBasedRLEnv 训练 M20 轮足机器人原地站稳（静态站立），PPO 端到端输出关节力矩（无 PD），后端是 rsl_rl，GPU 上可并行 4096 个环境。
+用 Isaac Lab 的 ManagerBasedRLEnv 训练 M20 轮足机器人原地站稳（静态站立）：PPO 输出关节位置目标，PD 伺服环在 200 Hz 跟踪成力矩，后端是 rsl_rl，GPU 上可并行 4096 个环境。
 
 详细安装与排错见 [docs/isaaclab_setup.md](docs/isaaclab_setup.md)，奖励函数/网络结构/PPO 更新流程见 [docs/algorithm.md](docs/algorithm.md)。
 
@@ -53,7 +53,8 @@ tensorboard --logdir logs/rsl_rl --bind_all --port 6006
 - 物理 200 Hz（`sim.dt=0.005`），策略 50 Hz（`decimation=4`），回合 10 s。
 - **静态站立任务**：没有速度指令，目标就是原地站稳、保持高度、机身水平、不漂移。
 - 观测 57 维：机身线速度 3 + 角速度 3 + 重力投影 3 + 关节角 16 + 关节速度 16 + 上一拍动作 16。
-- 动作 16 维 ∈ [-1, 1]，**直接力矩控制（无 PD）**：腿 12 维 × 76.4 N·m、轮 4 维 × 21.6 N·m，PPO 端到端学重力补偿。
+- 动作 16 维 ∈ [-1, 1]，均为**目标值**：腿部 12 维为位置目标 `q* = q_default + a × 0.25 rad`，轮部 4 维为速度目标 `ω* = a × 20 rad/s`。
+- PD 伺服环（`ImplicitActuatorCfg`，200 Hz）：腿 kp=80 / kd=2，轮 kp=0 / kd=2，力矩上限 76.4 / 21.6 N·m。
 - 奖励：机身水平、高度（0.50 m）、禁止漂移、省力矩、动作平滑、存活。
 - 终止：高度 < 0.25 m、倾角 > 0.7 rad、超时。
 

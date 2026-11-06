@@ -51,7 +51,10 @@ rsl_rl 的 Actor-Critic，两个 MLP 共享同一份观测输入（`obs_groups` 
 ```
 
 - **观测 57 维**：`base_lin_vel(3) + base_ang_vel(3) + projected_gravity(3) + joint_pos(16) + joint_vel(16) + last_action(16)`。
-- **动作 16 维** ∈ [-1,1]，映射为直接力矩：腿 12 维 × 76.4 N·m，轮 4 维 × 21.6 N·m（`JointEffortActionCfg` + `ImplicitActuatorCfg(stiffness=0, damping=0)`，驱动本身不出力，即无 PD）。
+- **动作 16 维** ∈ [-1,1]，都是**目标值**，不是力矩：
+  - 腿 12 维：`q* = q_default + a × 0.25 rad`（`JointPositionActionCfg`）
+  - 轮 4 维：`ω* = a × 20 rad/s`（`JointVelocityActionCfg`）
+- **PD 伺服环**（`ImplicitActuatorCfg`）在 200 Hz 物理步上把目标跟踪成力矩：腿 kp=80、kd=2，轮 kp=0、kd=2（速度伺服），力矩上限 76.4 / 21.6 N·m。策略负责决策，PD 只负责跟踪。
 - **激活** ELU，三层 MLP [512, 256, 128]；**无观测归一化**（`actor_obs_normalization=False`）。
 - **策略头**：输出均值，方差固定为 `init_noise_std=1.0` 的对角高斯（不学方差），采样得到动作。
 

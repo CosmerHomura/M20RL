@@ -46,17 +46,24 @@ class M20SceneCfg(InteractiveSceneCfg):
 
 @configclass
 class ActionsCfg:
-    """16 direct joint-torque commands (12 legs + 4 wheels), no PD layer."""
+    """12 leg position targets + 4 wheel velocity targets, tracked by the PD servo.
 
-    leg_efforts = mdp.JointEffortActionCfg(
+    The policy emits targets, not torques: q* = q_default + a*0.25 rad for the
+    legs and ω* = a*20 rad/s for the wheels. The implicit actuator's PD runs at
+    the 200 Hz physics rate and turns them into motor torque.
+    """
+
+    leg_positions = mdp.JointPositionActionCfg(
         asset_name="robot",
         joint_names=[".*_hipx_joint", ".*_hipy_joint", ".*_knee_joint"],
-        scale=76.4,
+        scale=0.25,
+        use_default_offset=True,
     )
-    wheel_efforts = mdp.JointEffortActionCfg(
+    wheel_velocities = mdp.JointVelocityActionCfg(
         asset_name="robot",
         joint_names=[".*_wheel_joint"],
-        scale=21.6,
+        scale=20.0,
+        use_default_offset=False,
     )
 
 
@@ -176,7 +183,7 @@ class M20WheeledEnvCfg(ManagerBasedRLEnvCfg):
     events: EventCfg = EventCfg()
 
     def __post_init__(self) -> None:
-        # 200 Hz physics, 50 Hz policy, direct torque control (no PD).
+        # 200 Hz physics, 50 Hz policy: the actuator PD runs at the physics rate.
         self.decimation = 4
         self.episode_length_s = 10.0
         self.sim.dt = 0.005

@@ -48,23 +48,24 @@ M20_CFG = ArticulationCfg(
     ),
     soft_joint_pos_limit_factor=1.0,
     actuators={
-        # Direct torque control, no PD layer: stiffness and damping are both
-        # zero, so the implicit drive contributes no torque of its own and the
-        # effort target written by JointEffortActionCfg is applied as-is.
-        # Gravity compensation is learned end-to-end by the policy.
+        # PD servo loop, the standard legged-robot arrangement: the policy sends
+        # position targets and the drive tracks them at the physics rate.
+        # tau = kp * (q* - q) + kd * (qd* - qd), clamped by effort_limit_sim.
         "legs": ImplicitActuatorCfg(
             joint_names_expr=[".*_hipx_joint", ".*_hipy_joint", ".*_knee_joint"],
             effort_limit_sim=76.4,
             velocity_limit_sim=40.0,
-            stiffness=0.0,
-            damping=0.0,
+            stiffness=80.0,
+            damping=2.0,
         ),
+        # Wheels are velocity controlled: zero stiffness turns the drive into a
+        # velocity servo whose gain is `damping`.
         "wheels": ImplicitActuatorCfg(
             joint_names_expr=[".*_wheel_joint"],
             effort_limit_sim=21.6,
             velocity_limit_sim=200.0,
             stiffness=0.0,
-            damping=0.0,
+            damping=2.0,
         ),
     },
 )
