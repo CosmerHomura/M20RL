@@ -71,7 +71,17 @@ def test_reward_components_present(env):
 
 def test_action_is_clipped_to_torque_limits(env):
     env.step(np.full(16, 10.0))
-    assert np.all(np.abs(env.tau) <= env.action_scale + 1e-9)
+    assert np.all(np.abs(env.tau) <= env.max_torque + 1e-9)
+
+
+def test_zero_action_holds_stance(env):
+    env.reset(seed=0)
+    for _ in range(100):
+        _, _, terminated, _, _ = env.step(np.zeros(16))
+        if terminated:
+            break
+    assert not terminated
+    assert env.data.qpos[2] > 0.45
 
 
 def test_fall_terminates_episode():

@@ -6,11 +6,20 @@ import mujoco
 import gymnasium as gym
 from gymnasium import spaces
 
-from .config import ACTION_SCALE, DEFAULT_JOINT_POS, JOINT_NAMES, EnvConfig, RewardConfig
+from .config import (
+    ACTION_SCALE,
+    DEFAULT_JOINT_POS,
+    JOINT_NAMES,
+    MAX_TORQUE,
+    PD_KD,
+    PD_KP,
+    EnvConfig,
+    RewardConfig,
+)
 
 
 class M20Env(gym.Env):
-    """Torque-controlled wheeled quadruped tracking body-frame velocity commands."""
+    """PD-controlled wheeled quadruped tracking body-frame velocity commands."""
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 50}
 
@@ -40,6 +49,11 @@ class M20Env(gym.Env):
         ], dtype=np.int32)
 
         self.action_scale = np.array(ACTION_SCALE, dtype=np.float64)
+        self.max_torque = np.array(MAX_TORQUE, dtype=np.float64)
+        self.pd_kp = np.array(PD_KP, dtype=np.float64)
+        self.pd_kd = np.array(PD_KD, dtype=np.float64)
+        # Wheel joints track a target angular velocity, legs a target angle.
+        self.is_wheel = np.tile([False, False, False, True], 4)
         self.default_joint_pos = np.array(DEFAULT_JOINT_POS, dtype=np.float64)
         # Collision geoms belonging to the torso (visual geoms have contype == 0).
         self.base_geom_ids = frozenset(
@@ -189,12 +203,27 @@ class M20Env(gym.Env):
         }
         return float(sum(components.values())), components
 
+    def _action_to_torque(self, action):
+        """Map a normalised action to joint torques.
+
+        Legs track a target angle through PD; wheels apply torque directly.
+        """
+        q = self.data.qpos[self.qpos_adr]
+        dq = self.data.qvel[self.qvel_adr]
+        target = self.default_joint_pos + action * self.action_scale
+        tau_leg = self.pd_kp * (target - q) - self.pd_kd * dq
+        tau_wheel = action * self.action_scale
+        tau = np.where(self.is_wheel, tau_wheel, tau_leg)
+        return np.clip(tau, -self.max_torque, self.max_torque)
+
     def step(self, action):
         action = np.clip(np.asarray(action, dtype=np.float64), -1.0, 1.0)
         prev_action = self.last_action
-        self.tau = action * self.action_scale
-        self.data.ctrl[self.ctrl_ids] = self.tau
+        # Run the PD loop at the physics rate: at 50 Hz the gains would be
+        # discretely unstable for the light distal links.
         for _ in range(self.cfg.n_substeps):
+            self.tau = self._action_to_torque(action)
+            self.data.ctrl[self.ctrl_ids] = self.tau
             mujoco.mj_step(self.model, self.data)
 
         self.step_count += 1

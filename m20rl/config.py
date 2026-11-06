@@ -17,8 +17,17 @@ JOINT_NAMES = [f"{leg}_{jt}_joint" for leg in LEGS for jt in JOINT_TYPES]
 # With base at 0.50 m the wheel centre sits at 0.09 m == wheel radius.
 DEFAULT_JOINT_POS = [0.0, 0.61, -1.22, 0.0] * 4
 
-# Leg joints: 76.4 N·m, wheel joints: 21.6 N·m.
-ACTION_SCALE = [76.4, 76.4, 76.4, 21.6] * 4
+# Action -> actuator mapping, per joint type (hipx, hipy, knee, wheel):
+#   legs: angle offset in rad from DEFAULT_JOINT_POS, tracked by a PD loop
+#   wheels: direct torque in N·m (a velocity loop is unstable at 50 Hz here)
+ACTION_SCALE = [0.4, 0.4, 0.4, 21.6] * 4
+
+# Torque saturation limits: legs 76.4 N·m, wheels 21.6 N·m.
+MAX_TORQUE = [76.4, 76.4, 76.4, 21.6] * 4
+
+# PD gains for the leg joints; wheels are torque-controlled (gains unused).
+PD_KP = [100.0, 100.0, 100.0, 0.0] * 4
+PD_KD = [5.0, 5.0, 5.0, 0.0] * 4
 
 
 @dataclass

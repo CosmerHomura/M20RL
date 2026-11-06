@@ -2,6 +2,9 @@ from m20rl.config import (
     ACTION_SCALE,
     DEFAULT_JOINT_POS,
     JOINT_NAMES,
+    MAX_TORQUE,
+    PD_KD,
+    PD_KP,
     EnvConfig,
     RewardConfig,
     TrainConfig,
@@ -30,18 +33,25 @@ def test_dimensions():
     assert cfg.n_substeps == 10
     assert len(DEFAULT_JOINT_POS) == 16
     assert len(ACTION_SCALE) == 16
+    assert len(MAX_TORQUE) == 16
+    assert len(PD_KP) == 16
+    assert len(PD_KD) == 16
 
 
-def test_default_stance_and_scale():
+def test_default_stance_and_action_scale():
     for i in range(4):
         assert DEFAULT_JOINT_POS[i * 4 + 0] == 0.0
         assert DEFAULT_JOINT_POS[i * 4 + 1] == 0.61
         assert DEFAULT_JOINT_POS[i * 4 + 2] == -1.22
         assert DEFAULT_JOINT_POS[i * 4 + 3] == 0.0
-        assert ACTION_SCALE[i * 4 + 0] == 76.4
-        assert ACTION_SCALE[i * 4 + 1] == 76.4
-        assert ACTION_SCALE[i * 4 + 2] == 76.4
+        assert ACTION_SCALE[i * 4 + 0] == 0.4
+        assert ACTION_SCALE[i * 4 + 1] == 0.4
+        assert ACTION_SCALE[i * 4 + 2] == 0.4
         assert ACTION_SCALE[i * 4 + 3] == 21.6
+        assert MAX_TORQUE[i * 4 + 3] == 21.6
+        assert MAX_TORQUE[i * 4 + 0] == 76.4
+        assert PD_KP[i * 4 + 3] == 0.0
+        assert PD_KD[i * 4 + 3] == 0.0
 
 
 def test_full_reward_weights():
