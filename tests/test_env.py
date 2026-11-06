@@ -96,3 +96,33 @@ def test_episode_truncates_at_limit():
     _, _, terminated, truncated, _ = e.step(np.zeros(16))
     assert truncated is True
     e.close()
+
+
+def test_command_sampling_respects_ranges(env):
+    cmds = np.array([env._sample_command() for _ in range(1000)])
+    assert cmds[:, 0].min() >= -0.6 and cmds[:, 0].max() <= 0.6
+    assert cmds[:, 1].min() >= -0.3 and cmds[:, 1].max() <= 0.3
+    assert cmds[:, 2].min() >= -0.6 and cmds[:, 2].max() <= 0.6
+    zero_fraction = np.mean(np.all(np.isclose(cmds, 0.0), axis=1))
+    assert 0.05 < zero_fraction < 0.15
+
+
+def test_forward_only_mode_zeroes_vy_and_yaw():
+    e = M20Env(env_config=EnvConfig(reward_mode="forward_only"))
+    e.reset(seed=0)
+    for _ in range(200):
+        cmd = e._sample_command()
+        assert cmd[1] == 0.0
+        assert cmd[2] == 0.0
+    e.close()
+
+
+def test_command_is_resampled_periodically():
+    e = M20Env(env_config=EnvConfig(command_resample_steps=2))
+    e.reset(seed=0)
+    seen = set()
+    for _ in range(6):
+        e.step(np.zeros(16))
+        seen.add(tuple(np.round(e.command, 6)))
+    assert len(seen) > 1
+    e.close()

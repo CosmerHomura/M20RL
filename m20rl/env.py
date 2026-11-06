@@ -122,7 +122,18 @@ class M20Env(gym.Env):
         return obs.astype(np.float32)
 
     def _sample_command(self):
-        return np.zeros(3, dtype=np.float64)
+        if self.np_random.random() < self.cfg.zero_command_prob:
+            return np.zeros(3, dtype=np.float64)
+        if self.cfg.reward_mode == "forward_only":
+            return np.array(
+                [self.np_random.uniform(*self.cfg.vx_range), 0.0, 0.0],
+                dtype=np.float64,
+            )
+        return np.array([
+            self.np_random.uniform(*self.cfg.vx_range),
+            self.np_random.uniform(*self.cfg.vy_range),
+            self.np_random.uniform(*self.cfg.yaw_range),
+        ], dtype=np.float64)
 
     # --------------------------------------------------------------- gym API
     def _roll_pitch(self):
