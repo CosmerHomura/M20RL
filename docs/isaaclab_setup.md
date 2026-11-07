@@ -147,7 +147,7 @@ tensorboard --logdir logs/rsl_rl --bind_all --port 6006
 ## 6. 播放与评估
 
 ```bash
-# 最新 checkpoint，16 个环境
+# 最新 checkpoint，16 个环境（默认站立任务，自动找 m20_wheeled/ 下最新）
 python -m isaaclab_m20.scripts.play --num_envs 16
 
 # 指定 checkpoint
@@ -156,10 +156,12 @@ python -m isaaclab_m20.scripts.play \
     --num_envs 16
 
 # 无界面录制视频
-python -m isaaclab_m20.scripts.play --checkpoint <path> --headless --video
+python -m isaaclab_m20.scripts.play --headless --video
 ```
 
 `play.py` 加载 checkpoint 后就地站立推演，视频写到 `videos/`，`--video_length` 是策略步数（50 Hz，500 步 = 10 s）。
+
+`--task` 决定加载哪个任务的模型：不传 `--checkpoint` 时，脚本在 `logs/rsl_rl/<experiment>/` 下自动找最新 checkpoint——站立是 `m20_wheeled/`、速度指令是 `m20_velocity/`，两个目录的 checkpoint 维度不同（57 vs 60），按目录隔离就不会串。
 
 ### 推一把试试
 
@@ -181,13 +183,12 @@ python -m isaaclab_m20.scripts.play --num_envs 16 --push_speed 1.0
 # 自动推：每 3 秒推一次，适合录视频
 python -m isaaclab_m20.scripts.play --num_envs 16 --push_every 3 --headless --video
 
-# 速度指令任务：键盘实时给指令
-python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0 \
-    --checkpoint <m20_velocity/model_*.pt>
+# 速度指令任务：键盘实时给指令（自动加载 m20_velocity/ 下最新 checkpoint）
+python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0
 
 # 速度指令任务：固定指令（headless 时也可用）
 python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0 \
-    --checkpoint <path> --cmd_vx 0.6 --cmd_vy 0.0 --cmd_wz 0.3 --headless --video
+    --cmd_vx 0.6 --cmd_vy 0.0 --cmd_wz 0.3 --headless --video
 ```
 
 速度指令任务里，`play.py` 会把指令重采样时间改成无穷大，并在每个策略步覆写指令缓冲——否则训练配置里 4 s 一次的重采样会不停覆盖人工输入。

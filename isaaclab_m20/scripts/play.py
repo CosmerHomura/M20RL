@@ -1,18 +1,22 @@
 """Play a trained M20 policy.
 
+``--task`` picks the task and, unless ``--checkpoint`` is given, the newest
+checkpoint under ``logs/rsl_rl/<experiment>/`` is loaded automatically -- the
+two tasks log to different directories and their checkpoints are not
+interchangeable, so this never mixes them up.
+
 Examples::
 
-    # static standing
-    python -m isaaclab_m20.scripts.play --checkpoint logs/rsl_rl/m20_wheeled/<run>/checkpoints/model_2000.pt
+    # static standing: default task, newest m20_wheeled checkpoint
+    python -m isaaclab_m20.scripts.play
 
-    # velocity command -- steer with the keyboard, or pin a fixed command
-    python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0 \
-        --checkpoint logs/rsl_rl/m20_velocity/<run>/checkpoints/model_3000.pt
-    python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0 \
-        --checkpoint <path> --cmd_vx 0.6 --cmd_wz 0.3 --headless --video
+    # velocity command: steer with the keyboard (W/S/A/D/Q/E, Space)
+    python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0
 
-Checkpoints are not interchangeable between the two tasks: the velocity task
-observes 60 dims (3 command values prepended) against the standing task's 57.
+    # velocity command, pinned checkpoint and fixed command (headless video)
+    python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0 \
+        --checkpoint logs/rsl_rl/m20_velocity/<run>/checkpoints/model_*.pt \
+        --cmd_vx 0.6 --cmd_wz 0.3 --headless --video
 """
 from __future__ import annotations
 
@@ -34,7 +38,8 @@ parser = argparse.ArgumentParser(description="Play a trained M20 policy.")
 parser.add_argument("--task", type=str, default="Isaac-M20-Wheeled-v0")
 parser.add_argument("--num_envs", type=int, default=16)
 parser.add_argument("--checkpoint", type=str, default=None,
-                    help="Path to model_*.pt. Defaults to the newest checkpoint under --log_root.")
+                    help="Path to model_*.pt. Defaults to the newest checkpoint under "
+                         "<log_root>/<experiment>, where <experiment> is the task's log dir.")
 parser.add_argument("--log_root", type=str, default=str(REPO_ROOT / "logs" / "rsl_rl"))
 parser.add_argument("--video", action="store_true", help="Record a video instead of opening the viewer.")
 parser.add_argument("--video_length", type=int, default=500, help="Video length in policy steps.")
@@ -77,15 +82,24 @@ import isaaclab_m20.tasks  # noqa: F401 - registers both M20 task ids
 from isaaclab_m20.tasks.m20_env_cfg import fit_viewer_to_grid
 
 
-def resolve_checkpoint() -> Path:
+def resolve_checkpoint(experiment_name: str) -> Path:
+    """Return --checkpoint, else the newest model under <log_root>/<experiment_name>.
+
+    The search is scoped to the task's experiment directory: standing and
+    velocity log to ``m20_wheeled/`` and ``m20_velocity/`` respectively, and
+    their checkpoints are not interchangeable (57 vs 60 observation dims). A
+    flat "newest model anywhere under log_root" would hand a standing checkpoint
+    to the velocity env and crash on a shape mismatch.
+    """
     if args_cli.checkpoint:
         path = Path(args_cli.checkpoint).expanduser()
         if not path.is_file():
             raise FileNotFoundError(f"Checkpoint not found: {path}")
         return path
-    candidates = sorted(Path(args_cli.log_root).rglob("model_*.pt"), key=lambda p: p.stat().st_mtime)
+    run_dir = Path(args_cli.log_root) / experiment_name
+    candidates = sorted(run_dir.rglob("model_*.pt"), key=lambda p: p.stat().st_mtime)
     if not candidates:
-        raise FileNotFoundError(f"No model_*.pt under {args_cli.log_root}; pass --checkpoint.")
+        raise FileNotFoundError(f"No model_*.pt under {run_dir}; pass --checkpoint.")
     return candidates[-1]
 
 
@@ -175,13 +189,14 @@ def main() -> None:
     fit_viewer_to_grid(env_cfg)
     has_command = getattr(env_cfg, "commands", None) is not None
 
-    checkpoint = resolve_checkpoint()
-    print(f"[INFO] Loading {checkpoint}")
-
     agent_entry = gym.spec(args_cli.task).kwargs["rsl_rl_cfg_entry_point"]
     module_name, class_name = agent_entry.split(":")
     agent_cfg = getattr(importlib.import_module(module_name), class_name)()
     agent_cfg.device = args_cli.device
+
+    checkpoint = resolve_checkpoint(agent_cfg.experiment_name)
+    print(f"[INFO] Task={args_cli.task}  experiment={agent_cfg.experiment_name}")
+    print(f"[INFO] Loading {checkpoint}")
 
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
     if args_cli.video:

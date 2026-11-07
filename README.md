@@ -58,12 +58,12 @@ python -m isaaclab_m20.scripts.train --headless --num_envs 4096 \
     --task Isaac-M20-Wheeled-Velocity-v0 --run_name vel_v1
 
 # 6. 速度指令任务：播放。键盘 W/S = vx，A/D = vy，Q/E = 偏航角速度，空格清零
-python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0 \
-    --checkpoint logs/rsl_rl/m20_velocity/vel_v1/checkpoints/model_3000.pt
+#    --task 决定加载哪个任务的 checkpoint（自动找 m20_velocity/ 下最新的）
+python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0
 
-# 7. 或固定指令、无界面出视频
+# 7. 或固定指令、无界面出视频（--checkpoint 可省略，自动用最新）
 python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0 \
-    --checkpoint <path> --cmd_vx 0.6 --cmd_wz 0.3 --headless --video
+    --cmd_vx 0.6 --cmd_wz 0.3 --headless --video
 
 # 8. 曲线
 tensorboard --logdir logs/rsl_rl --bind_all --port 6006

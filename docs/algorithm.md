@@ -212,12 +212,12 @@ python -m isaaclab_m20.scripts.train --headless --num_envs 4096 \
     --task Isaac-M20-Wheeled-Velocity-v0 --run_name vel_v1
 
 # 播放：键盘 W/S 改 vx，A/D 改 vy，Q/E 改 ωz，空格清零，P 推一把，R 重置
-python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0 \
-    --checkpoint logs/rsl_rl/m20_velocity/vel_v1/checkpoints/model_3000.pt
+# --task 决定加载哪个任务的 checkpoint（自动找 m20_velocity/ 下最新）
+python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0
 
 # 或无窗口跑固定指令出视频
 python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0 \
-    --checkpoint <path> --cmd_vx 0.6 --cmd_wz 0.3 --headless --video
+    --cmd_vx 0.6 --cmd_wz 0.3 --headless --video
 ```
 
 播放时脚本会把指令重采样时间改成无穷大，并在每个策略步覆写指令缓冲——否则训练里的 4 s 重采样会不停覆盖人工输入。
