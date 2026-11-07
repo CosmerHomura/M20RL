@@ -43,6 +43,10 @@ parser.add_argument(
     help="Fraction of training over which the domain randomization ramps "
          "from 0 (nominal robot) to 1 (full range). 0 disables the curriculum "
          "and applies the full range from the first step.")
+parser.add_argument(
+    "--cmd_ramp", type=float, default=0.5,
+    help="Velocity tasks only: fraction of training over which the command "
+         "sampling range ramps from zero to full. 0 starts at the full range.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 if args_cli.video:
@@ -116,23 +120,47 @@ def attach_diagnostics(env, every: int, zero_actions: bool) -> None:
 
 
 def attach_curriculum(env, max_iterations: int, num_steps_per_env: int,
-                      ramp_fraction: float) -> None:
-    """Ramp the domain-randomization level from 0 to 1.
+                      ramp_fraction: float, cmd_ramp: float) -> None:
+    """Ramp the domain-randomization level, and the command range, from 0 to 1.
 
     Full randomization from the first step means the policy is asked to survive
     pushes and payload changes before it has learned to stand at all -- survival
     typically rises for a while and then collapses. Starting at 0 and ramping
     keeps the task in the learnable band: the nominal robot first, the
     distribution later.
+
+    The command range gets its own ramp for the same reason, plus one specific
+    to the reward design: ``joint_deviation`` is gated on ``|cmd| < 0.1``
+    (legged_gym ``stand_still``), and with the full range sampled uniformly that
+    gate is hit about 0.1% of the time -- the posture penalty would be dead code.
+    Ramping the range up from zero makes every environment hit it early on, so
+    the robot first learns to stand still, then to track small commands, then
+    the full range.
     """
     from isaaclab_m20.tasks import dr
 
-    if ramp_fraction <= 0.0:
+    diag_every = 50
+    ramp_iterations = max(int(max_iterations * ramp_fraction), 1)
+    plain_dr = ramp_fraction <= 0.0
+
+    command_term = None
+    cmd_ramp_iterations = 0
+    if cmd_ramp > 0.0:
+        manager = getattr(env.unwrapped, "command_manager", None)
+        if manager is not None and "base_velocity" in manager.active_terms:
+            command_term = manager.get_term("base_velocity")
+            dr.register_command_term(command_term)
+            dr.set_command_level(0.0)
+            dr.zero_command(command_term)
+            cmd_ramp_iterations = max(int(max_iterations * cmd_ramp), 1)
+            print(f"[INFO] Command range ramps 0 -> 1 over {cmd_ramp_iterations} iterations.")
+
+    if plain_dr:
         dr.set_level(1.0)
         print("[INFO] --dr_ramp 0: full domain randomization from step 0.")
-        return
+    else:
+        print(f"[INFO] Domain randomization ramps 0 -> 1 over {ramp_iterations} iterations.")
 
-    ramp_iterations = max(int(max_iterations * ramp_fraction), 1)
     original_step = env.step
     state = {"n": 0}
 
@@ -141,13 +169,17 @@ def attach_curriculum(env, max_iterations: int, num_steps_per_env: int,
         state["n"] += 1
         if state["n"] % num_steps_per_env == 0:
             iteration = state["n"] // num_steps_per_env
-            level = dr.set_level(iteration / ramp_iterations)
-            if iteration % 50 == 0:
-                print(f"[dr] iteration={iteration:5d} level={level:.2f}", flush=True)
+            level = 1.0 if plain_dr else dr.set_level(iteration / ramp_iterations)
+            cmd_level = (dr.set_command_level(iteration / cmd_ramp_iterations)
+                         if command_term is not None else 0.0)
+            if iteration % diag_every == 0:
+                msg = f"[dr] iteration={iteration:5d} level={level:.2f}"
+                if command_term is not None:
+                    msg += f" cmd_level={cmd_level:.2f}"
+                print(msg, flush=True)
         return out
 
     env.step = step
-    print(f"[INFO] Domain randomization ramps 0 -> 1 over {ramp_iterations} iterations.")
 
 
 def main() -> None:
@@ -197,7 +229,7 @@ def main() -> None:
     if args_cli.zero_actions:
         print("[INFO] --zero_actions: holding the default pose, actions are forced to 0.")
     attach_curriculum(env, agent_cfg.max_iterations, agent_cfg.num_steps_per_env,
-                      args_cli.dr_ramp)
+                      args_cli.dr_ramp, args_cli.cmd_ramp)
     attach_diagnostics(env, args_cli.health_every, args_cli.zero_actions)
 
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)

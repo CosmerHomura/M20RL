@@ -151,12 +151,14 @@ level = clamp(iteration / (max_iterations × --dr_ramp), 0, 1)
 
 `mdp.UniformVelocityCommandCfg`，机体系 `(vx, vy, ωz)`：
 
-| 维度 | 范围 | 说明 |
+| 维度 | 满幅范围 | 说明 |
 | --- | --- | --- |
 | `lin_vel_x` | ±1.0 m/s | 前后 |
-| `lin_vel_y` | ±0.4 m/s | 横移，轮腿机器人可以侧滑，但给窄一点 |
+| `lin_vel_y` | ±0.4 m/s | 横移。髋只有外展 + 俯仰两个自由度，没有髋偏航，所以横向**不能纯靠轮子滚**，得靠腿侧向蹬/抬；范围给窄一点 |
 | `ang_vel_z` | ±1.0 rad/s | 偏航角速度 |
 | 重采样 | 每 4 s | `heading_command=False`，直接给角速度而不是让环境算 heading 误差 |
+
+上表是**满幅**。实际生效的是 `满幅 × cmd_level`，见下面的指令课程。
 
 `heading_command=False` 是刻意的：heading 模式下指令是"朝向某个绝对角度"，环境内部再转成 ωz 误差，观测里那 3 维的含义就不再是纯粹的角速度了。直接给 ωz，观测、奖励、部署三处口径一致。
 
@@ -173,6 +175,29 @@ level = clamp(iteration / (max_iterations × --dr_ramp), 0, 1)
 
 `stand_still` 那一条是 legged_gym 的做法：一直罚"偏离默认站姿"，等于和横移/转向需要的抬腿动作对着干，策略会学到"站着不动最划算"。门控之后，静止段保持姿态、运动段释放自由度。
 
+**但门控只在指令课程下才成立。** 满幅均匀采样时，`‖cmd‖ < 0.1` 的命中率是
+
+```text
+半径 0.1 的球体积 4.19e-3 / 采样盒体积 (2 × 0.8 × 2 = 3.2) = 0.13%
+```
+
+也就是约 770 个环境步才命中一次——姿态惩罚在满幅采样下等于**从来没生效过**，配置里写的行为并不存在。所以指令范围必须从零开始爬（见下），早期所有环境都命中这条门控，站姿先练出来，之后才逐步放开。
+
+### 指令课程
+
+与域随机化课程并列的第二条调度（`--cmd_ramp`，默认 0.5）：
+
+```text
+cmd_level = clamp(iteration / (max_iterations × --cmd_ramp), 0, 1)
+采样范围 = 满幅 × cmd_level
+```
+
+`cmd_level = 0` 时指令恒为 0，等价于站立任务；1500 轮后爬到满幅。`UniformVelocityCommand` 每次重采样都读 `cfg.ranges`，所以直接改 term 的 config 就生效（与 events 不同，那里是深拷贝，见 §4）。
+
+另外训练启动时会把指令缓冲清零一次：建场景时抽的指令用的是满幅，而第一次重采样要等 4 s，不擦掉的话策略开局 4 s 就被要求跑 1 m/s。
+
+这一步不只服务 `stand_still`。从满幅 `vy ±0.4` 冷启动，策略连"该往哪个方向走"都分不清，跟踪分长期贴着 0；从小到大是同一个任务族里更容易的那一支，梯度也更有方向。
+
 ### 其余设置
 
 - 回合 **20 s**（站立是 10 s）：一个回合里能放 5 段指令，而不是只有 1 段，同一个回合内的切换也是策略要面对的。
@@ -182,7 +207,7 @@ level = clamp(iteration / (max_iterations × --dr_ramp), 0, 1)
 ### 训练与播放
 
 ```bash
-# 训练（建议 4096 环境，4090 上占一半显存）
+# 训练（建议 4096 环境，4090 上占一半显存）。--cmd_ramp 0 关掉指令课程
 python -m isaaclab_m20.scripts.train --headless --num_envs 4096 \
     --task Isaac-M20-Wheeled-Velocity-v0 --run_name vel_v1
 
@@ -206,6 +231,9 @@ python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0 \
 | `Episode_Reward/track_wheel_vel` | **不存在**，看到这一项说明跑的是站立任务 |
 | `Episode_Termination/base_height` / `bad_orientation` | 从高往低降 |
 | `Episode_Reward/alive` | 上限 0.15 × 1000 步 = 150（20 s 回合） |
+| `Episode_Reward/joint_deviation` | 早期（`cmd_level` 小）是活跃的，后期趋近 0，符合预期 |
 | `Loss/learning_rate` | 自适应 |
 
-跟踪分数上不去最常见的原因是**指令范围太大**：±1.0 m/s 加 ±1.0 rad/s 同时抽，一部分组合本来就接近侧翻边界。先把 `ang_vel_z` 收到 ±0.6 再试。
+终端里 `[dr] iteration=... level=... cmd_level=...` 每 50 轮打印一次，`level` 是域随机化、`cmd_level` 是指令范围。**前 1500 轮 `cmd_level` 很小的时候跟踪分低是正常的**，此时指令本身就只有零点几 m/s。
+
+跟踪分数上不去最常见的原因是**指令范围太大**：±1.0 m/s 加 ±1.0 rad/s 同时抽，一部分组合本来就接近侧翻边界。先把 `ang_vel_z` 收到 ±0.6、或把 `--cmd_ramp` 调到 0.7 再试。
