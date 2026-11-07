@@ -12,10 +12,11 @@ Difference from the standing task:
 * the wheel-standstill reward is gone -- a moving robot's wheels must turn --
   and is replaced by a wheel/body rolling-consistency term, so that spinning
   the wheels on the spot is not free
-* the leg-posture penalty is gated on the lateral and yaw commands only, not on
-  the whole command vector: forward driving is pure rolling, so the legs must
-  stay in the stance while it happens (legged_gym's ``stand_still`` gate leaves
-  them unconstrained over the entire forward range)
+* the leg-posture penalty is applied unconditionally, with no ``stand_still``
+  gate: forward driving is pure rolling and needs no leg deviation, and lateral
+  stepping should return to the (symmetric) nominal stance every step
+* velocity tracking is split per axis, because +-3.0 m/s and +-0.6 m/s cannot
+  share one error scale, and that scale also shrinks with the command
 * 20 s episodes so one episode contains five 4 s command segments
 * a wider wheel action scale, so the command range is actually reachable (below)
 * the wheel joints are out of the joint-velocity penalty; a wheel spinning at
@@ -100,11 +101,22 @@ class VelocityRewardsCfg:
     # -- task: exp tracking kernels against the commanded velocity ------------
     # sigma is the error scale of the kernel, not a speed. exp(-e^2/sigma) is
     # ~0 once the error is a few sigma, so sigma has to be a similar fraction of
-    # the command range: 0.25 was tuned for legged_gym's +-1 m/s, and at +-2.5
-    # m/s it would mean "within 10% or nothing" -- a near-step reward with no
-    # gradient to climb. 0.5 keeps the same relative sharpness.
-    track_lin_vel_xy = RewardTermCfg(
-        func=rewards.track_lin_vel_xy_cmd, weight=1.5, params={"sigma": 0.5})
+    # the command range on that axis -- and the two axes are 5x apart, which is
+    # why they are separate terms now instead of one 2-norm.
+    #
+    # Each sigma also follows the command magnitude: sharp (sigma_min) when the
+    # command asks to hold ~zero, widening to sigma_max at `fade`. A single
+    # sigma for the whole axis cannot serve both ends -- 0.5 gives no gradient
+    # to 3 m/s tracking, 0.0625 makes 3 m/s unreachable.
+    track_lin_vel_x = RewardTermCfg(
+        func=rewards.track_lin_vel_cmd, weight=1.5,
+        params={"axis": 0, "sigma_max": 0.5, "sigma_min": 0.0625, "fade": 1.5})
+    # Lateral: range is only +-0.6, so both sigma values are much smaller.
+    # 0.1 at full command means a 0.3 m/s error still scores 0.41; 0.02 at a
+    # zero command means a 0.1 m/s slip already costs half the channel.
+    track_lin_vel_y = RewardTermCfg(
+        func=rewards.track_lin_vel_cmd, weight=1.0,
+        params={"axis": 1, "sigma_max": 0.1, "sigma_min": 0.02, "fade": 0.3})
     track_ang_vel_z = RewardTermCfg(
         func=rewards.track_ang_vel_z_cmd, weight=0.75, params={"sigma": 0.25})
     # Wheels and body agree on forward speed = the wheels are not slipping.
@@ -121,12 +133,12 @@ class VelocityRewardsCfg:
         func=rewards.base_height_l2, weight=-20.0, params={"target_height": 0.50})
 
     # -- posture and smoothness ----------------------------------------------
-    # Gated on |vy, wz| rather than on the whole command: forward driving is
-    # pure wheel rolling and the legs have no business leaving the stance, so
-    # the posture must be held over the whole vx range, not only at |cmd| ~ 0.
-    joint_deviation = RewardTermCfg(
-        func=rewards.joint_deviation_l1_when_rolling, weight=-0.5,
-        params={"threshold": 0.1})
+    # Always on -- no stand_still gate. Gating it off for lateral/yaw commands
+    # removed the constraint exactly where the legs move most, which is how the
+    # rear legs ended up one fore and one aft. The default stance is the target
+    # every step should return to, and it is symmetric, so this term is also
+    # what keeps the left and right legs mirrored.
+    joint_deviation = RewardTermCfg(func=rewards.joint_deviation_l1, weight=-0.5)
     # Legs only. Four wheels at 40 rad/s contribute 4 * 1600 * 1e-4 = 0.64 per
     # step -- 40% of the maximum tracking reward -- which is a direct tax on the
     # behaviour being asked for. Wheel smoothness is already covered by
