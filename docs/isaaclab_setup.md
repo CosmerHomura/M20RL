@@ -159,6 +159,27 @@ python -m isaaclab_m20.scripts.play --checkpoint <path> --headless --video
 
 `play.py` 加载 checkpoint 后就地站立推演，视频写到 `videos/`，`--video_length` 是策略步数（50 Hz，500 步 = 10 s）。
 
+### 推一把试试
+
+打开视口时可以用键盘：
+
+| 键 | 作用 |
+| --- | --- |
+| `P` | 给机身一个随机水平方向的瞬时速度冲量 |
+| `R` | 重置所有环境 |
+
+```bash
+# 手动推：P 键推一次，--push_speed 是冲量大小（m/s）
+python -m isaaclab_m20.scripts.play --num_envs 16 --push_speed 1.0
+
+# 自动推：每 3 秒推一次，适合录视频
+python -m isaaclab_m20.scripts.play --num_envs 16 --push_every 3 --headless --video
+```
+
+推力用的和训练时的 `push_robot` 是同一个机制（`write_root_velocity_to_sim`，瞬时改变机身速度），所以可以直接对比：训练时是 ±0.5 m/s，`--push_speed 1.0` 就是**两倍于训练强度**的测试。
+
+视口模式下默认按实时速度播放；headless 不限速。想强制关掉限速加 `--no-real_time`。
+
 ## 7. 控制与观测速查
 
 **当前任务是静态站立**：无速度指令，目标原地站稳、保持高度 0.50 m、机身水平、不漂移。PPO 输出关节**位置目标**，PD 伺服环在 200 Hz 跟踪成力矩。

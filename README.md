@@ -38,11 +38,11 @@ python -m isaaclab_m20.scripts.check_m20 --headless --convert urdf
 # 2. 训练（静态站立）
 python -m isaaclab_m20.scripts.train --headless --num_envs 4096
 
-# 3. 播放（加载最新 checkpoint，16 个环境）
+# 3. 播放（加载最新 checkpoint，16 个环境）。视口里按 P 推一下机器人，R 重置
 python -m isaaclab_m20.scripts.play --num_envs 16
 
-# 4. 无界面录视频
-python -m isaaclab_m20.scripts.play --num_envs 16 --headless --video
+# 4. 无界面录视频，每 3 秒自动推一次
+python -m isaaclab_m20.scripts.play --num_envs 16 --push_every 3 --headless --video
 
 # 5. 曲线
 tensorboard --logdir logs/rsl_rl --bind_all --port 6006

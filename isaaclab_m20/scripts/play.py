@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import math
+import random
 import sys
 import time
 from pathlib import Path
@@ -28,7 +30,17 @@ parser.add_argument("--log_root", type=str, default=str(REPO_ROOT / "logs" / "rs
 parser.add_argument("--video", action="store_true", help="Record a video instead of opening the viewer.")
 parser.add_argument("--video_length", type=int, default=500, help="Video length in policy steps.")
 parser.add_argument("--video_folder", type=str, default=str(REPO_ROOT / "videos"))
-parser.add_argument("--real_time", action="store_true", help="Throttle the loop to the simulated step time.")
+parser.add_argument(
+    "--real_time", action=argparse.BooleanOptionalAction, default=None,
+    help="Throttle the loop to the simulated step time. Defaults to on with a "
+         "viewer, off when headless.")
+parser.add_argument(
+    "--push_speed", type=float, default=1.0,
+    help="Horizontal velocity impulse in m/s applied by the push key / auto-push.")
+parser.add_argument(
+    "--push_every", type=float, default=0.0,
+    help="Apply a push every N seconds of simulated time (0 disables). Useful "
+         "for videos; with a viewer you can also press P by hand.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 if args_cli.video:
@@ -63,6 +75,46 @@ def resolve_checkpoint() -> Path:
     return candidates[-1]
 
 
+def shove(env, speed: float) -> None:
+    """Instantaneous horizontal velocity change -- the same disturbance training used."""
+    robot = env.unwrapped.scene["robot"]
+    angle = random.uniform(0.0, 2.0 * math.pi)
+    root_vel = robot.data.root_vel_w.clone()
+    root_vel[:, 0] += speed * math.cos(angle)
+    root_vel[:, 1] += speed * math.sin(angle)
+    robot.write_root_velocity_to_sim(root_vel)
+
+
+class KeyboardPusher:
+    """P = shove the robot, R = reset every environment. Needs a viewer window."""
+
+    def __init__(self, speed: float):
+        import carb.input
+        import omni.appwindow
+
+        self._ki = carb.input
+        self.speed = speed
+        self.pending_push = False
+        self.reset_requested = False
+
+        self._appwindow = omni.appwindow.get_default_app_window()
+        self._input = carb.input.acquire_input_interface()
+        self._keyboard = self._appwindow.get_keyboard()
+        self._sub = self._input.subscribe_to_keyboard_events(self._keyboard, self._on_event)
+
+    def _on_event(self, event, *args, **kwargs):
+        if event.type != self._ki.KeyboardEventType.KEY_PRESS:
+            return True
+        if event.input == self._ki.KeyboardInput.P:
+            self.pending_push = True
+        elif event.input == self._ki.KeyboardInput.R:
+            self.reset_requested = True
+        return True
+
+    def close(self) -> None:
+        self._input.unsubscribe_to_keyboard_events(self._keyboard, self._sub)
+
+
 def main() -> None:
     entry_point = gym.spec(args_cli.task).kwargs["env_cfg_entry_point"]
     module_name, class_name = entry_point.split(":")
@@ -95,19 +147,47 @@ def main() -> None:
 
     obs = env.get_observations()
     dt = env.unwrapped.step_dt
+    real_time = args_cli.real_time if args_cli.real_time is not None else not args_cli.headless
+    push_period = int(round(args_cli.push_every / dt)) if args_cli.push_every > 0 else 0
+
+    keyboard = None
+    if not args_cli.headless:
+        try:
+            keyboard = KeyboardPusher(args_cli.push_speed)
+            print("[INFO] Viewer controls:  P = push the robot   R = reset")
+        except Exception as exc:  # no window or no input interface available
+            print(f"[WARN] Keyboard control unavailable: {exc}")
+    if push_period:
+        print(f"[INFO] Auto-push every {args_cli.push_every:g} s at {args_cli.push_speed:g} m/s")
+
     timestep = 0
     while simulation_app.is_running():
         start = time.time()
         with torch.inference_mode():
             obs, _, _, _ = env.step(policy(obs))
         timestep += 1
+
+        if push_period and timestep % push_period == 0:
+            shove(env, args_cli.push_speed)
+        if keyboard is not None:
+            if keyboard.pending_push:
+                shove(env, args_cli.push_speed)
+                keyboard.pending_push = False
+            if keyboard.reset_requested:
+                env.unwrapped.reset()
+                obs = env.get_observations()
+                keyboard.reset_requested = False
+
         if args_cli.video and timestep >= args_cli.video_length:
             print(f"[INFO] Wrote video to {args_cli.video_folder}")
             break
-        if args_cli.real_time:
+        if real_time:
             sleep_time = dt - (time.time() - start)
             if sleep_time > 0:
                 time.sleep(sleep_time)
+
+    if keyboard is not None:
+        keyboard.close()
     env.close()
 
 
