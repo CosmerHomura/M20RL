@@ -206,12 +206,20 @@ class EventCfg:
         },
     )
 
-    # -- reset: dynamics ------------------------------------------------------
+    # -- startup: dynamics ----------------------------------------------------
     # Payload on the body: cameras, a lid, a different battery. Additive in kg,
     # and the inertia is recomputed so the tensor stays consistent with the mass.
+    #
+    # MUST be mode="startup", not "reset". IsaacLab's mass/com randomizers read
+    # the *current* value from PhysX and add to it, so re-running them on every
+    # reset compounds: an environment that resets 300 times ends up adding a
+    # sample 300 times, and its mass climbs without bound. That shows up exactly
+    # as survival rising and then collapsing late in training. With startup the
+    # sample is drawn once, but per environment -- 4096 environments still give
+    # the policy a distribution of robots to survive.
     base_mass = EventTermCfg(
-        func=dr.randomize_rigid_body_mass,
-        mode="reset",
+        func=mdp.randomize_rigid_body_mass,
+        mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
             "mass_distribution_params": (-2.0, 3.0),
@@ -220,9 +228,10 @@ class EventCfg:
         },
     )
     # Centre-of-mass shift: mounted equipment is never perfectly centred.
+    # Startup for the same reason as base_mass.
     base_com = EventTermCfg(
-        func=dr.randomize_rigid_body_com,
-        mode="reset",
+        func=mdp.randomize_rigid_body_com,
+        mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
             "com_range": {"x": (-0.03, 0.03), "y": (-0.03, 0.03), "z": (-0.02, 0.02)},

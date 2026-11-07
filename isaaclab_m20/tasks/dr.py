@@ -64,31 +64,12 @@ def reset_joints_by_offset(env, env_ids, position_range, velocity_range,
 
 
 # --------------------------------------------------------------------------- #
-# Dynamics (reset)
-# --------------------------------------------------------------------------- #
-def randomize_rigid_body_mass(env, env_ids, asset_cfg, mass_distribution_params,
-                              operation="add", distribution="uniform",
-                              recompute_inertia=True):
-    mdp.randomize_rigid_body_mass(
-        env, env_ids,
-        asset_cfg=asset_cfg,
-        mass_distribution_params=tuple(v * _LEVEL for v in mass_distribution_params),
-        operation=operation,
-        distribution=distribution,
-        recompute_inertia=recompute_inertia,
-    )
-
-
-def randomize_rigid_body_com(env, env_ids, asset_cfg, com_range):
-    mdp.randomize_rigid_body_com(
-        env, env_ids,
-        asset_cfg=asset_cfg,
-        com_range=_scale(com_range, _LEVEL),
-    )
-
-
-# --------------------------------------------------------------------------- #
 # Disturbance (interval)
+# --------------------------------------------------------------------------- #
+# Mass and centre-of-mass randomization deliberately have no wrapper here: they
+# read the current value out of PhysX and add to it, so they compound if run
+# again on every reset. They are mode="startup" in the config instead, which
+# also means there is nothing to schedule.
 # --------------------------------------------------------------------------- #
 def push_by_setting_velocity(env, env_ids, velocity_range,
                              asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")):
