@@ -38,6 +38,11 @@ parser.add_argument(
 parser.add_argument(
     "--health_every", type=int, default=24,
     help="Print sim-health stats every N env steps (0 disables).")
+parser.add_argument(
+    "--dr_ramp", type=float, default=0.4,
+    help="Fraction of training over which the domain randomization ramps "
+         "from 0 (nominal robot) to 1 (full range). 0 disables the curriculum "
+         "and applies the full range from the first step.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 if args_cli.video:
@@ -111,6 +116,41 @@ def attach_diagnostics(env, every: int, zero_actions: bool) -> None:
     env.step = step
 
 
+def attach_curriculum(env, max_iterations: int, num_steps_per_env: int,
+                      ramp_fraction: float) -> None:
+    """Ramp the domain-randomization level from 0 to 1.
+
+    Full randomization from the first step means the policy is asked to survive
+    pushes and payload changes before it has learned to stand at all -- survival
+    typically rises for a while and then collapses. Starting at 0 and ramping
+    keeps the task in the learnable band: the nominal robot first, the
+    distribution later.
+    """
+    from isaaclab_m20.tasks import dr
+
+    if ramp_fraction <= 0.0:
+        dr.set_level(1.0)
+        print("[INFO] --dr_ramp 0: full domain randomization from step 0.")
+        return
+
+    ramp_iterations = max(int(max_iterations * ramp_fraction), 1)
+    original_step = env.step
+    state = {"n": 0}
+
+    def step(action):
+        out = original_step(action)
+        state["n"] += 1
+        if state["n"] % num_steps_per_env == 0:
+            iteration = state["n"] // num_steps_per_env
+            level = dr.set_level(iteration / ramp_iterations)
+            if iteration % 50 == 0:
+                print(f"[dr] iteration={iteration:5d} level={level:.2f}", flush=True)
+        return out
+
+    env.step = step
+    print(f"[INFO] Domain randomization ramps 0 -> 1 over {ramp_iterations} iterations.")
+
+
 def main() -> None:
     entry_point = gym.spec(args_cli.task).kwargs["env_cfg_entry_point"]
     module_name, class_name = entry_point.split(":")
@@ -155,6 +195,8 @@ def main() -> None:
     print(f"[INFO] Action space: {env.action_space}  Observation space: {env.observation_space}")
     if args_cli.zero_actions:
         print("[INFO] --zero_actions: holding the default pose, actions are forced to 0.")
+    attach_curriculum(env, agent_cfg.max_iterations, agent_cfg.num_steps_per_env,
+                      args_cli.dr_ramp)
     attach_diagnostics(env, args_cli.health_every, args_cli.zero_actions)
 
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)

@@ -10,7 +10,7 @@ from isaaclab_rl.rsl_rl import (
 @configclass
 class M20RslRlPpoRunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
-    max_iterations = 2000
+    max_iterations = 3000
     save_interval = 100
     experiment_name = "m20_wheeled"
     empirical_normalization = False

@@ -20,7 +20,7 @@ from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 
 from isaaclab_m20.assets import M20_CFG
-from isaaclab_m20.tasks import rewards
+from isaaclab_m20.tasks import dr, rewards
 
 
 @configclass
@@ -158,7 +158,7 @@ class EventCfg:
 
     # -- reset: initial state -------------------------------------------------
     reset_base = EventTermCfg(
-        func=mdp.reset_root_state_uniform,
+        func=dr.reset_root_state_uniform,
         mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("robot"),
@@ -179,7 +179,7 @@ class EventCfg:
     # Leg joints only: a wheel's absolute angle is meaningless, so offsetting it
     # buys nothing and just adds noise to the first step.
     reset_joints = EventTermCfg(
-        func=mdp.reset_joints_by_offset,
+        func=dr.reset_joints_by_offset,
         mode="reset",
         params={
             "asset_cfg": SceneEntityCfg(
@@ -194,6 +194,8 @@ class EventCfg:
     # episodes and PhysX never wraps it. Zero it every reset so the joint_pos
     # observation does not drift upward all run -- but do not add an offset,
     # the angle itself carries no information.
+    # Deliberately NOT curriculum-scaled: this is a bookkeeping reset, not a
+    # randomization, so it has to run at every level including 0.
     reset_wheels = EventTermCfg(
         func=mdp.reset_joints_by_offset,
         mode="reset",
@@ -208,7 +210,7 @@ class EventCfg:
     # Payload on the body: cameras, a lid, a different battery. Additive in kg,
     # and the inertia is recomputed so the tensor stays consistent with the mass.
     base_mass = EventTermCfg(
-        func=mdp.randomize_rigid_body_mass,
+        func=dr.randomize_rigid_body_mass,
         mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
@@ -219,7 +221,7 @@ class EventCfg:
     )
     # Centre-of-mass shift: mounted equipment is never perfectly centred.
     base_com = EventTermCfg(
-        func=mdp.randomize_rigid_body_com,
+        func=dr.randomize_rigid_body_com,
         mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
@@ -231,7 +233,7 @@ class EventCfg:
     # Instantaneous velocity change, i.e. a shove. Episode is 10 s, so this
     # lands roughly once or twice per episode.
     push_robot = EventTermCfg(
-        func=mdp.push_by_setting_velocity,
+        func=dr.push_by_setting_velocity,
         mode="interval",
         interval_range_s=(4.0, 8.0),
         params={
