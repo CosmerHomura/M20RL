@@ -127,8 +127,8 @@ def attach_diagnostics(env, every: int, zero_actions: bool) -> None:
 # Staged rather than a linear ramp because a ramp spends most of its iterations
 # in the slow band, where there is nothing left to learn, and reaches the
 # interesting 2-3 m/s regime only near the end. Stage 0 is deliberately short:
-# it exists to give the posture penalty (gated on |cmd| < 0.1) something to
-# shape, not to train a standing policy from scratch.
+# it exists to settle the stance and the base-height/posture terms, not to
+# train a standing policy from scratch (the standing task already did that).
 COMMAND_STAGES: tuple[tuple[float, float, float, float], ...] = (
     (0.05, 0.0, 0.00, 0.0),   # 站立
     (0.25, 0.6, 0.15, 0.3),   # 低速
@@ -156,12 +156,12 @@ def attach_curriculum(env, max_iterations: int, num_steps_per_env: int,
     while and then collapses. Starting at 0 and ramping keeps the task in the
     learnable band: the nominal robot first, the distribution later.
 
-    Commands: the staged table above, for a reason specific to the reward
-    design -- ``joint_deviation`` is gated on ``|cmd| < 0.1`` (legged_gym
-    ``stand_still``), and with the full range sampled uniformly that gate is hit
-    about 0.03% of the time, so the posture penalty would be dead code. The
-    standing stage makes every environment hit it, and the later stages hand
-    over to the tracking reward.
+    Commands: the staged table above, so that the tracking task widens at the
+    pace the policy can absorb. Sampling +-3 m/s from step 0 asks for a reward
+    density the untrained policy cannot reach anywhere, while a linear ramp
+    spends most of its iterations in the slow band where there is nothing left
+    to learn. The short standing stage exists to establish the stance and the
+    base-height/posture terms before any command asks for motion.
     """
     from isaaclab_m20.tasks import dr
 

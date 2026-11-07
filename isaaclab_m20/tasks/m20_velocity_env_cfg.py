@@ -9,9 +9,13 @@ Difference from the standing task:
 
 * observation 57 -> 60 dims: the 3-dim (vx, vy, wz) command is prepended
 * the tracking kernels measure the error against the command instead of zero
-* the wheel-standstill reward is gone -- a moving robot's wheels must turn
-* the leg-posture penalty only applies while the command is ~zero (legged_gym's
-  ``stand_still``), otherwise it fights the leg motion steering needs
+* the wheel-standstill reward is gone -- a moving robot's wheels must turn --
+  and is replaced by a wheel/body rolling-consistency term, so that spinning
+  the wheels on the spot is not free
+* the leg-posture penalty is gated on the lateral and yaw commands only, not on
+  the whole command vector: forward driving is pure rolling, so the legs must
+  stay in the stance while it happens (legged_gym's ``stand_still`` gate leaves
+  them unconstrained over the entire forward range)
 * 20 s episodes so one episode contains five 4 s command segments
 * a wider wheel action scale, so the command range is actually reachable (below)
 * the wheel joints are out of the joint-velocity penalty; a wheel spinning at
@@ -103,6 +107,11 @@ class VelocityRewardsCfg:
         func=rewards.track_lin_vel_xy_cmd, weight=1.5, params={"sigma": 0.5})
     track_ang_vel_z = RewardTermCfg(
         func=rewards.track_ang_vel_z_cmd, weight=0.75, params={"sigma": 0.25})
+    # Wheels and body agree on forward speed = the wheels are not slipping.
+    # Neutral at a standstill (see the docstring), so it does not bias toward
+    # standing; it only makes "spin the wheels, go nowhere" unprofitable.
+    wheel_roll = RewardTermCfg(
+        func=rewards.wheel_roll_vel_exp, weight=0.5, params={"sigma": 0.25})
 
     # -- base stability -------------------------------------------------------
     lin_vel_z = RewardTermCfg(func=rewards.lin_vel_z_l2, weight=-2.0)
@@ -112,8 +121,11 @@ class VelocityRewardsCfg:
         func=rewards.base_height_l2, weight=-20.0, params={"target_height": 0.50})
 
     # -- posture and smoothness ----------------------------------------------
+    # Gated on |vy, wz| rather than on the whole command: forward driving is
+    # pure wheel rolling and the legs have no business leaving the stance, so
+    # the posture must be held over the whole vx range, not only at |cmd| ~ 0.
     joint_deviation = RewardTermCfg(
-        func=rewards.joint_deviation_l1_when_still, weight=-0.5,
+        func=rewards.joint_deviation_l1_when_rolling, weight=-0.5,
         params={"threshold": 0.1})
     # Legs only. Four wheels at 40 rad/s contribute 4 * 1600 * 1e-4 = 0.64 per
     # step -- 40% of the maximum tracking reward -- which is a direct tax on the
