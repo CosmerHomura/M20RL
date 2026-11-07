@@ -17,9 +17,11 @@ model/
 ```text
 isaaclab_m20/
 ├── assets/m20.py              # ArticulationCfg：USD 路径、初始姿态、腿/轮执行器增益
-├── tasks/rewards.py           # 奖励项函数
-├── tasks/m20_env_cfg.py       # 场景、观测、动作、指令、奖励、终止、事件
-├── tasks/__init__.py          # gym.register("Isaac-M20-Wheeled-v0")
+├── tasks/rewards.py           # 奖励项函数（两个任务共用）
+├── tasks/m20_env_cfg.py       # 静态站立：场景、观测、动作、奖励、终止、事件
+├── tasks/m20_velocity_env_cfg.py  # 速度指令：继承上者，换观测/奖励/指令
+├── tasks/dr.py                # 域随机化的课程缩放
+├── tasks/__init__.py          # gym.register(...) 两个任务 id
 ├── tasks/agents/rsl_rl_ppo_cfg.py
 └── scripts/
     ├── check_m20.py           # 加载 USD，打印关节/质量，验证资产
@@ -167,6 +169,10 @@ python -m isaaclab_m20.scripts.play --checkpoint <path> --headless --video
 | --- | --- |
 | `P` | 给机身一个随机水平方向的瞬时速度冲量 |
 | `R` | 重置所有环境 |
+| `W` / `S` | 前进 / 后退速度指令 ±`--cmd_step`（仅速度指令任务） |
+| `A` / `D` | 左 / 右横移指令（仅速度指令任务） |
+| `Q` / `E` | 偏航角速度指令（仅速度指令任务） |
+| `Space` | 指令清零（仅速度指令任务） |
 
 ```bash
 # 手动推：P 键推一次，--push_speed 是冲量大小（m/s）
@@ -174,7 +180,17 @@ python -m isaaclab_m20.scripts.play --num_envs 16 --push_speed 1.0
 
 # 自动推：每 3 秒推一次，适合录视频
 python -m isaaclab_m20.scripts.play --num_envs 16 --push_every 3 --headless --video
+
+# 速度指令任务：键盘实时给指令
+python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0 \
+    --checkpoint <m20_velocity/model_*.pt>
+
+# 速度指令任务：固定指令（headless 时也可用）
+python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0 \
+    --checkpoint <path> --cmd_vx 0.6 --cmd_vy 0.0 --cmd_wz 0.3 --headless --video
 ```
+
+速度指令任务里，`play.py` 会把指令重采样时间改成无穷大，并在每个策略步覆写指令缓冲——否则训练配置里 4 s 一次的重采样会不停覆盖人工输入。
 
 推力用的和训练时的 `push_robot` 是同一个机制（`write_root_velocity_to_sim`，瞬时改变机身速度），所以可以直接对比：训练时是 ±0.5 m/s，`--push_speed 1.0` 就是**两倍于训练强度**的测试。
 
@@ -182,9 +198,14 @@ python -m isaaclab_m20.scripts.play --num_envs 16 --push_every 3 --headless --vi
 
 ## 7. 控制与观测速查
 
-**当前任务是静态站立**：无速度指令，目标原地站稳、保持高度 0.50 m、机身水平、不漂移。PPO 输出关节**位置目标**，PD 伺服环在 200 Hz 跟踪成力矩。
+两个任务共用同一套场景、动作、PD 与终止条件，差别只在观测/奖励/指令：
 
-观测 57 维：base_lin_vel(3) + base_ang_vel(3) + projected_gravity(3) + joint_pos(16) + joint_vel(16) + last_action(16)。
+| gym id | 任务 | 观测 | 回合 | 日志目录 |
+| --- | --- | --- | --- | --- |
+| `Isaac-M20-Wheeled-v0` | 静态站立，无指令 | 57 维 | 10 s | `logs/rsl_rl/m20_wheeled/` |
+| `Isaac-M20-Wheeled-Velocity-v0` | `(vx, vy, ωz)` 跟踪 | 60 维 | 20 s | `logs/rsl_rl/m20_velocity/` |
+
+观测 57 维 = base_lin_vel(3) + base_ang_vel(3) + projected_gravity(3) + joint_pos(16) + joint_vel(16) + last_action(16)；速度指令任务在最前面再加 3 维指令。**两边的 checkpoint 不能互换。**
 
 | 项 | 配置 |
 | --- | --- |
@@ -193,7 +214,8 @@ python -m isaaclab_m20.scripts.play --num_envs 16 --push_every 3 --headless --vi
 | 轮动作 | `JointVelocityActionCfg(scale=20)`，`use_default_offset=False` |
 | PD 伺服 | 腿 kp=80 / kd=2，轮 kp=0 / kd=2，200 Hz |
 | 力矩上限 | 腿 76.4 N·m，轮 21.6 N·m |
-| 奖励 | 共 14 项，完整权重表见 [docs/algorithm.md](algorithm.md) 第 1 节 |
+| 指令范围（速度指令任务） | vx ±1.0 m/s，vy ±0.4 m/s，ωz ±1.0 rad/s，每 4 s 重采样 |
+| 奖励 | 站立 14 项 / 速度指令 13 项（去掉轮速归零），完整权重表见 [docs/algorithm.md](algorithm.md) 第 1 节与第 6 节 |
 | 终止 | 高度 < 0.25、倾角 > 0.7、超时 |
 
 ## 8. 常见问题
@@ -215,7 +237,8 @@ python -m isaaclab_m20.scripts.play --num_envs 16 --push_every 3 --headless --vi
 
 | 想改的东西 | 文件 |
 | --- | --- |
-| 奖励权重、指令范围、终止条件 | `isaaclab_m20/tasks/m20_env_cfg.py` |
+| 奖励权重、终止条件（站立） | `isaaclab_m20/tasks/m20_env_cfg.py` |
+| 奖励权重、指令范围（速度指令） | `isaaclab_m20/tasks/m20_velocity_env_cfg.py` |
 | 奖励函数本身 | `isaaclab_m20/tasks/rewards.py` |
 | PPO 超参（lr、epochs、网络大小） | `isaaclab_m20/tasks/agents/rsl_rl_ppo_cfg.py` |
 | PD 增益、力矩上限、默认姿态 | `isaaclab_m20/assets/m20.py` |

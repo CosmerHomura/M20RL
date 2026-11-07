@@ -62,8 +62,7 @@ from rsl_rl.runners import OnPolicyRunner
 from isaaclab.utils.dict import print_dict
 from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 
-import isaaclab_m20.tasks  # noqa: F401 - registers Isaac-M20-Wheeled-v0
-from isaaclab_m20.tasks.agents.rsl_rl_ppo_cfg import M20RslRlPpoRunnerCfg
+import isaaclab_m20.tasks  # noqa: F401 - registers both M20 task ids
 from isaaclab_m20.tasks.m20_env_cfg import fit_viewer_to_grid
 
 
@@ -159,7 +158,9 @@ def main() -> None:
     env_cfg.seed = args_cli.seed
     fit_viewer_to_grid(env_cfg)
 
-    agent_cfg = M20RslRlPpoRunnerCfg()
+    agent_entry = gym.spec(args_cli.task).kwargs["rsl_rl_cfg_entry_point"]
+    module_name, class_name = agent_entry.split(":")
+    agent_cfg = getattr(importlib.import_module(module_name), class_name)()
     agent_cfg.seed = args_cli.seed
     agent_cfg.device = args_cli.device
     if args_cli.max_iterations is not None:

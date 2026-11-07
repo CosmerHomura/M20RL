@@ -1,8 +1,10 @@
-# 训练算法设计（静态站立）
+# 训练算法设计
+
+本文以**静态站立任务**（`Isaac-M20-Wheeled-v0`）为主线说明奖励函数、策略/价值网络结构，以及 PPO 一整个迭代里「采集 → 计算优势 → 更新网络」的完整流程；**速度指令任务**（`Isaac-M20-Wheeled-Velocity-v0`）的差异集中在 [§6](#6-速度指令任务第二个任务)。配置入口见 `isaaclab_m20/tasks/`：
 
 本文说明当前静态站立任务的奖励函数、策略/价值网络结构，以及 PPO 一整个迭代里「采集 → 计算优势 → 更新网络」的完整流程。配置入口见 `isaaclab_m20/tasks/`：
 
-- 奖励权重与观测/动作：`tasks/m20_env_cfg.py`
+- 奖励权重与观测/动作：`tasks/m20_env_cfg.py`（站立）、`tasks/m20_velocity_env_cfg.py`（速度指令）
 - 奖励公式：`tasks/rewards.py`
 - 网络与 PPO 超参：`tasks/agents/rsl_rl_ppo_cfg.py`
 
@@ -83,7 +85,7 @@ rsl_rl 的 Actor-Critic，两个 MLP 共享同一份观测输入（`obs_groups` 
 4. **自适应学习率**：每遍后若新旧策略 KL 超过 `desired_kl=0.01`，lr 自动减半式下调。
 5. 清空 buffer，用更新后的策略进入下一轮采集。
 
-**训练总量**：`max_iterations=2000` 轮 × 98,304 步 ≈ 2 亿步。每 `save_interval=100` 轮存一个 `checkpoints/model_*.pt`。
+**训练总量**：`max_iterations=3000` 轮 × 98,304 步 ≈ 3 亿步。每 `save_interval=100` 轮存一个 `checkpoints/model_*.pt`。
 
 **为什么直驱力矩开局会大面积趴下**：没有 PD 兜底，随机初始化的策略输出的是乱力矩，机器人生成就倒。这属正常——`base_height`/`flat_orientation` 的信号会把策略逐步拉向"撑住"的力矩组合，通常几百轮内趴下率开始下降。
 
@@ -136,3 +138,74 @@ level = clamp(iteration / (max_iterations × --dr_ramp), 0, 1)
 | `Loss/learning_rate` | 自适应，学不动时自动降 |
 
 加了域随机化之后，`Episode_Reward/*` 的绝对值会整体下降，这是**正常的**——同样的策略在更难的初始条件下拿不到那么多分。看趋势而不是绝对值。
+
+## 6. 速度指令任务（第二个任务）
+
+`Isaac-M20-Wheeled-Velocity-v0`，配置在 `tasks/m20_velocity_env_cfg.py`。它是**独立注册的第二个任务**，站立任务（`Isaac-M20-Wheeled-v0`）一字未改，两者各自训练、各自出 checkpoint。
+
+### 为什么必须是两个任务
+
+观测维度不同：速度指令要把 3 维指令拼进观测，57 → 60 维。Actor 第一层是 `57×512` 的矩阵，加载 60 维输入的 checkpoint 直接 shape mismatch；反之亦然。**两边的 `model_*.pt` 不能互换**，日志也分开放（`logs/rsl_rl/m20_wheeled/` vs `logs/rsl_rl/m20_velocity/`）。
+
+### 指令
+
+`mdp.UniformVelocityCommandCfg`，机体系 `(vx, vy, ωz)`：
+
+| 维度 | 范围 | 说明 |
+| --- | --- | --- |
+| `lin_vel_x` | ±1.0 m/s | 前后 |
+| `lin_vel_y` | ±0.4 m/s | 横移，轮腿机器人可以侧滑，但给窄一点 |
+| `ang_vel_z` | ±1.0 rad/s | 偏航角速度 |
+| 重采样 | 每 4 s | `heading_command=False`，直接给角速度而不是让环境算 heading 误差 |
+
+`heading_command=False` 是刻意的：heading 模式下指令是"朝向某个绝对角度"，环境内部再转成 ωz 误差，观测里那 3 维的含义就不再是纯粹的角速度了。直接给 ωz，观测、奖励、部署三处口径一致。
+
+### 奖励差异
+
+其余项（`lin_vel_z` / `ang_vel_xy` / `flat_orientation` / `base_height` / `joint_vel` / `joint_acc` / `joint_torques` / `action_rate` / `termination_penalty` / `alive`）与站立任务完全相同，只有三处不同：
+
+| 分项 | 站立任务 | 速度指令任务 |
+| --- | --- | --- |
+| `track_lin_vel_xy` | `exp(-‖v_xy‖²/0.25)` | `exp(-‖v_xy − cmd_xy‖²/0.25)` |
+| `track_ang_vel_z` | `exp(-ω_z²/0.25)` | `exp(-(ω_z − cmd_ωz)²/0.25)` |
+| `track_wheel_vel` | +0.5，轮子不许转 | **删除**。要机器人动，就不许罚它动 |
+| `joint_deviation` | 一直生效 | 只在 `‖cmd‖ < 0.1` 时生效（`stand_still`） |
+
+`stand_still` 那一条是 legged_gym 的做法：一直罚"偏离默认站姿"，等于和横移/转向需要的抬腿动作对着干，策略会学到"站着不动最划算"。门控之后，静止段保持姿态、运动段释放自由度。
+
+### 其余设置
+
+- 回合 **20 s**（站立是 10 s）：一个回合里能放 5 段指令，而不是只有 1 段，同一个回合内的切换也是策略要面对的。
+- 域随机化、推力、课程调度、PD 参数、动作缩放全部继承站立任务，没有第二套。
+- `max_iterations=3000`、网络结构与超参也完全一致，只是 `experiment_name` 变成 `m20_velocity`。
+
+### 训练与播放
+
+```bash
+# 训练（建议 4096 环境，4090 上占一半显存）
+python -m isaaclab_m20.scripts.train --headless --num_envs 4096 \
+    --task Isaac-M20-Wheeled-Velocity-v0 --run_name vel_v1
+
+# 播放：键盘 W/S 改 vx，A/D 改 vy，Q/E 改 ωz，空格清零，P 推一把，R 重置
+python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0 \
+    --checkpoint logs/rsl_rl/m20_velocity/vel_v1/checkpoints/model_3000.pt
+
+# 或无窗口跑固定指令出视频
+python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0 \
+    --checkpoint <path> --cmd_vx 0.6 --cmd_wz 0.3 --headless --video
+```
+
+播放时脚本会把指令重采样时间改成无穷大，并在每个策略步覆写指令缓冲——否则训练里的 4 s 重采样会不停覆盖人工输入。
+
+### 看这些指标
+
+| 指标 | 期望趋势 |
+| --- | --- |
+| `Episode_Reward/track_lin_vel_xy` | 往 1.5 爬；满幅约 0.8–1.1 就算收敛 |
+| `Episode_Reward/track_ang_vel_z` | 往 0.75 爬 |
+| `Episode_Reward/track_wheel_vel` | **不存在**，看到这一项说明跑的是站立任务 |
+| `Episode_Termination/base_height` / `bad_orientation` | 从高往低降 |
+| `Episode_Reward/alive` | 上限 0.15 × 1000 步 = 150（20 s 回合） |
+| `Loss/learning_rate` | 自适应 |
+
+跟踪分数上不去最常见的原因是**指令范围太大**：±1.0 m/s 加 ±1.0 rad/s 同时抽，一部分组合本来就接近侧翻边界。先把 `ang_vel_z` 收到 ±0.6 再试。

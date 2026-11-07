@@ -1,9 +1,18 @@
-"""Play a trained M20 static-standing policy.
+"""Play a trained M20 policy.
 
 Examples::
 
+    # static standing
     python -m isaaclab_m20.scripts.play --checkpoint logs/rsl_rl/m20_wheeled/<run>/checkpoints/model_2000.pt
-    python -m isaaclab_m20.scripts.play --checkpoint <path> --headless --video
+
+    # velocity command -- steer with the keyboard, or pin a fixed command
+    python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0 \
+        --checkpoint logs/rsl_rl/m20_velocity/<run>/checkpoints/model_3000.pt
+    python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0 \
+        --checkpoint <path> --cmd_vx 0.6 --cmd_wz 0.3 --headless --video
+
+Checkpoints are not interchangeable between the two tasks: the velocity task
+observes 60 dims (3 command values prepended) against the standing task's 57.
 """
 from __future__ import annotations
 
@@ -41,6 +50,12 @@ parser.add_argument(
     "--push_every", type=float, default=0.0,
     help="Apply a push every N seconds of simulated time (0 disables). Useful "
          "for videos; with a viewer you can also press P by hand.")
+parser.add_argument("--cmd_vx", type=float, default=0.0, help="Constant forward command, m/s.")
+parser.add_argument("--cmd_vy", type=float, default=0.0, help="Constant lateral command, m/s.")
+parser.add_argument("--cmd_wz", type=float, default=0.0, help="Constant yaw-rate command, rad/s.")
+parser.add_argument(
+    "--cmd_step", type=float, default=0.25,
+    help="Amount W/S, A/D, Q/E add to the command per key press.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 if args_cli.video:
@@ -58,8 +73,7 @@ from rsl_rl.runners import OnPolicyRunner
 
 from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 
-import isaaclab_m20.tasks  # noqa: F401 - registers Isaac-M20-Wheeled-v0
-from isaaclab_m20.tasks.agents.rsl_rl_ppo_cfg import M20RslRlPpoRunnerCfg
+import isaaclab_m20.tasks  # noqa: F401 - registers both M20 task ids
 from isaaclab_m20.tasks.m20_env_cfg import fit_viewer_to_grid
 
 
@@ -85,17 +99,26 @@ def shove(env, speed: float) -> None:
     robot.write_root_velocity_to_sim(root_vel)
 
 
-class KeyboardPusher:
-    """P = shove the robot, R = reset every environment. Needs a viewer window."""
+class KeyboardControls:
+    """Viewer controls. Needs a focused viewer window.
 
-    def __init__(self, speed: float):
+    P push the robot        R reset every environment
+    W/S vx +/-              A/D vy +/-          Q/E wz +/-
+    Space zero the command  (command keys only when the task has commands)
+    """
+
+    def __init__(self, speed: float, command_step: float, steer: bool):
         import carb.input
         import omni.appwindow
 
         self._ki = carb.input
         self.speed = speed
+        self.command_step = command_step
+        self.steer = steer
         self.pending_push = False
         self.reset_requested = False
+        self.command = [0.0, 0.0, 0.0]
+        self.command_changed = False
 
         self._appwindow = omni.appwindow.get_default_app_window()
         self._input = carb.input.acquire_input_interface()
@@ -105,14 +128,42 @@ class KeyboardPusher:
     def _on_event(self, event, *args, **kwargs):
         if event.type != self._ki.KeyboardEventType.KEY_PRESS:
             return True
-        if event.input == self._ki.KeyboardInput.P:
+        key = event.input
+        K = self._ki.KeyboardInput
+        if key == K.P:
             self.pending_push = True
-        elif event.input == self._ki.KeyboardInput.R:
+            return True
+        if key == K.R:
             self.reset_requested = True
+            return True
+        if not self.steer:
+            return True
+        steps = {K.W: (0, 1), K.S: (0, -1), K.A: (1, 1), K.D: (1, -1),
+                 K.Q: (2, 1), K.E: (2, -1)}
+        if key in steps:
+            axis, sign = steps[key]
+            self.command[axis] += sign * self.command_step
+            self.command_changed = True
+        elif key == K.SPACE:
+            self.command = [0.0, 0.0, 0.0]
+            self.command_changed = True
         return True
 
     def close(self) -> None:
         self._input.unsubscribe_to_keyboard_events(self._keyboard, self._sub)
+
+
+def write_command(command_term, command) -> None:
+    """Overwrite the (vx, vy, wz) columns of the command buffer.
+
+    The velocity command buffer is 4 columns -- index 3 is the heading target,
+    unused with ``heading_command=False`` -- so only the first three are written.
+    """
+    buffer = getattr(command_term, "vel_command_b", None)
+    if buffer is None:
+        buffer = command_term.command
+    buffer[:, : len(command)] = torch.tensor(
+        command, device=buffer.device, dtype=buffer.dtype)
 
 
 def main() -> None:
@@ -122,11 +173,14 @@ def main() -> None:
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.seed = 0
     fit_viewer_to_grid(env_cfg)
+    has_command = getattr(env_cfg, "commands", None) is not None
 
     checkpoint = resolve_checkpoint()
     print(f"[INFO] Loading {checkpoint}")
 
-    agent_cfg = M20RslRlPpoRunnerCfg()
+    agent_entry = gym.spec(args_cli.task).kwargs["rsl_rl_cfg_entry_point"]
+    module_name, class_name = agent_entry.split(":")
+    agent_cfg = getattr(importlib.import_module(module_name), class_name)()
     agent_cfg.device = args_cli.device
 
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
@@ -136,7 +190,7 @@ def main() -> None:
             video_folder=args_cli.video_folder,
             step_trigger=lambda step: step == 0,
             video_length=args_cli.video_length,
-            name_prefix="m20_stand",
+            name_prefix="m20_velocity" if has_command else "m20_stand",
             disable_logger=True,
         )
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
@@ -150,19 +204,51 @@ def main() -> None:
     real_time = args_cli.real_time if args_cli.real_time is not None else not args_cli.headless
     push_period = int(round(args_cli.push_every / dt)) if args_cli.push_every > 0 else 0
 
+    command_term = None
+    if has_command:
+        command_term = env.unwrapped.command_manager.get_term("base_velocity")
+        ranges = command_term.cfg.ranges
+        print(f"[INFO] Command ranges: vx {ranges.lin_vel_x}  vy {ranges.lin_vel_y}  "
+              f"wz {ranges.ang_vel_z}")
+        # Training resamples the command every 4 s. Stop it here so the operator
+        # owns the command; the per-step write below is the backstop.
+        try:
+            command_term.cfg.resampling_time_range = (1.0e6, 1.0e6)
+            command_term.time_left.fill_(1.0e6)
+        except Exception:
+            pass
+
     keyboard = None
     if not args_cli.headless:
         try:
-            keyboard = KeyboardPusher(args_cli.push_speed)
+            keyboard = KeyboardControls(args_cli.push_speed, args_cli.cmd_step, steer=has_command)
             print("[INFO] Viewer controls:  P = push the robot   R = reset")
+            if has_command:
+                print("[INFO] Steer:  W/S = vx   A/D = vy   Q/E = yaw   Space = zero")
+                keyboard.command = [args_cli.cmd_vx, args_cli.cmd_vy, args_cli.cmd_wz]
         except Exception as exc:  # no window or no input interface available
             print(f"[WARN] Keyboard control unavailable: {exc}")
     if push_period:
         print(f"[INFO] Auto-push every {args_cli.push_every:g} s at {args_cli.push_speed:g} m/s")
 
+    pending_command = None
+    if has_command and keyboard is None:
+        pending_command = [args_cli.cmd_vx, args_cli.cmd_vy, args_cli.cmd_wz]
+        print(f"[INFO] Fixed command: vx={pending_command[0]:g}  vy={pending_command[1]:g}  "
+              f"wz={pending_command[2]:g}")
+
     timestep = 0
     while simulation_app.is_running():
         start = time.time()
+        if command_term is not None:
+            if keyboard is not None:
+                write_command(command_term, keyboard.command)
+                if keyboard.command_changed:
+                    print(f"[INFO] command -> vx={keyboard.command[0]:+.2f}  "
+                          f"vy={keyboard.command[1]:+.2f}  wz={keyboard.command[2]:+.2f}")
+                    keyboard.command_changed = False
+            else:
+                write_command(command_term, pending_command)
         with torch.inference_mode():
             obs, _, _, _ = env.step(policy(obs))
         timestep += 1

@@ -43,3 +43,10 @@ class M20RslRlPpoRunnerCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
     )
+
+
+@configclass
+class M20VelocityRslRlPpoRunnerCfg(M20RslRlPpoRunnerCfg):
+    """Same PPO hyper-parameters, separate log directory."""
+
+    experiment_name = "m20_velocity"
