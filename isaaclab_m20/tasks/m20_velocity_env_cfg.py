@@ -13,6 +13,15 @@ Difference from the standing task:
 * the leg-posture penalty only applies while the command is ~zero (legged_gym's
   ``stand_still``), otherwise it fights the leg motion steering needs
 * 20 s episodes so one episode contains five 4 s command segments
+* a wider wheel action scale, so the command range is actually reachable (below)
+* the wheel joints are out of the joint-velocity penalty; a wheel spinning at
+  the commanded speed is the goal, not a cost
+
+Speed ceiling: the wheel action scale times the 0.09 m wheel radius is the
+fastest the policy can ask for. ``scale=40`` -> 40 * 0.09 = 3.6 m/s, and the
++-2.5 m/s command range uses about 70% of that, leaving headroom for tracking
+error and for the pushes. The standing task keeps ``scale=20`` (1.8 m/s cap)
+because its wheels are supposed to stay still anyway.
 """
 from __future__ import annotations
 
@@ -23,6 +32,7 @@ from isaaclab.managers import (
     ObservationGroupCfg,
     ObservationTermCfg,
     RewardTermCfg,
+    SceneEntityCfg,
 )
 from isaaclab.utils import configclass
 
@@ -42,8 +52,13 @@ class VelocityCommandsCfg:
         heading_command=False,
         debug_vis=True,
         ranges=mdp.UniformVelocityCommandCfg.Ranges(
-            lin_vel_x=(-1.0, 1.0),
-            lin_vel_y=(-0.4, 0.4),
+            # 2.5 m/s is ~70% of the 3.6 m/s the action scale allows. Keep the
+            # command range under that ceiling: a command the actuators cannot
+            # reach is a permanent reward loss the policy can do nothing about.
+            lin_vel_x=(-2.5, 2.5),
+            # Lateral motion is limited by the legs (hipx 外展 + hipy 俯仰, no
+            # hip yaw), so the wheels cannot roll sideways.
+            lin_vel_y=(-0.6, 0.6),
             ang_vel_z=(-1.0, 1.0),
             heading=(-math.pi, math.pi),
         ),
@@ -77,8 +92,13 @@ class VelocityRewardsCfg:
     """Same legged_gym set as the standing task, with command tracking."""
 
     # -- task: exp tracking kernels against the commanded velocity ------------
+    # sigma is the error scale of the kernel, not a speed. exp(-e^2/sigma) is
+    # ~0 once the error is a few sigma, so sigma has to be a similar fraction of
+    # the command range: 0.25 was tuned for legged_gym's +-1 m/s, and at +-2.5
+    # m/s it would mean "within 10% or nothing" -- a near-step reward with no
+    # gradient to climb. 0.5 keeps the same relative sharpness.
     track_lin_vel_xy = RewardTermCfg(
-        func=rewards.track_lin_vel_xy_cmd, weight=1.5, params={"sigma": 0.25})
+        func=rewards.track_lin_vel_xy_cmd, weight=1.5, params={"sigma": 0.5})
     track_ang_vel_z = RewardTermCfg(
         func=rewards.track_ang_vel_z_cmd, weight=0.75, params={"sigma": 0.25})
 
@@ -93,7 +113,15 @@ class VelocityRewardsCfg:
     joint_deviation = RewardTermCfg(
         func=rewards.joint_deviation_l1_when_still, weight=-0.5,
         params={"threshold": 0.1})
-    joint_vel = RewardTermCfg(func=rewards.joint_vel_l2, weight=-1e-4)
+    # Legs only. Four wheels at 40 rad/s contribute 4 * 1600 * 1e-4 = 0.64 per
+    # step -- 40% of the maximum tracking reward -- which is a direct tax on the
+    # behaviour being asked for. Wheel smoothness is already covered by
+    # action_rate and joint_acc.
+    joint_vel = RewardTermCfg(
+        func=rewards.joint_vel_l2, weight=-1e-4,
+        params={"asset_cfg": SceneEntityCfg(
+            "robot",
+            joint_names=[".*_hipx_joint", ".*_hipy_joint", ".*_knee_joint"])})
     joint_acc = RewardTermCfg(func=rewards.joint_acc_l2, weight=-2.5e-7)
     joint_torques = RewardTermCfg(func=rewards.joint_torques_l2, weight=-1e-5)
     action_rate = RewardTermCfg(func=rewards.action_rate_l2, weight=-0.01)
@@ -115,3 +143,8 @@ class M20WheeledVelocityEnvCfg(M20WheeledEnvCfg):
         super().__post_init__()
         # Five command segments per episode instead of one.
         self.episode_length_s = 20.0
+        # Wheel target range: w* = a * scale, and ground speed = w * 0.09 m
+        # radius, so 40 rad/s is a 3.6 m/s ceiling. The command range is set to
+        # ~70% of that. Set here rather than as an actions subclass so the
+        # standing task's 20 rad/s (1.8 m/s) is provably untouched.
+        self.actions.wheel_velocities.scale = 40.0
