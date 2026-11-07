@@ -136,43 +136,107 @@ class TerminationsCfg:
 
 @configclass
 class EventCfg:
+    """Domain randomization plus the per-episode reset randomization.
+
+    Startup terms are sampled once when the scene is built; reset terms are
+    re-sampled for every environment every time its episode restarts, so a
+    single policy has to cope with a distribution of robots rather than one.
+    """
+
+    # -- startup: contact properties ------------------------------------------
     physics_material = EventTermCfg(
         func=mdp.randomize_rigid_body_material,
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
-            "static_friction_range": (0.7, 1.2),
-            "dynamic_friction_range": (0.7, 1.2),
+            "static_friction_range": (0.5, 1.25),
+            "dynamic_friction_range": (0.5, 1.25),
             "restitution_range": (0.0, 0.0),
             "num_buckets": 64,
         },
     )
+
+    # -- reset: initial state -------------------------------------------------
     reset_base = EventTermCfg(
         func=mdp.reset_root_state_uniform,
         mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("robot"),
             "pose_range": {
-                "x": (-0.05, 0.05),
-                "y": (-0.05, 0.05),
-                "z": (0.0, 0.02),
-                "roll": (-0.05, 0.05),
-                "pitch": (-0.05, 0.05),
-                "yaw": (-0.1, 0.1),
+                "x": (-0.10, 0.10),
+                "y": (-0.10, 0.10),
+                "z": (0.0, 0.04),
+                "roll": (-0.10, 0.10),
+                "pitch": (-0.10, 0.10),
+                "yaw": (-0.30, 0.30),
             },
             "velocity_range": {
-                "x": (0.0, 0.0), "y": (0.0, 0.0), "z": (0.0, 0.0),
-                "roll": (0.0, 0.0), "pitch": (0.0, 0.0), "yaw": (0.0, 0.0),
+                "x": (-0.1, 0.1), "y": (-0.1, 0.1), "z": (0.0, 0.0),
+                "roll": (0.0, 0.0), "pitch": (0.0, 0.0), "yaw": (-0.1, 0.1),
             },
         },
     )
+    # Leg joints only: a wheel's absolute angle is meaningless, so offsetting it
+    # buys nothing and just adds noise to the first step.
     reset_joints = EventTermCfg(
         func=mdp.reset_joints_by_offset,
         mode="reset",
         params={
-            "asset_cfg": SceneEntityCfg("robot"),
-            "position_range": (-0.1, 0.1),
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=[".*_hipx_joint", ".*_hipy_joint", ".*_knee_joint"],
+            ),
+            "position_range": (-0.15, 0.15),
+            "velocity_range": (-0.5, 0.5),
+        },
+    )
+    # Wheels are continuous joints: their absolute angle accumulates across
+    # episodes and PhysX never wraps it. Zero it every reset so the joint_pos
+    # observation does not drift upward all run -- but do not add an offset,
+    # the angle itself carries no information.
+    reset_wheels = EventTermCfg(
+        func=mdp.reset_joints_by_offset,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_wheel_joint"]),
+            "position_range": (0.0, 0.0),
             "velocity_range": (0.0, 0.0),
+        },
+    )
+
+    # -- reset: dynamics ------------------------------------------------------
+    # Payload on the body: cameras, a lid, a different battery. Additive in kg,
+    # and the inertia is recomputed so the tensor stays consistent with the mass.
+    base_mass = EventTermCfg(
+        func=mdp.randomize_rigid_body_mass,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
+            "mass_distribution_params": (-2.0, 3.0),
+            "operation": "add",
+            "recompute_inertia": True,
+        },
+    )
+    # Centre-of-mass shift: mounted equipment is never perfectly centred.
+    base_com = EventTermCfg(
+        func=mdp.randomize_rigid_body_com,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
+            "com_range": {"x": (-0.03, 0.03), "y": (-0.03, 0.03), "z": (-0.02, 0.02)},
+        },
+    )
+
+    # -- interval: impulsive pushes -------------------------------------------
+    # Instantaneous velocity change, i.e. a shove. Episode is 10 s, so this
+    # lands roughly once or twice per episode.
+    push_robot = EventTermCfg(
+        func=mdp.push_by_setting_velocity,
+        mode="interval",
+        interval_range_s=(4.0, 8.0),
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)},
         },
     )
 

@@ -87,7 +87,30 @@ rsl_rl 的 Actor-Critic，两个 MLP 共享同一份观测输入（`obs_groups` 
 
 **为什么直驱力矩开局会大面积趴下**：没有 PD 兜底，随机初始化的策略输出的是乱力矩，机器人生成就倒。这属正常——`base_height`/`flat_orientation` 的信号会把策略逐步拉向"撑住"的力矩组合，通常几百轮内趴下率开始下降。
 
-## 4. 看板指标
+## 4. 域随机化
+
+在 `tasks/m20_env_cfg.py` 的 `EventCfg` 里。`startup` 类在场景建立时抽一次，`reset` 类在**每个环境每次重置时重新抽**——策略面对的不是一台机器人，而是一族机器人。
+
+| 项 | 模式 | 范围 | 目的 |
+| --- | --- | --- | --- |
+| `physics_material` | startup | 静/动摩擦 0.5–1.25，restitution 0 | 地面/轮子材质差异 |
+| `reset_base` | reset | xy ±0.10 m，z 0–0.04 m，roll/pitch ±0.10 rad，yaw ±0.30 rad；线速度 ±0.1 m/s | 初始姿态偏差 |
+| `reset_joints` | reset | **腿关节** ±0.15 rad，速度 ±0.5 rad/s | 编码器/标定的初始误差 |
+| `reset_wheels` | reset | 轮关节角度归零（无偏移） | 连续关节角度会跨回合累加，必须清零 |
+| `base_mass` | reset | 机身质量 **+(-2.0, +3.0) kg**（叠加），重算惯量 | 载荷变化（相机、电池、雷达） |
+| `base_com` | reset | 质心 x/y ±0.03 m，z ±0.02 m | 载荷不在几何中心 |
+| `push_robot` | interval | 每 4–8 s 给 x/y 一个 ±0.5 m/s 的瞬时速度 | 外力扰动、抗推 |
+
+几点设计取舍：
+
+- **质量和质心用 `reset` 而不是 `startup`**。`startup` 是整场训练固定一组值，策略只需要适应一次；`reset` 每个回合重抽，才能真正逼出对质量不敏感的站姿。代价是学习初期更抖。
+- **推力用速度脉冲**（`push_by_setting_velocity`）而不是持续外力：真机上人推一把、撞一下，都是在几十毫秒内改变动量，速度突变更接近这个物理过程，实现也更便宜。
+- **轮子不参与 `reset_joints`**。轮子是连续关节，初始角度没有物理意义。
+- **策略观测里没有质量/质心**，所以它只能学一个"对这一族参数都稳"的策略，这正是 sim2real 需要的。
+
+如果加了 DR 之后训练曲线开始抖或跌，**先降 `push_robot` 的幅度**（±0.5 → ±0.3 m/s），它对回报的冲击最直接；其次是 `base_mass` 的上界。
+
+## 5. 看板指标
 
 | 指标 | 期望趋势 |
 | --- | --- |
@@ -95,4 +118,7 @@ rsl_rl 的 Actor-Critic，两个 MLP 共享同一份观测输入（`obs_groups` 
 | `Episode_Reward/flat_orientation` | 往 0 收（越平越好，本就是负分） |
 | `Episode_Reward/base_motion` | 往 0 收（不再漂移） |
 | `Episode_Termination/base_height` / `bad_orientation` | 从 ~100% 往 0 降 |
+| `Episode_Reward/track_wheel_vel` | 往 0.5 爬（轮子不再乱转） |
 | `Loss/learning_rate` | 自适应，学不动时自动降 |
+
+加了域随机化之后，`Episode_Reward/*` 的绝对值会整体下降，这是**正常的**——同样的策略在更难的初始条件下拿不到那么多分。看趋势而不是绝对值。
