@@ -1,9 +1,10 @@
 """Curriculum-scheduled difficulty.
 
-Two independent levels are scheduled here:
+Two independent schedules live here:
 
 * ``LEVEL`` -- scales every domain-randomization range.
-* ``COMMAND_LEVEL`` -- scales the velocity-command sampling range.
+* the velocity-command sampling ranges, rewritten per training stage by
+  ``set_command_ranges``.
 
 Every randomization range in the config has a *full* value. These wrappers
 multiply it by a module-level ``LEVEL`` in [0, 1] before handing it to the
@@ -97,27 +98,22 @@ def push_by_setting_velocity(env, env_ids, velocity_range,
 # i.e. every time a command is drawn, so mutating the term's config takes effect
 # at the next resample. Nothing is deep-copied away from us here, unlike events.
 _COMMAND_TERM = None
-_FULL_COMMAND_RANGES: tuple | None = None
 
 
 def register_command_term(command_term) -> None:
-    """Capture the full command ranges, before the first scaling."""
-    global _COMMAND_TERM, _FULL_COMMAND_RANGES
+    """Remember the term whose sampling range the schedule rewrites."""
+    global _COMMAND_TERM
     _COMMAND_TERM = command_term
-    ranges = command_term.cfg.ranges
-    _FULL_COMMAND_RANGES = (tuple(ranges.lin_vel_x), tuple(ranges.lin_vel_y),
-                            tuple(ranges.ang_vel_z))
 
 
-def set_command_level(level: float) -> float:
-    """Scale the command sampling range by ``level``. Returns the clamped level."""
-    if _COMMAND_TERM is None or _FULL_COMMAND_RANGES is None:
-        return 0.0
-    level = min(max(float(level), 0.0), 1.0)
+def set_command_ranges(vx: float, vy: float, wz: float) -> None:
+    """Set the command sampling range to +-vx / +-vy / +-wz (absolute values)."""
+    if _COMMAND_TERM is None:
+        return
     ranges = _COMMAND_TERM.cfg.ranges
-    ranges.lin_vel_x, ranges.lin_vel_y, ranges.ang_vel_z = (
-        tuple(v * level for v in full) for full in _FULL_COMMAND_RANGES)
-    return level
+    ranges.lin_vel_x = (-vx, vx)
+    ranges.lin_vel_y = (-vy, vy)
+    ranges.ang_vel_z = (-wz, wz)
 
 
 def zero_command(command_term) -> None:
@@ -125,8 +121,8 @@ def zero_command(command_term) -> None:
 
     The commands drawn at scene construction used the full range, and the first
     resample is up to 4 s away -- long enough for the untrained policy to be
-    asked for 1 m/s straight out of the gate. Call this after
-    ``set_command_level(0)`` so training really does start from standing.
+    asked for 3 m/s straight out of the gate. Call this after
+    ``set_command_ranges(0, 0, 0)`` so training really does start from standing.
     """
     buffer = getattr(command_term, "vel_command_b", None)
     if buffer is not None:

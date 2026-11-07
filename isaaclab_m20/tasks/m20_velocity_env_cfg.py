@@ -18,10 +18,10 @@ Difference from the standing task:
   the commanded speed is the goal, not a cost
 
 Speed ceiling: the wheel action scale times the 0.09 m wheel radius is the
-fastest the policy can ask for. ``scale=40`` -> 40 * 0.09 = 3.6 m/s, and the
-+-2.5 m/s command range uses about 70% of that, leaving headroom for tracking
-error and for the pushes. The standing task keeps ``scale=20`` (1.8 m/s cap)
-because its wheels are supposed to stay still anyway.
+fastest the policy can ask for. ``scale=45`` -> 45 * 0.09 = 4.05 m/s, and the
+3.0 m/s top command uses about 74% of that, leaving headroom for tracking error,
+slip on a low-friction surface and the pushes. The standing task keeps
+``scale=20`` (1.8 m/s cap) because its wheels are supposed to stay still anyway.
 """
 from __future__ import annotations
 
@@ -52,10 +52,12 @@ class VelocityCommandsCfg:
         heading_command=False,
         debug_vis=True,
         ranges=mdp.UniformVelocityCommandCfg.Ranges(
-            # 2.5 m/s is ~70% of the 3.6 m/s the action scale allows. Keep the
-            # command range under that ceiling: a command the actuators cannot
-            # reach is a permanent reward loss the policy can do nothing about.
-            lin_vel_x=(-2.5, 2.5),
+            # The full range, reached in the last stage of the staged command
+            # schedule (see COMMAND_STAGES in scripts/train.py). 3.0 m/s is
+            # ~74% of the 4.05 m/s the action scale allows: keep the command
+            # under that ceiling, because a command the actuators cannot reach
+            # is a permanent reward loss the policy can do nothing about.
+            lin_vel_x=(-3.0, 3.0),
             # Lateral motion is limited by the legs (hipx 外展 + hipy 俯仰, no
             # hip yaw), so the wheels cannot roll sideways.
             lin_vel_y=(-0.6, 0.6),
@@ -144,7 +146,7 @@ class M20WheeledVelocityEnvCfg(M20WheeledEnvCfg):
         # Five command segments per episode instead of one.
         self.episode_length_s = 20.0
         # Wheel target range: w* = a * scale, and ground speed = w * 0.09 m
-        # radius, so 40 rad/s is a 3.6 m/s ceiling. The command range is set to
-        # ~70% of that. Set here rather than as an actions subclass so the
+        # radius, so 45 rad/s is a 4.05 m/s ceiling. The top command (3.0 m/s)
+        # uses ~74% of that. Set here rather than as an actions subclass so the
         # standing task's 20 rad/s (1.8 m/s) is provably untouched.
-        self.actions.wheel_velocities.scale = 40.0
+        self.actions.wheel_velocities.scale = 45.0

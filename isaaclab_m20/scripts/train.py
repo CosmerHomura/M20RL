@@ -44,9 +44,10 @@ parser.add_argument(
          "from 0 (nominal robot) to 1 (full range). 0 disables the curriculum "
          "and applies the full range from the first step.")
 parser.add_argument(
-    "--cmd_ramp", type=float, default=0.5,
-    help="Velocity tasks only: fraction of training over which the command "
-         "sampling range ramps from zero to full. 0 starts at the full range.")
+    "--cmd_stages", action=argparse.BooleanOptionalAction, default=True,
+    help="Velocity tasks only: walk the command range through the staged "
+         "schedule (stand -> low -> mid -> high -> full). --no-cmd_stages "
+         "samples the full range from the first step.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 if args_cli.video:
@@ -119,23 +120,48 @@ def attach_diagnostics(env, every: int, zero_actions: bool) -> None:
     env.step = step
 
 
+# Command-range stages: (end of the stage as a fraction of training, vx, vy, wz).
+# The robot learns to stand, then to hold a low, medium and high speed, and
+# finally sees the full range. Values are half-widths in m/s and rad/s.
+#
+# Staged rather than a linear ramp because a ramp spends most of its iterations
+# in the slow band, where there is nothing left to learn, and reaches the
+# interesting 2-3 m/s regime only near the end. Stage 0 is deliberately short:
+# it exists to give the posture penalty (gated on |cmd| < 0.1) something to
+# shape, not to train a standing policy from scratch.
+COMMAND_STAGES: tuple[tuple[float, float, float, float], ...] = (
+    (0.05, 0.0, 0.00, 0.0),   # 站立
+    (0.25, 0.6, 0.15, 0.3),   # 低速
+    (0.50, 1.5, 0.35, 0.6),   # 中速
+    (0.75, 2.2, 0.50, 0.8),   # 高速
+    (1.00, 3.0, 0.60, 1.0),   # 满幅
+)
+
+
+def command_stage(progress: float) -> int:
+    """Index of the stage covering ``progress`` in [0, 1)."""
+    for index, (end, *_) in enumerate(COMMAND_STAGES):
+        if progress < end:
+            return index
+    return len(COMMAND_STAGES) - 1
+
+
 def attach_curriculum(env, max_iterations: int, num_steps_per_env: int,
-                      ramp_fraction: float, cmd_ramp: float) -> None:
-    """Ramp the domain-randomization level, and the command range, from 0 to 1.
+                      ramp_fraction: float, cmd_stages: bool) -> None:
+    """Schedule the domain randomization and the command range.
 
-    Full randomization from the first step means the policy is asked to survive
-    pushes and payload changes before it has learned to stand at all -- survival
-    typically rises for a while and then collapses. Starting at 0 and ramping
-    keeps the task in the learnable band: the nominal robot first, the
-    distribution later.
+    Randomization: a linear ramp from 0 to full. Full randomization from the
+    first step means the policy is asked to survive pushes and payload changes
+    before it has learned to stand at all -- survival typically rises for a
+    while and then collapses. Starting at 0 and ramping keeps the task in the
+    learnable band: the nominal robot first, the distribution later.
 
-    The command range gets its own ramp for the same reason, plus one specific
-    to the reward design: ``joint_deviation`` is gated on ``|cmd| < 0.1``
-    (legged_gym ``stand_still``), and with the full range sampled uniformly that
-    gate is hit about 0.1% of the time -- the posture penalty would be dead code.
-    Ramping the range up from zero makes every environment hit it early on, so
-    the robot first learns to stand still, then to track small commands, then
-    the full range.
+    Commands: the staged table above, for a reason specific to the reward
+    design -- ``joint_deviation`` is gated on ``|cmd| < 0.1`` (legged_gym
+    ``stand_still``), and with the full range sampled uniformly that gate is hit
+    about 0.03% of the time, so the posture penalty would be dead code. The
+    standing stage makes every environment hit it, and the later stages hand
+    over to the tracking reward.
     """
     from isaaclab_m20.tasks import dr
 
@@ -144,16 +170,20 @@ def attach_curriculum(env, max_iterations: int, num_steps_per_env: int,
     plain_dr = ramp_fraction <= 0.0
 
     command_term = None
-    cmd_ramp_iterations = 0
-    if cmd_ramp > 0.0:
+    if cmd_stages:
         manager = getattr(env.unwrapped, "command_manager", None)
         if manager is not None and "base_velocity" in manager.active_terms:
             command_term = manager.get_term("base_velocity")
             dr.register_command_term(command_term)
-            dr.set_command_level(0.0)
+            _, vx, vy, wz = COMMAND_STAGES[0]
+            dr.set_command_ranges(vx, vy, wz)
+            # The commands drawn at scene construction used the full range and
+            # the first resample is 4 s away; start the robot from standing.
             dr.zero_command(command_term)
-            cmd_ramp_iterations = max(int(max_iterations * cmd_ramp), 1)
-            print(f"[INFO] Command range ramps 0 -> 1 over {cmd_ramp_iterations} iterations.")
+            bounds = ", ".join(
+                f"{i}:{end:.0%} vx+-{vx:g}/vy+-{vy:g}/wz+-{wz:g}"
+                for i, (end, vx, vy, wz) in enumerate(COMMAND_STAGES))
+            print(f"[INFO] Command stages (fraction of training): {bounds}")
 
     if plain_dr:
         dr.set_level(1.0)
@@ -162,7 +192,7 @@ def attach_curriculum(env, max_iterations: int, num_steps_per_env: int,
         print(f"[INFO] Domain randomization ramps 0 -> 1 over {ramp_iterations} iterations.")
 
     original_step = env.step
-    state = {"n": 0}
+    state = {"n": 0, "stage": -1}
 
     def step(action):
         out = original_step(action)
@@ -170,13 +200,16 @@ def attach_curriculum(env, max_iterations: int, num_steps_per_env: int,
         if state["n"] % num_steps_per_env == 0:
             iteration = state["n"] // num_steps_per_env
             level = 1.0 if plain_dr else dr.set_level(iteration / ramp_iterations)
-            cmd_level = (dr.set_command_level(iteration / cmd_ramp_iterations)
-                         if command_term is not None else 0.0)
+            if command_term is not None:
+                stage = command_stage(iteration / max(max_iterations, 1))
+                if stage != state["stage"]:
+                    _, vx, vy, wz = COMMAND_STAGES[stage]
+                    dr.set_command_ranges(vx, vy, wz)
+                    state["stage"] = stage
+                    print(f"[cmd] iteration={iteration:5d} stage={stage} "
+                          f"vx=+-{vx:g} vy=+-{vy:g} wz=+-{wz:g}", flush=True)
             if iteration % diag_every == 0:
-                msg = f"[dr] iteration={iteration:5d} level={level:.2f}"
-                if command_term is not None:
-                    msg += f" cmd_level={cmd_level:.2f}"
-                print(msg, flush=True)
+                print(f"[dr] iteration={iteration:5d} level={level:.2f}", flush=True)
         return out
 
     env.step = step
@@ -229,7 +262,7 @@ def main() -> None:
     if args_cli.zero_actions:
         print("[INFO] --zero_actions: holding the default pose, actions are forced to 0.")
     attach_curriculum(env, agent_cfg.max_iterations, agent_cfg.num_steps_per_env,
-                      args_cli.dr_ramp, args_cli.cmd_ramp)
+                      args_cli.dr_ramp, args_cli.cmd_stages)
     attach_diagnostics(env, args_cli.health_every, args_cli.zero_actions)
 
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
