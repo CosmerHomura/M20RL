@@ -194,10 +194,16 @@ class M20WheeledEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.render_interval = self.decimation
 
         self.sim.physx.bounce_threshold_velocity = 0.2
+        # GPU contact buffers. gpu_total_aggregate_pairs_capacity defaults to
+        # 1024*1024 in IsaacLab; 16*1024 (64x smaller) overflows once several
+        # thousand envs share the GPU, and a PhysX buffer overflow surfaces as a
+        # generic "Failed to get DOF velocities from backend" on the next tensor
+        # API call -- not as a PhysX-looking error.
         self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
-        self.sim.physx.gpu_total_aggregate_pairs_capacity = 16 * 1024
+        self.sim.physx.gpu_total_aggregate_pairs_capacity = 1024 * 1024
         self.sim.physx.gpu_max_rigid_patch_count = 10 * 2 ** 15
         self.sim.physx.gpu_max_rigid_contact_count = 2 ** 23
+        self.sim.physx.gpu_collision_stack_size = 64 * 2 ** 20
 
         self.viewer.origin_type = "env"
         self.viewer.env_index = 0
