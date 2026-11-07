@@ -31,6 +31,13 @@ parser.add_argument("--resume", action="store_true", help="Resume from the lates
 parser.add_argument("--video", action="store_true", help="Record a video of the first training iteration.")
 parser.add_argument("--video_length", type=int, default=200, help="Video length in policy steps.")
 parser.add_argument("--video_folder", type=str, default=str(REPO_ROOT / "videos"))
+parser.add_argument(
+    "--zero_actions", action="store_true",
+    help="Hold the default pose instead of training. Isolation test: if this still "
+         "crashes, the fault is in the model/sim, not in the policy.")
+parser.add_argument(
+    "--health_every", type=int, default=24,
+    help="Print sim-health stats every N env steps (0 disables).")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 if args_cli.video:
@@ -43,6 +50,7 @@ simulation_app = app_launcher.app
 # Everything below needs the Omniverse app running.
 # --------------------------------------------------------------------------- #
 import gymnasium as gym
+import torch
 import yaml
 from rsl_rl.runners import OnPolicyRunner
 
@@ -65,6 +73,42 @@ def _represent_unknown(dumper, data):
 # SceneEntityCfg defaults to joint_ids=slice(None), which plain SafeDumper rejects.
 _LogDumper.add_multi_representer(slice, _represent_unknown)
 _LogDumper.add_multi_representer(object, _represent_unknown)
+
+
+def attach_diagnostics(env, every: int, zero_actions: bool) -> None:
+    """Log simulation health, optionally replacing the policy output with zeros.
+
+    PhysX reports a divergence as a bare ``CUDA error 700`` (illegal memory
+    access) with no hint about which quantity blew up, and the CUDA context is
+    dead by the time it surfaces. Printing the worst-case joint speed and base
+    height every iteration makes the growth visible a few seconds before the
+    crash instead of after it.
+    """
+    unwrapped = env.unwrapped
+    original_step = env.step
+    state = {"n": 0}
+
+    def step(action):
+        if zero_actions:
+            action = torch.zeros_like(action)
+        out = original_step(action)
+        state["n"] += 1
+        if every > 0 and state["n"] % every == 0:
+            robot = unwrapped.scene["robot"]
+            joint_vel = robot.data.joint_vel
+            root_z = robot.data.root_pos_w[:, 2]
+            root_vel = robot.data.root_lin_vel_w.abs().max()
+            print(
+                f"[health] step={state['n']:8d}"
+                f"  max|qdot|={joint_vel.abs().max().item():10.2f}"
+                f"  max|v|={root_vel.item():8.2f}"
+                f"  z=[{root_z.min().item():.3f},{root_z.max().item():.3f}]"
+                f"  finite={torch.isfinite(joint_vel).all().item()}",
+                flush=True,
+            )
+        return out
+
+    env.step = step
 
 
 def main() -> None:
@@ -109,6 +153,9 @@ def main() -> None:
 
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
     print(f"[INFO] Action space: {env.action_space}  Observation space: {env.observation_space}")
+    if args_cli.zero_actions:
+        print("[INFO] --zero_actions: holding the default pose, actions are forced to 0.")
+    attach_diagnostics(env, args_cli.health_every, args_cli.zero_actions)
 
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     if args_cli.resume and args_cli.run_name:
