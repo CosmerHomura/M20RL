@@ -169,7 +169,7 @@ python -m isaaclab_m20.scripts.play --checkpoint <path> --headless --video
 | 轮动作 | `JointVelocityActionCfg(scale=20)`，`use_default_offset=False` |
 | PD 伺服 | 腿 kp=80 / kd=2，轮 kp=0 / kd=2，200 Hz |
 | 力矩上限 | 腿 76.4 N·m，轮 21.6 N·m |
-| 奖励 | 水平 2.0、高度 2.0（σ=20）、禁漂移 1.0、省力矩 1e-5、动作平滑 0.01、存活 0.2 |
+| 奖励 | 共 14 项，完整权重表见 [docs/algorithm.md](algorithm.md) 第 1 节 |
 | 终止 | 高度 < 0.25、倾角 > 0.7、超时 |
 
 ## 8. 常见问题

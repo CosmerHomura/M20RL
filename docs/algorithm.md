@@ -16,11 +16,12 @@
 | --- | --- | --- | --- |
 | `track_lin_vel_xy` | **+1.5** | `exp(-‖v_xy‖² / 0.25)` | 线速度跟踪核，指令为 0 → 越静止越接近 1 |
 | `track_ang_vel_z` | **+0.75** | `exp(-ω_z² / 0.25)` | 偏航角速度跟踪核，指令为 0 |
+| `track_wheel_vel` | **+0.5** | `exp(-‖ω_wheel‖² / 2.0²)` | 四个轮子静止（轮腿机器人专属） |
 | `lin_vel_z` | −2.0 | `v_z²` | 禁止上下颠簸 |
 | `ang_vel_xy` | −0.05 | `Σ ω_xy²` | 禁止翻滚/俯仰角速度 |
 | `flat_orientation` | −2.5 | `gx² + gy²` | 机身水平（`g` 为重力在机体系的投影） |
 | `base_height` | **−20.0** | `(h − 0.50)²` | 基座高度二次惩罚（论文用的是二次型，不是 exp 奖励） |
-| `joint_deviation` | −0.5 | `Σ abs(q − q_default)` | 关节偏离默认站立姿态（legged_gym 的 `stand_still`） |
+| `joint_deviation` | −0.5 | `Σ_legs abs(q − q_default)` | **仅 12 个腿关节**偏离默认站立姿态（legged_gym 的 `stand_still`） |
 | `joint_vel` | −1e-4 | `Σ q̇²` | 关节速度正则 |
 | `joint_acc` | −2.5e-7 | `Σ q̈²` | 关节加速度正则，抑制高频抖动 |
 | `joint_torques` | −1e-5 | `Σ τ²` | 省力矩 |
@@ -32,6 +33,11 @@
 
 **`base_height` 必须是二次惩罚**：权重 −20 作用在 `(h−h*)²` 上。换成 `exp` 奖励形式时，远离目标高度的区域梯度几乎为零，等于没有推力。
 
+**轮组的两个专门处理**（轮腿机器人区别于普通四足的地方）：
+
+1. `track_wheel_vel` 用 exp 核把四个轮速压到零。不能用 L2：`joint_vel` 是 −1e-4 的量级，而轮速量纲是 rad/s，ω ≈ 1 rad/s 时贡献只有 −4e-4，**零速附近的梯度几乎是死的**；exp 核在原点梯度非零且有界。σ_w = 2.0 rad/s 吸收了四个轮子的求和。
+2. `joint_deviation` **只算 12 个腿关节**。轮子的绝对角度是无界的（`continuous` revolute，不 wrap），转两圈就是 4π → 每步罚 6.3，能把整套奖励淹没。轮子的"别动"由 `track_wheel_vel` 负责，不用关节角。
+
 **终止条件**（触发即本回合结束、重置）：
 
 - `base_height`：基座高度 < 0.25 m（趴下）
@@ -42,7 +48,7 @@
 
 rsl_rl 的 Actor-Critic，两个 MLP 共享同一份观测输入（`obs_groups` 里 actor 和 critic 都吃 `policy` 组）。
 
-```
+```text
 观测 o ∈ R^57
   │
   ├─ Actor  (策略)    57 → 512 → 256 → 128 → μ∈R^16

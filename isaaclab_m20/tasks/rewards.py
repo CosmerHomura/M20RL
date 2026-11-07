@@ -5,8 +5,9 @@ formulation used by legged_gym (Rudin et al., "Learning to Walk in Minutes")
 and IsaacLab's own AnymalC task, adapted to a zero velocity command:
 
     r = 1.5·exp(-|v_xy|^2/0.25) + 0.75·exp(-w_z^2/0.25)
+        + 0.5·exp(-|w_wheel|^2/4)                     # wheels stand still
         - 2.0·v_z^2 - 0.05·|w_xy|^2 - 2.5·(gx^2+gy^2)
-        - 20·(h - 0.5)^2 - 0.5·sum|q - q_default|
+        - 20·(h - 0.5)^2 - 0.5·sum_legs|q - q_default|
         - 1e-4·sum(qd^2) - 2.5e-7·sum(qdd^2) - 1e-5·sum(tau^2)
         - 0.01·sum(a - a_prev)^2
         - 200·1[terminated]  (+ 0.15 alive)
@@ -42,6 +43,20 @@ def track_ang_vel_z_zero(env, sigma: float = 0.25,
     return torch.exp(-torch.square(ang_vel_z) / sigma)
 
 
+def wheel_vel_exp(env, sigma: float = 2.0,
+                  asset_cfg: SceneEntityCfg = SceneEntityCfg(
+                      "robot", joint_names=[".*_wheel_joint"])) -> torch.Tensor:
+    """exp(-|w_wheel|^2 / sigma^2), in [0, 1]: the four wheels hold still.
+
+    Bounded on [0, 1] and, unlike an L2 penalty, it still has gradient close to
+    zero wheel speed -- which is where the ``joint_vel`` term (weight -1e-4 on a
+    quantity of order 1) is numerically dead. sigma is in rad/s and absorbs the
+    sum over four wheels: sigma=2.0 means "all four at 2 rad/s -> e^-4".
+    """
+    wheel_vel = _robot(env, asset_cfg).data.joint_vel[:, asset_cfg.joint_ids]
+    return torch.exp(-torch.sum(torch.square(wheel_vel), dim=1) / (sigma * sigma))
+
+
 def lin_vel_z_l2(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     """Vertical velocity squared (positive; weight is negative)."""
     return torch.square(_robot(env, asset_cfg).data.root_lin_vel_b[:, 2])
@@ -66,10 +81,20 @@ def base_height_l2(env, target_height: float = 0.50,
     return torch.square(height - target_height)
 
 
-def joint_deviation_l1(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """L1 distance from the default stand pose (positive; weight is negative)."""
+def joint_deviation_l1(env, asset_cfg: SceneEntityCfg = SceneEntityCfg(
+        "robot", joint_names=[".*_hipx_joint", ".*_hipy_joint", ".*_knee_joint"])
+        ) -> torch.Tensor:
+    """L1 distance from the default stand pose over the LEG joints (positive; weight is negative).
+
+    Wheels are deliberately excluded. A wheel joint's absolute angle is
+    unbounded -- it grows without limit as the wheel rolls -- so penalising it
+    against a default of 0 adds a term that never saturates and swamps the rest
+    of the reward after a couple of turns.
+    """
     robot = _robot(env, asset_cfg)
-    return torch.sum(torch.abs(robot.data.joint_pos - robot.data.default_joint_pos), dim=1)
+    joint_pos = robot.data.joint_pos[:, asset_cfg.joint_ids]
+    default_joint_pos = robot.data.default_joint_pos[:, asset_cfg.joint_ids]
+    return torch.sum(torch.abs(joint_pos - default_joint_pos), dim=1)
 
 
 def joint_vel_l2(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:

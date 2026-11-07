@@ -98,6 +98,10 @@ class RewardsCfg:
         func=rewards.track_lin_vel_xy_zero, weight=1.5, params={"sigma": 0.25})
     track_ang_vel_z = RewardTermCfg(
         func=rewards.track_ang_vel_z_zero, weight=0.75, params={"sigma": 0.25})
+    # Wheels: a standing robot's wheels must be still. The generic joint_vel term
+    # is ~1e-4 on a quantity of order 1, i.e. no useful gradient near zero speed.
+    track_wheel_vel = RewardTermCfg(
+        func=rewards.wheel_vel_exp, weight=0.5, params={"sigma": 2.0})
 
     # -- base stability -------------------------------------------------------
     lin_vel_z = RewardTermCfg(func=rewards.lin_vel_z_l2, weight=-2.0)
