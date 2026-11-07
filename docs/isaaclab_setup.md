@@ -96,9 +96,12 @@ python -m isaaclab_m20.scripts.check_m20 --headless
 它会加载 USD，打印 body / joint 名字、默认关节角、根状态、各刚体质量。对照预期：
 
 - 16 个 joint，名字为 `fl_hipx_joint` … `hr_wheel_joint`（每条腿 hipx / hipy / knee / wheel）；
+- **17 个 body**（base + 16 个腿部链接）；
 - 默认关节角：hipx = 0.0，hipy = 0.61，knee = -1.22，wheel = 0.0；
-- 总质量 ≈ 38.5 kg（含相机、雷达链接）；
+- 总质量 ≈ 38.5 kg；
 - 根高度 0.50 m。
+
+官方 URDF 里 `front_camera_link` / `rear_camera_link` / `front_lidar_link` / `rear_lidar_link` 都是**空标签**（`<link name="x"/>`，没有 inertial / visual / collision）。保留它们会生成 4 个**零质量零惯量**的刚体，在 PhysX GPU 求解器里构成奇异质量矩阵，并在组合后的 stage 里留下 `/visuals/<link>` 的悬空引用——表现为运行时偶发的 `CUDA error: an illegal memory access`。所以导入时用 `merge_fixed_joints=True` 把它们并入 `base_link`。如果 body 数是 21 而不是 17，说明这个开关没生效，重新 `--convert urdf`。
 
 **为什么不直接用 `model/usd/M20.usd`**：那是个组合层，`M20.usd`（1.4 KB）的默认变体早已选中 `PhysX / Sensors / Robot`，但它的子层链末端是 `configuration/M20_physics.usd` → `configuration/M20_base.usd`（17 MB，几何+质量）。这个 17 MB 文件一缺，整条链就塌成一个空 prim，报错是 `Failed to find an articulation when resolving '/World/envs/env_0/Robot'`。如果你确实想用官方 USD，把本地 `model/usd/configuration/M20_base.usd`（17,196,921 字节）传全，再 `--usd model/usd/M20.usd --headless` 检查即可，关节和质量应当一致。
 

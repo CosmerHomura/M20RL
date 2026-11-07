@@ -57,7 +57,13 @@ def convert_urdf() -> str:
         force_usd_conversion=True,
         make_instanceable=False,
         fix_base=False,
-        merge_fixed_joints=False,
+        # The URDF declares front/rear camera and lidar links as bare
+        # <link name="..."/> with no inertial, visual or collision. Left alone
+        # they become four rigid bodies with zero mass and zero inertia in the
+        # articulation -- a singular mass matrix in the PhysX GPU solver, and an
+        # unresolved /visuals/<link> reference in the composed stage. Merging
+        # fixed joints folds them into base_link and removes both problems.
+        merge_fixed_joints=True,
         self_collision=False,
         collision_from_visuals=False,
         # IsaacLab actuators write the real gains at runtime; keep the USD
@@ -104,8 +110,9 @@ def check(usd_path: str) -> None:
         print(f"[WARN] could not read masses: {exc}")
 
     print(
-        "\n[CHECK] Expect 16 joints: 4 x hipx/hipy/knee/wheel per leg; total mass ~38.5 kg; "
-        "root height 0.50 above the ground plane."
+        "\n[CHECK] Expect 16 joints: 4 x hipx/hipy/knee/wheel per leg; 17 bodies "
+        "(base + 16 leg links; the empty camera/lidar links are merged away); "
+        "total mass ~38.5 kg; root height 0.50 above the ground plane."
     )
     print("[CHECK] If the joint order or names differ, fix the regexes in "
           "isaaclab_m20/assets/m20.py and isaaclab_m20/tasks/m20_env_cfg.py.")
