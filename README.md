@@ -61,23 +61,30 @@ python -m isaaclab_m20.scripts.play --num_envs 16
 # 4. 训练速度指令任务：5 阶段课程，512 环境起步，阶段间自动续训
 python -m isaaclab_m20.scripts.train --headless --num_envs 512 --run_name m20_v1
 
-# 5. 只跑某个阶段（自动从上一阶段最新 checkpoint 续）
-python -m isaaclab_m20.scripts.train --headless --num_envs 1024 --stage 3 --run_name m20_v1
+# 5. 推荐流程：一次只跑一个阶段，跑完进模拟器看，再决定下一步。
+#    --stage N 会自动从同一次 run 里第 N-1 阶段的最新 checkpoint 续训。
+python -m isaaclab_m20.scripts.train --headless --num_envs 512 --stage 1 --run_name m20_v1
+#（看完 play/eval 之后）
+python -m isaaclab_m20.scripts.train --headless --num_envs 512 --stage 2 --run_name m20_v1
 
-# 6. 冒烟测试：总轮数缩到 10%
-python -m isaaclab_m20.scripts.train --headless --num_envs 128 --stage_scale 0.1 --run_name smoke
+# 6. 每个阶段的轮数都是参数：--iters_stage1 … --iters_stage5
+python -m isaaclab_m20.scripts.train --headless --num_envs 512 --stage 2 \
+    --run_name m20_v1 --iters_stage2 1200
 
-# 7. 播放速度指令策略。W/S = vx，A/D = vy，Q/E = 偏航角速度，空格清零
+# 7. 冒烟测试：第 1 阶段只跑 20 轮（约 1 分钟）
+python -m isaaclab_m20.scripts.train --headless --num_envs 128 --stage 1 --iters_stage1 20
+
+# 8. 播放速度指令策略。W/S = vx，A/D = vy，Q/E = 偏航角速度，空格清零
 python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0
 
-# 8. 固定指令 + 无界面出视频
+# 9. 固定指令 + 无界面出视频
 python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0 \
     --cmd_vx 0.3 --cmd_wz 0.3 --headless --video
 
-# 9. 验收：9 组固定指令，输出 RMSE / 倾角 / 摔倒率 / PASS-FAIL
+# 10. 验收：9 组固定指令，输出 RMSE / 倾角 / 摔倒率 / PASS-FAIL
 python -m isaaclab_m20.scripts.eval
 
-# 10. 曲线
+# 11. 曲线
 tensorboard --logdir logs/rsl_rl --bind_all --port 6006
 ```
 

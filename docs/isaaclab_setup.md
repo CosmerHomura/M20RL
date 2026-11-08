@@ -125,6 +125,9 @@ python -m isaaclab_m20.scripts.train --headless --num_envs 4096
 
 # 速度指令任务：5 阶段课程 + 阶段间续训（512 起步，稳定后改 1024）
 python -m isaaclab_m20.scripts.train --headless --num_envs 512 --run_name m20_v1
+
+# 推荐：一次一个阶段，跑完进模拟器看完再决定下一步
+python -m isaaclab_m20.scripts.train --headless --num_envs 512 --stage 1 --run_name m20_v1
 ```
 
 - 站立任务每个 iteration 采集 4096 × 24 = 98,304 步；默认跑 3000 iterations。
@@ -132,8 +135,9 @@ python -m isaaclab_m20.scripts.train --headless --num_envs 512 --run_name m20_v1
 - 日志：`logs/rsl_rl/m20_wheeled/<时间戳>/`（站立，每 100 iterations 存一个 checkpoint）；速度指令任务按阶段分目录，`logs/rsl_rl/m20_velocity/<run_name>/stage{N}_<name>/`，每阶段每 50 iterations 存一个 `model_*.pt`。
 - 想给这次实验起名：`--run_name v1`，日志就落在 `logs/rsl_rl/m20_velocity/v1/`。
 - 显存不够就降 `--num_envs`。**训练期间只跑一个 Isaac Lab 进程**——两个进程抢同一张卡的表现是帧率崩到个位数，而不是干脆的 OOM。
-- 断点续训：站立任务 `--resume --run_name v1`（加载该目录下最新 checkpoint）；速度指令任务默认每阶段自动从上一阶段最新 checkpoint 续训，也可 `--stage 3 --resume_from <path>` 手指定。
-- 只有一份配置文件、想快速看流程通不通：`--stage_scale 0.1 --num_envs 128 --run_name smoke`。
+- 断点续训：站立任务 `--resume --run_name v1`（加载该目录下最新 checkpoint）；速度指令任务默认每阶段自动从上一阶段最新 checkpoint 续训，也可 `--stage 3 --resume_from <path>` 手指定。`--stage N` 不给 `--run_name` 时会自动沿用最新 run 目录。
+- 每阶段轮数都是参数：`--iters_stage1 … --iters_stage5`；`--iterations` 给所有选中阶段同一个值；`--stage_scale` 按比例整体缩。
+- 只想确认流程能通：`--stage 1 --iters_stage1 20 --num_envs 128`（约一分钟）。
 
 粗略预期（4090，单场景，无相机）：站立任务 3000 iterations 几小时量级；速度指令任务 1024 环境下约 20–30 min / 1000 iterations，整条 5 阶段课程通常 2–4 小时。
 

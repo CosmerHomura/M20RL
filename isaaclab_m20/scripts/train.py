@@ -33,18 +33,25 @@ appearing at full width on the first step.
 
 Example runs::
 
-    # the full course, 512 envs
+    # the whole course in one process, 512 envs
     python -m isaaclab_m20.scripts.train
 
-    # one stage at a time (each continues from the previous stage's checkpoint)
+    # one stage at a time -- the recommended loop: train, look at the result in
+    # the simulator (play / eval), decide, then spend the next stage's budget.
+    # --stage N automatically continues from stage N-1's latest checkpoint.
+    python -m isaaclab_m20.scripts.train --stage 1
     python -m isaaclab_m20.scripts.train --stage 2
-    python -m isaaclab_m20.scripts.train --stage 3
+    python -m isaaclab_m20.scripts.train --stage 2 --iters_stage2 1200
+
+    # every stage length is a parameter: --iters_stage1 ... --iters_stage5
+    python -m isaaclab_m20.scripts.train --stage all --iters_stage1 200 \
+        --iters_stage2 600 --iters_stage3 900 --iters_stage4 600 --iters_stage5 1000
 
     # 1024 envs once 512 is stable
     python -m isaaclab_m20.scripts.train --num_envs 1024
 
-    # smoke test: 5% of every stage's iteration budget
-    python -m isaaclab_m20.scripts.train --stage_scale 0.05
+    # smoke test: 20 iterations of the standing stage, about a minute
+    python -m isaaclab_m20.scripts.train --stage 1 --iters_stage1 20
 
 The legacy standing task (``Isaac-M20-Wheeled-v0``) has no command term, so for
 it this script runs a single plain run, as before.
@@ -68,6 +75,48 @@ if str(REPO_ROOT) not in sys.path:
 
 VELOCITY_TASK = "Isaac-M20-Wheeled-Velocity-v0"
 
+
+# --------------------------------------------------------------------------- #
+# Course definition
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class Stage:
+    """One stage of the course.
+
+    ``ranges_from`` -> ``ranges_to`` are (vx, vy, wz) half-widths in m/s / m/s /
+    rad/s. The warmup interpolates linearly between them over ``warmup``
+    iterations and then holds ``ranges_to``. ``ranges_from`` is written as the
+    previous stage's ``ranges_to`` -- not as zeros -- because the axes learned
+    earlier must keep their full width while the new axis grows in.
+    """
+
+    name: str
+    iterations: int
+    ranges_from: tuple[float, float, float]
+    ranges_to: tuple[float, float, float]
+    warmup: int
+
+
+STAGES: tuple[Stage, ...] = (
+    # Zero command: the standing baseline under the new 56-dim observation
+    # layout. Every term still runs; the tracking terms just mean "be still".
+    Stage("1_stand", 300, (0.00, 0.0, 0.0), (0.00, 0.0, 0.0), 0),
+    Stage("2_forward_backward", 700, (0.00, 0.0, 0.0), (0.40, 0.0, 0.0), 150),
+    Stage("3_lateral", 1000, (0.40, 0.0, 0.0), (0.40, 0.2, 0.0), 250),
+    Stage("4_yaw", 700, (0.40, 0.2, 0.0), (0.40, 0.2, 0.6), 250),
+    Stage("5_mixed", 1250, (0.40, 0.2, 0.6), (0.50, 0.2, 0.8), 250),
+)
+
+_LAST_STAGE = len(STAGES)
+
+
+def stage_by_number(number: int) -> Stage:
+    """Course stage by its 1-based number, with a readable error on a typo."""
+    if not 1 <= number <= _LAST_STAGE:
+        raise SystemExit(f"--stage must be 1..{_LAST_STAGE} or 'all', got {number}")
+    return STAGES[number - 1]
+
+
 parser = argparse.ArgumentParser(description="Train M20 wheeled locomotion with rsl_rl.")
 parser.add_argument("--task", type=str, default=VELOCITY_TASK)
 parser.add_argument("--num_envs", type=int, default=None,
@@ -81,7 +130,13 @@ parser.add_argument("--stage", type=str, default="all",
 parser.add_argument("--stage_scale", type=float, default=1.0,
                     help="Multiply every stage's iteration budget (e.g. 0.05 for a smoke test).")
 parser.add_argument("--iterations", type=int, default=None,
-                    help="Override the per-stage iteration budget for the selected stages.")
+                    help="Override the iteration budget of every selected stage. "
+                         "Prefer --iters_stageN when you want different lengths per stage.")
+for _number, _course_stage in enumerate(STAGES, start=1):
+    parser.add_argument(
+        f"--iters_stage{_number}", type=int, default=None,
+        help=f"Iterations for stage {_number} ({_course_stage.name}); "
+             f"default {_course_stage.iterations} x --stage_scale.")
 parser.add_argument("--resume_from", type=str, default=None,
                     help="Checkpoint for the first selected stage. Without it, stage 1 starts "
                          "from scratch and stages 2-5 continue from the previous stage.")
@@ -145,65 +200,48 @@ _LogDumper.add_multi_representer(slice, _represent_unknown)
 _LogDumper.add_multi_representer(object, _represent_unknown)
 
 
-# --------------------------------------------------------------------------- #
-# Course definition
-# --------------------------------------------------------------------------- #
-@dataclass(frozen=True)
-class Stage:
-    """One stage of the course.
-
-    ``ranges_from`` -> ``ranges_to`` are (vx, vy, wz) half-widths in m/s / m/s /
-    rad/s. The warmup interpolates linearly between them over ``warmup``
-    iterations and then holds ``ranges_to``. ``ranges_from`` is written as the
-    previous stage's ``ranges_to`` -- not as zeros -- because the axes learned
-    earlier must keep their full width while the new axis grows in.
-    """
-
-    name: str
-    iterations: int
-    ranges_from: tuple[float, float, float]
-    ranges_to: tuple[float, float, float]
-    warmup: int
-
-
-STAGES: tuple[Stage, ...] = (
-    # Zero command: the standing baseline under the new 56-dim observation
-    # layout. Every term still runs; the tracking terms just mean "be still".
-    Stage("1_stand", 300, (0.00, 0.0, 0.0), (0.00, 0.0, 0.0), 0),
-    Stage("2_forward_backward", 700, (0.00, 0.0, 0.0), (0.40, 0.0, 0.0), 150),
-    Stage("3_lateral", 1000, (0.40, 0.0, 0.0), (0.40, 0.2, 0.0), 250),
-    Stage("4_yaw", 700, (0.40, 0.2, 0.0), (0.40, 0.2, 0.6), 250),
-    Stage("5_mixed", 1250, (0.40, 0.2, 0.6), (0.50, 0.2, 0.8), 250),
-)
-
-
-def select_stages(selector: str, scale: float, iterations: int | None) -> list[tuple[int, Stage]]:
+def select_stages(
+    selector: str,
+    scale: float,
+    iterations: int | None,
+    per_stage: dict[int, int | None] | None = None,
+) -> list[tuple[int, Stage]]:
     """Which stages this run executes, with the iteration budget applied.
+
+    The budget of stage ``N`` comes from, in order of precedence: ``per_stage[N]``
+    (``--iters_stageN``), then ``iterations`` (``--iterations`` for every selected
+    stage), then the stage's default budget times ``--stage_scale``.
 
     Returns ``(index_in_STAGES, stage)`` pairs so the caller can find the
     preceding stage's checkpoint for the first selected stage.
     """
+    per_stage = per_stage or {}
     if selector == "all":
         indices = list(range(len(STAGES)))
     else:
         try:
-            index = int(selector) - 1
+            number = int(selector)
         except ValueError as exc:
             raise SystemExit(f"--stage must be 1..{len(STAGES)} or 'all', got {selector!r}") from exc
-        if not 0 <= index < len(STAGES):
-            raise SystemExit(f"--stage must be 1..{len(STAGES)} or 'all', got {selector!r}")
-        indices = [index]
+        stage_by_number(number)  # validates the 1..N range
+        indices = [number - 1]
 
     out: list[tuple[int, Stage]] = []
     for index in indices:
         stage = STAGES[index]
-        budget = iterations if iterations is not None else int(round(stage.iterations * scale))
+        explicit = per_stage.get(index)
+        if explicit is not None:
+            budget = explicit
+        elif iterations is not None:
+            budget = iterations
+        else:
+            budget = int(round(stage.iterations * scale))
         if budget <= 0:
             raise SystemExit(f"stage {stage.name} would run {budget} iterations")
         # Never spend more than half of a trimmed stage on the warmup: with
         # --stage_scale 0.05 the budget is 35 iterations for stage 2 and a
         # 150-iteration warmup would hold the new axis near zero the whole run.
-        # ``max(..., 1)`` keeps a 0-iteration warmup (stage 1) at 0 rather than 1.
+        # A stage with no warmup (stage 1) keeps 0, so it never steals iterations.
         warmup = min(stage.warmup, budget // 2) if stage.warmup else 0
         out.append((index, Stage(stage.name, budget, stage.ranges_from, stage.ranges_to, warmup)))
     return out
@@ -369,6 +407,14 @@ def latest_checkpoint(directory: Path) -> Path | None:
     return candidates[-1][1] if candidates else None
 
 
+def latest_run_dir(experiment_dir: Path) -> Path | None:
+    """Newest run directory under ``logs/rsl_rl/<experiment>/``."""
+    if not experiment_dir.is_dir():
+        return None
+    runs = [path for path in experiment_dir.iterdir() if path.is_dir()]
+    return max(runs, key=lambda path: path.stat().st_mtime) if runs else None
+
+
 def main() -> None:
     spec = gym.spec(args_cli.task)
     module_name, class_name = spec.kwargs["env_cfg_entry_point"].split(":")
@@ -384,7 +430,8 @@ def main() -> None:
 
     # The velocity task carries a command term; the standing task does not.
     is_velocity_task = hasattr(env_cfg, "commands")
-    stages = select_stages(args_cli.stage, args_cli.stage_scale, args_cli.iterations) \
+    per_stage = {index: getattr(args_cli, f"iters_stage{index + 1}") for index in range(len(STAGES))}
+    stages = select_stages(args_cli.stage, args_cli.stage_scale, args_cli.iterations, per_stage) \
         if is_velocity_task else []
 
     if is_velocity_task:
@@ -405,8 +452,29 @@ def main() -> None:
     else:
         agent_cfg.max_iterations = args_cli.iterations or agent_cfg.max_iterations
 
-    run_name = args_cli.run_name or datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_root_path = Path(args_cli.log_root, agent_cfg.experiment_name, run_name)
+    if stages:
+        total = sum(stage.iterations for _, stage in stages)
+        print(f"[INFO] Course plan: {len(stages)} stage(s), {total} iterations "
+              f"({env_cfg.scene.num_envs} envs x {agent_cfg.num_steps_per_env} steps/env)")
+        for number, stage in stages:
+            print(f"    stage {number + 1} {stage.name:<18} {stage.iterations:5d} it  "
+                  f"vx=+-{stage.ranges_to[0]:.2f} vy=+-{stage.ranges_to[1]:.2f} "
+                  f"wz=+-{stage.ranges_to[2]:.2f}  warmup {stage.warmup}")
+
+    experiment_dir = Path(args_cli.log_root, agent_cfg.experiment_name)
+    if args_cli.run_name:
+        run_name = args_cli.run_name
+    elif is_velocity_task and args_cli.stage != "all":
+        # One stage per invocation: stay inside the run the previous stage
+        # wrote to. A fresh timestamped directory would make "--stage 2" search
+        # for stage 1's checkpoint in an empty folder and silently start over.
+        previous_run = latest_run_dir(experiment_dir)
+        run_name = previous_run.name if previous_run else datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        if previous_run is not None:
+            print(f"[INFO] Continuing run {previous_run}")
+    else:
+        run_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_root_path = experiment_dir / run_name
     print(f"[INFO] Logging to {log_root_path}")
     print(f"[INFO] Environment: {args_cli.task}  num_envs={env_cfg.scene.num_envs}")
     print_dict(agent_cfg.to_dict(), nesting=0)
@@ -494,6 +562,19 @@ def main() -> None:
         if found is None:
             raise RuntimeError(f"stage {label} produced no checkpoint in {stage_dir}")
         resume_path = found
+
+        if stage is not None:
+            number = next(i for i, s in enumerate(STAGES) if s.name == stage.name) + 1
+            print(f"\n[INFO] Stage {label} done -- checkpoint {found}")
+            print("[INFO] Look at it in the simulator before spending the next stage:")
+            print(f"    python -m isaaclab_m20.scripts.play --task {args_cli.task} "
+                  f"--checkpoint '{found}'")
+            print(f"    python -m isaaclab_m20.scripts.eval --checkpoint '{found}'")
+            if number < _LAST_STAGE:
+                print(f"    then: python -m isaaclab_m20.scripts.train --stage {number + 1}"
+                      f"   (continues from this checkpoint)")
+            else:
+                print("[INFO] That was the last stage of the course.")
 
     env.close()
 

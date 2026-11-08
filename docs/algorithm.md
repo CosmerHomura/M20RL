@@ -323,7 +323,11 @@ for stage in stages:
 
 **只建一个 env，跨阶段复用**：`gym.make` 一次，各阶段重新 `OnPolicyRunner` 但共享场景。重建 env 会重新抽 startup 随机化、重置 PhysX 缓冲，既慢又让阶段间对比失去可比性。
 
-`--stage 3` 单独跑某一阶段时会自动去前一阶段目录找 checkpoint，找不到就打 `[WARN]` 从头开始——不会静默地用一个错维度的权重。
+`--stage N` 单独跑某一阶段时会自动去前一阶段目录找 checkpoint，找不到就打 `[WARN]` 从头开始——不会静默地用一个错维度的权重。不给 `--run_name` 时它会自动沿用 `<experiment>/` 下最新的 run 目录（否则每次 `--stage N` 都会新建一个空目录、每次都找不到上一阶段）。
+
+**每阶段的轮数是参数**：`--iters_stage1 … --iters_stage5` 分别覆盖对应阶段的预算，`--iterations` 是"给所有选中阶段同一个值"的简写，`--stage_scale` 才是按比例整体缩放。优先级：`--iters_stageN` > `--iterations` > 默认值 × `--stage_scale`。warmup 始终被裁到不超过该阶段预算的一半，所以缩到几次迭代也不会把整段吃光。
+
+**每阶段跑完，脚本会打印下一阶段的建议命令**（`play --checkpoint …` / `eval --checkpoint …` / `train --stage N+1`），这就是"跑完先进模拟器看，再决定是否训练下一步"的工作流。
 
 **每阶段该跑多少轮，要按 §6.8 的验收指标决定，不是机械跑满。** 表里给的是上限。
 
@@ -383,28 +387,40 @@ python -m isaaclab_m20.scripts.eval \
 ### 6.9 训练与播放
 
 ```bash
-# 全课程（推荐）：512 环境起步，稳定后改 1024
+# 全课程一次跑完（不推荐首版）：512 环境起步，稳定后改 1024
 python -m isaaclab_m20.scripts.train --headless --num_envs 512 --run_name m20_v1
 
-# 只跑某个阶段（会自动从上一阶段最新 checkpoint 续训）
-python -m isaaclab_m20.scripts.train --headless --num_envs 1024 --stage 3 --run_name m20_v1
+# 推荐：一次只跑一个阶段，跑完 play/eval 看完再决定下一步
+python -m isaaclab_m20.scripts.train --headless --num_envs 512 --stage 1 --run_name m20_v1
+python -m isaaclab_m20.scripts.train --headless --num_envs 512 --stage 2 --run_name m20_v1
 
-# 缩短总轮数做冒烟测试（各阶段轮数按比例缩）
-python -m isaaclab_m20.scripts.train --headless --stage_scale 0.1 --num_envs 128 --run_name smoke
+# 每个阶段的轮数都是参数（--iters_stage1 … --iters_stage5）
+python -m isaaclab_m20.scripts.train --headless --num_envs 512 --stage 2 \
+    --run_name m20_v1 --iters_stage2 1200
+
+# 一次指定全部阶段的长度
+python -m isaaclab_m20.scripts.train --headless --num_envs 512 --stage all \
+    --iters_stage1 200 --iters_stage2 600 --iters_stage3 900 \
+    --iters_stage4 600 --iters_stage5 1000
+
+# 冒烟测试：第 1 阶段 20 轮
+python -m isaaclab_m20.scripts.train --headless --num_envs 128 --stage 1 --iters_stage1 20
 
 # 播放：W/S 改 vx，A/D 改 vy，Q/E 改 ωz，空格清零，P 推一把，R 重置
-python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0
+python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0 --checkpoint <path>
 
 # 固定指令 + 无窗口出视频
 python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0 \
     --cmd_vx 0.3 --cmd_wz 0.3 --headless --video
 
 # 验收
-python -m isaaclab_m20.scripts.eval
+python -m isaaclab_m20.scripts.eval --checkpoint <path>
 
 # 曲线
 tensorboard --logdir logs/rsl_rl/m20_velocity
 ```
+
+`--stage N` 时如果没给 `--run_name`，脚本会自动沿用 `<experiment>/` 下最新的那个 run 目录，所以"先 `--stage 1`、看完再 `--stage 2`"不需要每次手抄 run 名。
 
 日志布局：
 
