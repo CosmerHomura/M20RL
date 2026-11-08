@@ -9,7 +9,7 @@
 | `Isaac-M20-Wheeled-v0` | 静态站立 | 57 维（无指令） | 10 s | `logs/rsl_rl/m20_wheeled/` |
 | `Isaac-M20-Wheeled-Velocity-v0` | `(vx, vy, ωz)` 速度指令跟踪 | 56 维 | 20 s | `logs/rsl_rl/m20_velocity/<run>/stage{N}_*/` |
 
-两者的 checkpoint **不能互换**（观测维度不同）。速度指令任务是第一版正式训练配置：6 阶段课程（含最后的静止↔运动切换阶段）、14 项奖励（含每步存活加成，摔倒才扣 −200，超时不扣）、域随机化默认关闭、阶段间自动续训。
+两者的 checkpoint **不能互换**（观测维度不同）。速度指令任务是第一版正式训练配置：6 阶段课程（含最后的静止↔运动切换阶段）、15 项奖励（含每步存活加成与零指令下的位置保持，摔倒才扣 −200，超时不扣）、域随机化默认关闭、阶段间自动续训。
 
 详细安装与排错见 [docs/isaaclab_setup.md](docs/isaaclab_setup.md)，奖励函数/网络结构/PPO 流程/课程与验收见 [docs/algorithm.md](docs/algorithm.md)。
 
@@ -31,10 +31,10 @@ isaaclab_m20/
 ├── assets/m20.py      # ArticulationCfg：USD、初始姿态、PD 增益
 ├── tasks/
 │   ├── m20_env_cfg.py            # 站立任务：场景/观测/动作/奖励/域随机化
-│   ├── m20_velocity_env_cfg.py   # 速度指令任务：56 维观测、14 项奖励、6 阶段
+│   ├── m20_velocity_env_cfg.py   # 速度指令任务：56 维观测、15 项奖励、6 阶段
 │   ├── observations.py           # 56 维观测的拆分项（腿/轮/指令）
 │   ├── commands.py               # MixedVelocityCommand：50/30/10/10 混合采样
-│   ├── rewards.py                # 奖励函数（站立 14 项 + 速度 14 项）
+│   ├── rewards.py                # 奖励函数（站立 14 项 + 速度 15 项）
 │   ├── dr.py                     # 域随机化档位（站立任务用）
 │   └── agents/rsl_rl_ppo_cfg.py  # PPO 超参（两个任务各一套）
 └── scripts/
@@ -110,7 +110,7 @@ tensorboard --logdir logs/rsl_rl --bind_all --port 6006
 - **观测 56 维**：`base_ang_vel(3) + projected_gravity(3) + base_lin_vel(3) + 腿关节位置偏差(12) + 腿关节速度(12) + 车轮角速度(4) + 指令(3) + last_action(16)`。线速度和指令都在**机体系**，训练/播放/部署必须同一个坐标系。
 - **动作 16 维** ∈ [-1, 1]，都是**目标值**：腿 12 维 `q* = q_default + 0.25·a`（rad），轮 4 维 `ω* = 8.0·a`（rad/s，轮半径 0.09 m → 0.72 m/s 上限）。
 - **指令**：机体系 `(vx, vy, ωz)`，每 2–4 s 重采样，混合采样 50% 单轴 / 30% 双轴 / 10% 三轴 / 10% 零指令。
-- **奖励 14 项**：任务项 `track_lin_vel_xy +2.0`（σ 0.25，exp）、`track_ang_vel_z +1.0`（σ 0.3，exp）、`base_height +0.5`（0.50 m，σ 0.05）、`flat_orientation −0.5`（姿态**平方**惩罚，σ 0.2）；**指令相对的二次项**（零指令时就是驻车刹车，非零指令时只惩罚跟踪误差）`lin_vel_xy_error −1.0`（0.15 m/s）、`yaw_rate_error −0.5`（0.2 rad/s）、`wheel_roll_error −0.5`（0.3 m/s 滚动速度）；正则项 `joint_deviation −0.2`、`joint_vel_legs −0.02`、`wheel_slip −0.1`、`action_rate −0.01`、`joint_torques −0.005`、`ang_vel_xy −0.05`；`alive +0.5`（每步存活）；`termination_penalty −200`（**只在真摔倒时**扣，20 s 超时不扣）。**不做与指令无关的绝对速度惩罚、不强制四轮着地、不惩罚横向滑移。** 那三个二次项是必需的：`exp` 跟踪核在误差为零处梯度为零，没有它们，零指令时 0.05 m/s 的蠕动几乎不花钱，机器人会自己溜达出去。
+- **奖励 15 项**：任务项 `track_lin_vel_xy +2.0`（σ 0.25，exp）、`track_ang_vel_z +1.0`（σ 0.3，exp）、`base_height +0.5`（0.50 m，σ 0.05）、`flat_orientation −0.5`（姿态**平方**惩罚，σ 0.2）；**指令相对的二次项与保持项**（零指令时就是驻车刹车，非零指令时只惩罚跟踪误差，**无死区**）`lin_vel_xy_error −1.0`（0.15 m/s）、`yaw_rate_error −0.5`（0.2 rad/s）、`stand_position −1.0`（0.25 m，**按位移计费，零指令时把漂移和"被推回来"都算进去**）、`wheel_roll_error −0.5`（0.3 m/s 滚动速度；后两项**只在命令严格为零时生效**）；正则项 `joint_deviation −0.2`、`joint_vel_legs −0.02`、`wheel_slip −0.1`、`action_rate −0.01`、`joint_torques −0.005`、`ang_vel_xy −0.05`；`alive +0.5`（每步存活）；`termination_penalty −200`（**只在真摔倒时**扣，20 s 超时不扣）。**不做与指令无关的绝对速度惩罚、不强制四轮着地、不惩罚横向滑移。** 那几项是必需的：`exp` 跟踪核在误差为零处梯度为零，速度二次项罚的是"速率"，只有 `stand_position` 罚"位移的积分"，才能让 0.05 m/s 的蠕动在 20 s 内涨到每步十几，把漂移在源头掐掉。
 - **终止**：高度 < 0.33 m、倾角 > 0.5 rad、超时 20 s。存活加成和摔倒惩罚是一对：站满 20 s 约 +500，第 40 步倒地约 +20 − 200，所以"早点摔"不再和"站住"等价。
 - **课程 6 阶段**（合计 4950 iterations，每阶段内有线性 warmup）：零指令站稳（300）→ 前进/后退 `vx ±0.4`（700）→ 加横移 `vy ±0.2`（1000）→ 加偏航 `ωz ±0.6`（700）→ 三维混合 `vx ±0.5 / vy ±0.2 / ωz ±0.8`（1250）→ **静止↔运动切换**（1000，同样的指令范围，但零指令占 35%、每条指令只保持 1.5–3 s）。每个轴先单独学会，再与其它轴叠加，最后练"起步—停下—换向"。
 - **域随机化默认关闭**（摩擦 1.0、质量/质心固定、无推力），`--dr full` 打开。

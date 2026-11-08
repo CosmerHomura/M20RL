@@ -9,9 +9,10 @@ set plus the static-hold and posture channels:
       + 1.0   · r_yaw                 yaw-rate tracking (exp, sigma 0.3 rad/s)
       + 0.5   · r_height              ride height (exp, sigma 0.05 m)
       - 0.5   · p_ori                 (gx² + gy²) / 0.2²        roll/pitch
-      - 1.0   · p_v                   sum((v_xy - cmd_xy)²/0.15²)   quad, command-relative
-      - 0.5   · p_yaw                 ((w_z - cmd_wz)²/0.2²)        quad, command-relative
-      - 0.5   · p_wheel               mean((r·qdot_w - cmd_vx)²/0.3²) quad, command-relative
+      - 1.0   · p_v                   sum((v_xy - cmd_xy)²/0.15²)            quad
+      - 0.5   · p_yaw                 ((w_z - cmd_wz)²/0.2²)                quad
+      - 1.0   · p_pos                 1[cmd==0]·sum((p_xy - p_hold)²/0.25²) hold
+      - 0.5   · p_wheel               1[cmd==0]·mean((r·qdot_w)²/0.3²)      gated
       - 0.2   · p_pose                sum((q - q_default)²/0.3²) legs only
       - 0.02  · p_qdot                sum((qdot / 20)²)          legs only
       - 0.1   · p_slip                wheel/ground longitudinal slip
@@ -46,20 +47,27 @@ Three deliberate departures from the plan's eight channels:
   wheels and a 0.3 m/s command costs nothing when the wheels roll at 0.3 m/s.
   Penalising ``qdot_w²`` directly would tax driving, which is the plan's
   original objection;
-* the hold-still channels are *command-relative quadratics* (``p_v``, ``p_yaw``,
-  ``p_wheel``) rather than zero-command-masked absolute penalties. A mask is a
-  silent failure mode: if the command term does not flag standing (or the task
-  has no command at all) the channel switches itself off and a "stand still"
-  robot creeps. First-version numbers were 0.5/0.25² and 0.1/4², so a 0.05 m/s
-  creep cost 0.02 per step: with the exp tracking term flat at zero error,
-  nothing held the base in place, and stage 1 wandered -- typically drifting
-  forward and slowly rotating, because yaw had *only* the exp kernel and no
-  quadratic at all. The error scales are now 0.15 m/s, 0.2 rad/s and 0.3 m/s of
-  rolling: a 0.1 m/s creep costs ~0.44, a 0.1 rad/s spin costs 0.125, a wheel
-  rolling 0.1 m/s when told to stop costs 0.055 -- against a per-step ceiling of
-  about 3.5. A standing policy that moves is now strictly worse than one that
-  does not, by a margin the advantage estimator can see through the exploration
-  noise, and the same terms cost nothing while tracking.
+* the hold-still channels are *command-relative quadratics* (``p_v``, ``p_yaw``)
+  plus a gated *position hold* (``p_pos``) and wheel gate (``p_wheel``), rather
+  than zero-command-masked absolute penalties. A mask around the base channels
+  would be a silent failure mode: if the command term does not flag standing (or
+  the task has no command at all) the channel switches itself off and a "stand
+  still" robot creeps. First-version numbers were 0.5/0.25² and 0.1/4², so a
+  0.05 m/s creep cost 0.02 per step: with the exp tracking term flat at zero
+  error, nothing held the base in place, and stage 1 wandered -- typically
+  drifting forward and slowly rotating, because yaw had *only* the exp kernel and
+  no quadratic at all.
+
+  There is **no deadband** on any of them. A zero command means zero motion: the
+  wheels have ``stiffness = 0`` and ``damping = 2``, i.e. the chassis is a
+  free-rolling cart whose only brake is wheel damping, so the last few cm/s are
+  set by contact impulses and are genuinely expensive to remove -- but the answer
+  is to charge for the *displacement* those cm/s produce (``p_pos``, which pays
+  for the integral and therefore stops the drift at its source, and also pays for
+  coming back after a push), not to declare the residual acceptable. Only
+  ``p_wheel`` and ``p_pos`` are gated (strictly-zero command, read from the
+  command buffer at ``eps = 1e-3``), because an ungated wheel term taxes every
+  skid-steer turn and an ungated position term forbids driving away.
 
 Sign convention: penalty terms return a POSITIVE magnitude and carry their sign
 in the reward weight, exactly like ``isaaclab.envs.mdp`` (e.g.
@@ -329,40 +337,54 @@ def action_rate_l2(env) -> torch.Tensor:
 
 # --------------------------------------------------------------------------- #
 # Command-relative quadratics: (what the base/wheels do) - (what was asked).
-# No mask on purpose -- see the note under each function. A masked term that
-# never fires (an env whose command term forgets to flag standing, a task with
-# no command at all) fails silently; these cannot.
+# No deadband: a zero command means zero motion, full stop. The two base terms
+# are ungated (subtracting the command keeps them free while driving); the wheel
+# term and the position hold are gated on a *strictly* zero command, and the gate
+# is read from the command buffer (see ``standing_mask``). A masked term that
+# never fires (an env whose command term forgets to flag standing, a task with no
+# command at all) fails silently; a subtraction cannot.
 # --------------------------------------------------------------------------- #
-def standing_mask(env, command_name: str = "base_velocity") -> torch.Tensor:
-    """1.0 for envs whose command is exactly zero, else 0.0 -- shape (num_envs,).
+def standing_mask(env, command_name: str = "base_velocity",
+                  eps: float = 1e-3) -> torch.Tensor:
+    """1.0 where the commanded twist is (strictly) zero, else 0.0 -- shape (n,).
 
-    ``is_standing_env`` is set by ``MixedVelocityCommand._resample_command`` for
-    the zero-command share. Kept as a utility (it is the right way to gate a
-    channel that is genuinely meaningless while driving), but the shipped reward
-    set does **not** use it: the static-hold terms below are command-relative,
-    so they brake a zero command without needing to know which envs are standing.
-    That matters because a mask that silently evaluates to 0 disables the whole
-    channel -- which is one of the ways a "stand still" command starts sliding.
+    Read from the command buffer itself, **not** from ``is_standing_env``: that
+    flag has to be written by the sampler, and a sampler that forgets to write it
+    (or a task with no command term) silently zeroes a whole reward channel --
+    which is one of the ways a "stand still" command starts sliding. The buffer is
+    the ground truth; ``eps = 1e-3`` makes the gate strict, so a 0.05 m/s command
+    counts as *driving* and does not receive the stand-still treatment.
+
+    Used by ``wheel_roll_l2_error`` and ``stand_position_l2``. The base-velocity
+    terms are command-relative and need no gate: subtracting the command already
+    makes them free while driving.
     """
     command_manager = getattr(env, "command_manager", None)
     if command_manager is None:
         return torch.ones(env.num_envs, device=env.device)
-    term = command_manager.get_term(command_name)
-    flag = getattr(term, "is_standing_env", None)
-    if flag is None:
-        return torch.zeros(env.num_envs, device=env.device)
-    return flag.to(device=env.device, dtype=torch.float32)
+    cmd = observations.velocity_command(env, command_name)
+    return (cmd.abs() <= eps).all(dim=1).to(dtype=torch.float32)
 
 
-def lin_vel_xy_l2_error(env, scale: float = 0.2, command_name: str = "base_velocity",
+def lin_vel_xy_l2_error(env, scale: float = 0.2, deadband: float = 0.0,
+                        command_name: str = "base_velocity",
                         asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """sum(((v_xy - cmd_xy) / scale)^2) (positive; weight is negative).
+    """sum(((max(0, |v_xy - cmd_xy| - deadband)) / scale)^2) (positive).
 
     The tracking term is an exp kernel, so at a zero command a 0.05 m/s drift
     still scores ``2.0 * exp(-0.04) = 1.92`` -- it loses 0.08 -- and the gradient
     there is exactly zero, so nothing pushes the base back. This quadratic is
-    the missing stiffness: 0.05 m/s costs 0.06, 0.1 m/s 0.25, 0.2 m/s 1.0, and
-    the gradient grows with the error instead of vanishing.
+    the missing stiffness: with ``scale = 0.15`` and no deadband, 0.05 m/s costs
+    0.11, 0.1 m/s 0.44, 0.2 m/s 1.78, and the gradient grows with the error
+    instead of vanishing.
+
+    ``deadband`` (m/s, per axis) exists only as a tuning knob and defaults to
+    0.0: a zero command means the base must not move, so there is no free zone.
+    ``stiffness = 0`` on the wheels means the chassis is a free-rolling cart with
+    no parking brake, which makes the last cm/s expensive to remove -- but that is
+    a reason to add the position hold below (which pays for the *displacement*
+    those cm/s produce, and so stops the drift at its source), not a reason to
+    score the residual as acceptable.
 
     It is measured against the command, not against zero, so it does not tax
     driving: a robot tracking 0.3 m/s perfectly pays 0 here, and the exp kernel
@@ -370,55 +392,120 @@ def lin_vel_xy_l2_error(env, scale: float = 0.2, command_name: str = "base_veloc
     """
     cmd = observations.velocity_command(env, command_name)[:, :2]
     lin_vel = _robot(env, asset_cfg).data.root_lin_vel_b[:, :2]
-    return torch.sum(torch.square((lin_vel - cmd) / scale), dim=1)
+    excess = torch.clamp((lin_vel - cmd).abs() - deadband, min=0.0)
+    return torch.sum(torch.square(excess / scale), dim=1)
 
 
-def yaw_rate_l2_error(env, scale: float = 0.2, command_name: str = "base_velocity",
+def yaw_rate_l2_error(env, scale: float = 0.2, deadband: float = 0.0,
+                      command_name: str = "base_velocity",
                       asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """((w_z - cmd_wz) / scale)^2 (positive; weight is negative).
+    """(max(0, |w_z - cmd_wz| - deadband) / scale)^2 (positive).
 
     Yaw is the one channel where "stands still but slowly rotates" was the
     cheapest escape: the exp kernel peaks at zero error, so a 0.5 rad/s spin
     only lost 0.94 of its 1.0 channel. ``scale = 0.2 rad/s``: 0.1 rad/s costs
     0.25, 0.3 rad/s costs 2.25, and a full-range 0.8 rad/s command costs 0 when
-    it is actually followed.
+    it is actually followed. ``deadband`` defaults to 0.0 -- a zero yaw command
+    means no rotation.
 
     Roll/pitch rate stays in ``ang_vel_xy_l2`` (there is no roll-rate command to
     measure against, and the target is always zero).
     """
     cmd = observations.velocity_command(env, command_name)[:, 2]
     ang_vel_z = _robot(env, asset_cfg).data.root_ang_vel_b[:, 2]
-    return torch.square((ang_vel_z - cmd) / scale)
+    excess = torch.clamp((ang_vel_z - cmd).abs() - deadband, min=0.0)
+    return torch.square(excess / scale)
 
 
-def wheel_roll_l2_error(env, scale: float = 0.3, command_name: str = "base_velocity",
+# Where each env's "hold here" reference is anchored. Per-env state, so it lives
+# in a module-level cache keyed by the env instance rather than in the cfg.
+_STAND_REF: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _stand_reference(env, mask: torch.Tensor, pos_xy: torch.Tensor) -> torch.Tensor:
+    """Position each env must hold while its command is zero -- shape (n, 2).
+
+    The reference is re-anchored on the **rising edge** of the stand mask (and on
+    every episode reset), i.e. "hold where you stopped". Anchoring it to the spawn
+    point instead would fight the driving stages: after 3 s at 0.5 m/s the robot is
+    1.5 m away, and a sampled zero command would then demand walking back to the
+    spawn -- which teaches "never drive far" rather than "stop cleanly". A push
+    still produces drift away from the reference, so recovery is still rewarded.
+    """
+    key = id(env)
+    state = _STAND_REF.get(key)
+    reset = env.episode_length_buf <= 1
+    if state is None or state[0].shape != pos_xy.shape or state[0].device != pos_xy.device:
+        return pos_xy.clone()
+    reference, last_mask = state
+    reference = reference.clone()
+    reanchor = ((mask > 0.5) & (last_mask < 0.5)) | reset
+    if bool(reanchor.any()):
+        reference[reanchor] = pos_xy[reanchor]
+    return reference
+
+
+def stand_position_l2(env, scale: float = 0.25, command_name: str = "base_velocity",
+                      asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """1[cmd == 0] * sum(((p_xy - p_xy_hold) / scale)^2) (positive).
+
+    The displacement counterpart of the velocity quadratics, and the term that
+    makes "the command is zero, so the robot must not move" actually hold. A
+    velocity penalty alone is a damper: it charges for the *rate*, so a constant
+    0.05 m/s creep costs 0.11 per step -- noticeable, but a position term charges
+    for the *integral*, and 0.05 m/s becomes 1 m of drift (cost 16 per step) within
+    one 20 s episode. That is also what recovers from a push: the pusher moves the
+    base, drift grows, and the term pays for coming back.
+
+    Gated on a strictly-zero command (see ``standing_mask``) and measured from the
+    position at which the command went to zero, so it is free while driving and
+    never asks the robot to return to where the episode started.
+
+    ``scale = 0.25 m``: 0.05 m costs 0.04, 0.25 m costs 1.0, 1 m costs 16. Read it
+    together with ``lin_vel_xy_l2_error`` (``scale = 0.15 m/s``): the velocity term
+    sets how hard the base brakes, this one sets how hard it comes back.
+    """
+    mask = standing_mask(env, command_name)
+    pos_xy = _robot(env, asset_cfg).data.root_pos_w[:, :2]
+    reference = _stand_reference(env, mask, pos_xy)
+    _STAND_REF[id(env)] = (reference, mask.clone())
+    drift = pos_xy - reference
+    return mask * torch.sum(torch.square(drift / scale), dim=1)
+
+
+def wheel_roll_l2_error(env, scale: float = 0.3, deadband: float = 0.0,
+                        command_name: str = "base_velocity",
                         wheel_radius: float = WHEEL_RADIUS, wheel_sign: float = -1.0,
                         asset_cfg: SceneEntityCfg = SceneEntityCfg(
                             "robot", joint_names=WHEEL_JOINT_NAMES)) -> torch.Tensor:
-    """mean_wheel ((wheel_sign * r * qdot_w - cmd_vx) / scale)^2 (positive).
+    """standing * mean_wheel (((r*qdot_w) - cmd_vx) / scale)^2 (positive).
 
-    The wheel version of the term above: with a zero command the wheels should
-    not be rolling at all (whatever is asked for, the four wheels must not roll
-    at ``cmd_vx`` when the robot is told to stand). Unmasked and command-relative
-    for the same reason: a masked absolute wheel-speed penalty is a reward for
-    refusing to move, while this one is exactly "your wheels are not doing what
-    the command says".
+    With a zero command the wheels should not be rolling at all, so this is the
+    channel that stops a "stand still" robot from rolling away: ``wheel_sign * r
+    * qdot`` is the ground speed the wheels are trying to produce, and at a zero
+    command it must be zero.
 
-    ``scale = 0.3 m/s`` = 3.3 rad/s of rolling speed: 0.1 m/s of unwanted
-    rolling costs 0.11, 0.3 m/s costs 1.0. The mean over four wheels (not the
-    sum) keeps one lifted, free-spinning wheel from dominating.
+    **Gated on a strictly-zero command** (``standing_mask``, read from the
+    command buffer, ``eps = 1e-3``), for two reasons:
 
-    Turning in place (a pure yaw command, ``cmd_vx = 0``) needs the left/right
-    wheels to roll in opposite directions, so this term charges that scrub:
-    at 0.5 rad/s with a 0.2 m half-track the wheels roll 0.1 m/s, costing
-    ``0.5 * (0.1 / 0.3)^2 = 0.06`` per step. That is small enough to leave
-    skid-steer yaw alone, and it is also the price of creeping forward.
+    * while driving, the base-velocity terms above already charge tracking error,
+      and an ungated wheel term would charge the same mistake twice;
+    * skid-steer yaw needs the left/right wheels to roll in opposite directions,
+      so an ungated term taxes every turn in place (0.06/step at 0.5 rad/s). That
+      is a real cost for a legal command, so the term is off while driving.
+
+    ``scale = 0.3 m/s`` = 3.3 rad/s of rolling speed. ``deadband`` defaults to
+    0.0 for the same reason as the base terms: a zero command means no rolling.
+    The mean over four wheels (not the sum) keeps one lifted, free-spinning wheel
+    from dominating.
     """
+    mask = standing_mask(env, command_name)
     cmd_x = observations.velocity_command(env, command_name)[:, 0]
     robot = _robot(env, asset_cfg)
     wheel_vel = robot.data.joint_vel[:, asset_cfg.joint_ids]
     rolling = wheel_sign * wheel_radius * wheel_vel
-    return torch.mean(torch.square((rolling - cmd_x.unsqueeze(1)) / scale), dim=1)
+    excess = torch.clamp((rolling - cmd_x.unsqueeze(1)).abs() - deadband, min=0.0)
+    return mask * torch.mean(torch.square(excess / scale), dim=1)
 
 
 def joint_deviation_l2(env, scale: float = 0.3,

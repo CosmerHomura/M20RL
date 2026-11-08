@@ -194,15 +194,28 @@ class RewardsCfg:
     ``yaw_rate_error``, ``wheel_roll_error``): they measure "what the base and
     wheels are doing minus what was asked", so with a zero command they are a
     hard brake and with a non-zero command they are a tracking penalty that is
-    zero when the command is followed. They are deliberately **not** masked by
+    zero when the command is followed. ``stand_position`` adds the displacement
+    half of the same idea. The two base terms are **not** masked by
     ``is_standing_env``: a mask that silently evaluates to zero disables the
-    channel and lets a "stand still" robot creep, which is exactly the failure
-    that showed up in stage 1.
+    channel and lets a "stand still" robot creep. Only the wheel term and the
+    position hold are gated, and their gate is read from the command buffer
+    (strictly zero, ``eps = 1e-3``), not from a flag -- because an ungated wheel
+    term taxes every skid-steer turn and an ungated position term forbids driving
+    away from the spawn point.
 
     Why quadratics at all when the tracking terms are already there: the exp
     kernels are flat at zero error (zero gradient), so on their own they never
     ask for the last 0.1 m/s to go away. ``scale`` is the error that costs 1.0
     (before the weight): 0.15 m/s, 0.2 rad/s, 0.3 m/s of wheel rolling.
+
+    Why the quadratics, and why **no deadband**: a wheeled base with
+    ``stiffness = 0`` on the wheels has no parking brake -- it is a free-rolling
+    cart whose only brake is ``damping = 2``. That makes the last few cm/s
+    expensive to remove, but a zero command still has to mean zero motion, so the
+    residual is charged rather than excused. What actually stops the drift is
+    ``stand_position``: a velocity penalty charges the rate, a position penalty
+    charges the integral, and 0.05 m/s becomes 1 m of drift (cost 16 per step)
+    inside one 20 s episode. The same term pays for coming back after a push.
 
     NOT present, on purpose: an absolute (command-independent) wheel-speed or
     base-speed penalty -- that is a reward for refusing the command; a
@@ -232,16 +245,25 @@ class RewardsCfg:
         func=rewards.base_height_exp, weight=0.5,
         params={"target_height": BASE_HEIGHT, "sigma": 0.05})
 
-    # -- hold still: command-relative quadratics -----------------------------
+    # -- hold still: command-relative quadratics + position hold --------------
     # These are what make "command == 0" mean "stay here", not merely "do not
-    # accelerate". No mask, so they also hold when the command term never flags
-    # an env as standing.
+    # accelerate". The base terms are ungated (subtracting the command makes them
+    # free while driving); the wheel term and the position hold are gated on a
+    # strictly-zero command read from the command buffer. No deadband anywhere:
+    # within it the base would be free to creep, and the acceptance criteria say
+    # a zero command means a stopped robot.
     lin_vel_xy_error = RewardTermCfg(
-        func=rewards.lin_vel_xy_l2_error, weight=-1.0, params={"scale": 0.15})
+        func=rewards.lin_vel_xy_l2_error, weight=-1.0,
+        params={"scale": 0.15})
     yaw_rate_error = RewardTermCfg(
-        func=rewards.yaw_rate_l2_error, weight=-0.5, params={"scale": 0.2})
+        func=rewards.yaw_rate_l2_error, weight=-0.5,
+        params={"scale": 0.2})
+    stand_position = RewardTermCfg(
+        func=rewards.stand_position_l2, weight=-1.0,
+        params={"scale": 0.25})
     wheel_roll_error = RewardTermCfg(
-        func=rewards.wheel_roll_l2_error, weight=-0.5, params={"scale": 0.3})
+        func=rewards.wheel_roll_l2_error, weight=-0.5,
+        params={"scale": 0.3})
 
     # -- posture and smoothness ----------------------------------------------
     joint_deviation = RewardTermCfg(
