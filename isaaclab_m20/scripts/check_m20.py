@@ -45,7 +45,7 @@ from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
 from isaaclab.sim.converters import UrdfConverter, UrdfConverterCfg
 from isaaclab.utils import configclass
 
-from isaaclab_m20.assets import M20_CFG, M20_USD_PATH
+from isaaclab_m20.assets import M20_CFG, M20_USD_PATH, M20_USD_SOURCE
 
 
 def convert_urdf() -> str:
@@ -124,6 +124,7 @@ def main() -> None:
     usd_path = str(Path(args_cli.usd).expanduser().resolve()) if args_cli.usd else M20_USD_PATH
     if args_cli.convert == "urdf":
         usd_path = str(Path(convert_urdf()).expanduser().resolve())
+    print(f"[CHECK] asset source: {M20_USD_SOURCE}")
     check(usd_path)
 
 

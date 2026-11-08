@@ -1,1 +1,1 @@
-from .m20 import M20_CFG, M20_USD_PATH
+from .m20 import M20_CFG, M20_USD_PATH, M20_USD_SOURCE

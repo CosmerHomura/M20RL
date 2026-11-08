@@ -65,7 +65,7 @@ import torch  # noqa: E402
 import isaaclab_m20.tasks  # noqa: E402,F401  (registers the gym ids)
 from isaaclab.managers import SceneEntityCfg  # noqa: E402
 
-from isaaclab_m20.assets import M20_CFG  # noqa: E402
+from isaaclab_m20.assets import M20_CFG, M20_USD_SOURCE  # noqa: E402
 from isaaclab_m20.tasks import rewards  # noqa: E402
 from isaaclab_m20.tasks.observations import LEG_JOINT_NAMES, WHEEL_JOINT_NAMES  # noqa: E402
 
@@ -221,7 +221,7 @@ def build_env() -> gym.Env:
     env_cfg.seed = 0
     if args_cli.usd:
         env_cfg.scene.robot.spawn.usd_path = str(Path(args_cli.usd).expanduser().resolve())
-    print(f"[INFO] robot USD: {env_cfg.scene.robot.spawn.usd_path}")
+    print(f"[INFO] robot USD: {env_cfg.scene.robot.spawn.usd_path} ({M20_USD_SOURCE})")
     return gym.make(args_cli.task, cfg=env_cfg)
 
 

@@ -13,22 +13,55 @@ _CONVERTED_USD = _MODEL_DIR / "M20_urdf.usd"
 # The vendor asset is the authoritative source for the joint order, the joint
 # limits and the default pose -- no conversion in between. It is a layer stack:
 # model/usd/M20.usd (1.4 KB) sublayers configuration/M20_physics.usd, which in
-# turn sublayers configuration/M20_base.usd (17 MB of meshes and masses). When the
-# configuration/ directory is present the stack composes normally; if a sublayer
-# is ever lost the stage collapses to an empty prim and the spawner fails with
-# "Failed to find an articulation", which is what pushed this repo towards the
-# URDF import originally.
+# turn sublayers configuration/M20_base.usd (17 MB of meshes and masses).
 #
-# M20_USD=urdf forces the imported file instead. That import remains useful: it
-# can fold the four massless sensor links (front/rear camera, front/rear lidar)
-# into base_link, see scripts/check_m20.py --convert urdf.
+# That last layer is the fragile part: model/*.usd and model/usd/ are gitignored,
+# so a checkout can end up with the two small layers and without the 17 MB one.
+# USD then logs "Could not load sublayer @M20_base.usd@" and skips it, the stage
+# composes to an empty prim, and the spawner fails with
+#   RuntimeError: Failed to find an articulation ... 'USD ArticulationRootAPI'
+# which says nothing about the real cause. So the stack is only used when every
+# layer is present and M20_base.usd looks like the real 17 MB file.
+#
+# M20_USD=urdf forces the URDF import instead (scripts/check_m20.py --convert
+# urdf). That path is also the one that folds the four massless sensor links
+# (front/rear camera, front/rear lidar) into base_link.
+_OFFICIAL_LAYERS = (
+    _OFFICIAL_USD,
+    _MODEL_DIR / "usd" / "configuration" / "M20_physics.usd",
+    _MODEL_DIR / "usd" / "configuration" / "M20_base.usd",
+)
+
+
+def _official_stack_usable() -> bool:
+    """True only when every layer of the vendor stack exists and is not a stub."""
+    for layer in _OFFICIAL_LAYERS:
+        if not layer.is_file() or layer.stat().st_size < 1024:
+            return False
+    return _OFFICIAL_LAYERS[-1].stat().st_size > 1_000_000
+
+
 _PREFERENCE = os.environ.get("M20_USD", "official").strip().lower()
-if _PREFERENCE != "urdf" and _OFFICIAL_USD.is_file():
-    M20_USD_PATH = str(_OFFICIAL_USD)
-else:
-    # Deliberately not an error when the file is missing: check_m20.py imports
-    # this module to run --convert urdf, which is what creates it.
+if _PREFERENCE == "urdf":
     M20_USD_PATH = str(_CONVERTED_USD)
+    M20_USD_SOURCE = "urdf (M20_USD=urdf)"
+elif _official_stack_usable():
+    M20_USD_PATH = str(_OFFICIAL_USD)
+    M20_USD_SOURCE = "official layer stack"
+else:
+    # Deliberately not an error: check_m20.py imports this module to run
+    # --convert urdf, which is what creates the fallback file.
+    M20_USD_PATH = str(_CONVERTED_USD)
+    M20_USD_SOURCE = "urdf (official stack incomplete)"
+    _missing = [layer.name for layer in _OFFICIAL_LAYERS if not layer.is_file()]
+    print(
+        "[WARN] isaaclab_m20.assets: the vendor USD layer stack is incomplete"
+        f" (missing: {', '.join(_missing) or 'M20_base.usd is a stub'}),"
+        f" falling back to {M20_USD_PATH}.\n"
+        "       Copy the whole model/usd/ tree to use the vendor asset: the model/"
+        "*.usd and model/usd/ paths are gitignored, so a fresh checkout only has"
+        " the small layers."
+    )
 
 M20_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(

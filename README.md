@@ -23,7 +23,8 @@
 
 ```text
 model/
-├── usd/               # 官方 USD（默认加载：M20.usd + configuration/ 子层）
+├── usd/               # 官方 USD（默认：M20.usd + configuration/ 子层；缺 17 MB 的
+│                      #   M20_base.usd 时会自动回退到 M20_urdf.usd 并打印 WARN）
 ├── urdf/              # 官方 URDF（回退路线 M20_USD=urdf 的导入源）
 ├── M20_urdf.usd       # URDF 导入版（不进 git，只有 M20_USD=urdf 时才用）
 └── M20.xml + meshes/  # 官方 MJCF（备用；关节轴与限位可在这里核对）
@@ -51,7 +52,7 @@ isaaclab_m20/
 仓库根目录执行（脚本是模块入口，不能 `cd` 进 `scripts/`）：
 
 ```bash
-# 1. 验证资产（默认加载官方 USD model/usd/M20.usd，不需要导入步骤）
+# 1. 验证资产（默认加载官方 USD model/usd/M20.usd；层链不完整会自动回退并打 WARN）
 python -m isaaclab_m20.scripts.check_m20 --headless
 
 #    回退路线：从官方 URDF 导入一份再验证（会折叠 4 个无质量传感器 link）
