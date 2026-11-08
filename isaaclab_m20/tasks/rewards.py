@@ -8,8 +8,9 @@ set plus the static-hold and posture channels:
       + 1.0   · r_yaw                 yaw-rate tracking (exp, sigma 0.3 rad/s)
       + 0.5   · r_height              ride height (exp, sigma 0.05 m)
       - 0.5   · p_ori                 (gx² + gy²) / 0.2²        roll/pitch
-      - 0.5   · p_v_stand             ||v_xy||² / 0.25²          zero command only
-      - 0.1   · p_wheel_stand         mean(qdot_w² / 4²)         zero command only
+      - 1.0   · p_v_stand             sum(v_xy² / 0.15²)         zero command only
+      - 1.0   · p_yaw_stand           (w_z / 0.2)²               zero command only
+      - 0.5   · p_wheel_stand         mean(qdot_w² / 2²)         zero command only
       - 0.2   · p_pose                sum((q - q_default)²/0.3²) legs only
       - 0.02  · p_qdot                sum((qdot / 20)²)          legs only
       - 0.1   · p_slip                wheel/ground longitudinal slip
@@ -24,7 +25,7 @@ the kernel is ~0 once the error is a few σ. Note the division by ``σ²``, not 
 0.25 m/s, 0.3 rad/s, 0.2 rad and 0.05 m -- read them as "the error that already
 costs most of the channel", not as a width.
 
-Two of the eight plan channels are split in two here, on purpose:
+Three deliberate departures from the plan's eight channels:
 
 * attitude is a *quadratic* (``orientation_sq``) instead of an exp kernel: on
   flat ground the body should be level at all times, so the cost has to be
@@ -35,7 +36,18 @@ Two of the eight plan channels are split in two here, on purpose:
   A lifted wheel free-spins because the servo has kp = 0, and with a zero
   command nothing should be turning at all -- so the term exists, but it is
   multiplied by a zero-command mask (``standing_mask``) and can never tax a
-  robot that was told to drive.
+  robot that was told to drive;
+* the static-hold trio (``p_v_stand``, ``p_yaw_stand``, ``p_wheel_stand``) is
+  tight, and yaw got a channel of its own. First-version numbers were
+  0.5/0.25² and 0.1/4², so a 0.05 m/s creep cost 0.02 per step: with the exp
+  tracking term flat at zero error, nothing held the base in place, and stage 1
+  ("stand still") wandered -- typically drifting forward and slowly rotating,
+  because yaw had *only* the exp kernel and no quadratic at all. The error
+  scales are now 0.15 m/s, 0.2 rad/s and 2 rad/s: a 0.1 m/s creep costs ~0.45, a
+  0.1 rad/s spin costs 0.25, a 2 rad/s wheel spin costs 0.5, against a per-step
+  ceiling of about 3.5. A standing policy that moves is now strictly worse than
+  one that does not, by a margin the advantage estimator can see through the
+  exploration noise.
 
 Sign convention: penalty terms return a POSITIVE magnitude and carry their sign
 in the reward weight, exactly like ``isaaclab.envs.mdp`` (e.g.
@@ -333,22 +345,23 @@ def standing_mask(env, command_name: str = "base_velocity") -> torch.Tensor:
     return flag.to(device=env.device, dtype=torch.float32)
 
 
-def lin_vel_xy_l2_standing(env, scale: float = 0.25, command_name: str = "base_velocity",
+def lin_vel_xy_l2_standing(env, scale: float = 0.15, command_name: str = "base_velocity",
                            asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """masked ||v_xy||^2 / scale^2 (positive; weight is negative).
+    """masked sum(v_xy^2 / scale^2) (positive; weight is negative).
 
-    The tracking term is an exp kernel, so at a zero command it still pays about
-    2.0 for a 0.05 m/s drift (``exp(-0.04) = 0.96``): the gradient there is far
-    too flat to pin the base down. This quadratic is what actually holds the
-    still command: 0.1 m/s costs ``(0.1/0.25)^2 = 0.16``, 0.2 m/s costs 0.64, and
-    the gradient grows with the error instead of vanishing.
+    The tracking term is an exp kernel, so at a zero command a 0.05 m/s drift
+    still pays ``2.0 * exp(-0.04) = 1.92``, i.e. it loses only 0.08: the gradient
+    there is far too flat to pin the base down. This quadratic is what actually
+    holds the still command: 0.05 m/s costs ``(0.05/0.15)^2 = 0.11``, 0.1 m/s
+    costs 0.44, 0.2 m/s costs 1.78, and the gradient grows with the error
+    instead of vanishing.
     """
     lin_vel = _robot(env, asset_cfg).data.root_lin_vel_b[:, :2]
     error = torch.sum(torch.square(lin_vel / scale), dim=1)
     return standing_mask(env, command_name) * error
 
 
-def wheel_speed_l2_standing(env, scale: float = 4.0, command_name: str = "base_velocity",
+def wheel_speed_l2_standing(env, scale: float = 2.0, command_name: str = "base_velocity",
                             asset_cfg: SceneEntityCfg = SceneEntityCfg(
                                 "robot", joint_names=WHEEL_JOINT_NAMES)) -> torch.Tensor:
     """masked mean_wheel (qdot_w / scale)^2 (positive; weight is negative).
@@ -358,9 +371,9 @@ def wheel_speed_l2_standing(env, scale: float = 4.0, command_name: str = "base_v
     spins: wasted action, no motion. With a zero command there is no reason to
     turn the wheels at all, so this term is free to punish it.
 
-    ``scale = 4 rad/s`` = 0.36 m/s of rolling speed, half the 0.72 m/s the wheel
-    action can ask for. The mean over the four wheels (not the sum) keeps a
-    single lifted wheel from dominating.
+    ``scale = 2 rad/s`` = 0.18 m/s of rolling speed, a quarter of the 0.72 m/s
+    the wheel action can ask for. The mean over the four wheels (not the sum)
+    keeps a single lifted wheel from dominating.
 
     Never enable this without the mask: penalising wheel speed while driving is
     a reward for refusing the command.
@@ -368,6 +381,28 @@ def wheel_speed_l2_standing(env, scale: float = 4.0, command_name: str = "base_v
     robot = _robot(env, asset_cfg)
     wheel_vel = robot.data.joint_vel[:, asset_cfg.joint_ids]
     error = torch.mean(torch.square(wheel_vel / scale), dim=1)
+    return standing_mask(env, command_name) * error
+
+
+def yaw_rate_standing(env, scale: float = 0.2, command_name: str = "base_velocity",
+                      asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """masked (w_z / scale)^2 (positive; weight is negative).
+
+    The yaw channel had only the exp tracking term, and an exp kernel has zero
+    gradient at its own peak: with a zero command a slow spin is therefore the
+    cheapest way to move, and "stands still but slowly rotates" is exactly the
+    failure mode the first stage showed. This quadratic closes that hole with
+    the same shape as ``p_v_stand``.
+
+    ``scale = 0.2 rad/s``: 0.1 rad/s costs 0.25, 0.3 rad/s (the full stage-2 yaw
+    range) costs 2.25.
+
+    Roll/pitch rate is already covered by ``ang_vel_xy_l2``; only yaw needs a
+    static-only brake, because yaw is the one channel a zero command never
+    relaxes.
+    """
+    ang_vel_z = _robot(env, asset_cfg).data.root_ang_vel_b[:, 2]
+    error = torch.square(ang_vel_z / scale)
     return standing_mask(env, command_name) * error
 
 

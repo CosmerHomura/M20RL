@@ -76,10 +76,15 @@ class M20VelocityRslRlPpoRunnerCfg(M20RslRlPpoRunnerCfg):
     * entropy 0.005 instead of 0.01 -- halved with the lower learning rate; the
       standing task needs exploration around one pose, the velocity task needs to
       *keep* the gait it finds rather than keep jittering.
-    * action std 0.9 rather than 1.0 -- one unit of leg action is 0.25 rad
-      (14 deg), so std 1.0 puts the initial stance noise at +-14 deg on every
-      joint. 0.9 is the plan's "0.8-1.0", chosen at the exploration-friendly end
-      because stage 1 begins with a zero command range.
+    * action std 0.5 rather than 1.0 -- the sampler puts the *same* sigma on all
+      16 action dims, but the dims do not mean the same thing: one unit of leg
+      action is 0.25 rad (14 deg), while one unit of wheel action is 8 rad/s
+      (0.72 m/s at the contact). A std of 0.9 therefore commanded the wheels to
+      +-7.2 rad/s (+-0.65 m/s) on every step of the "stand still" stage, which is
+      far larger than the 0.15 m/s the standing terms are trying to hold -- the
+      exploration noise alone recreated the wandering the reward was meant to
+      remove. 0.5 still gives +-7 deg of leg jitter and +-0.36 m/s of wheel
+      noise at the start, and rsl_rl shrinks the std as the policy improves.
     * save_interval 50 -- the stages are 300-1250 iterations long, so 100 would
       leave 7 checkpoints per stage and no way to bisect a stage that goes bad
       halfway.
@@ -91,7 +96,7 @@ class M20VelocityRslRlPpoRunnerCfg(M20RslRlPpoRunnerCfg):
     save_interval = 50
 
     policy = RslRlPpoActorCriticCfg(
-        init_noise_std=0.9,
+        init_noise_std=0.5,
         actor_hidden_dims=[256, 256],
         critic_hidden_dims=[256, 256],
         activation="elu",

@@ -393,6 +393,12 @@ def attach_diagnostics(env, every: int, zero_actions: bool) -> None:
     dead by the time it surfaces. Printing the worst-case joint speed and base
     height every iteration makes the growth visible a few seconds before the
     crash instead of after it.
+
+    For the velocity task the line also carries ``|v_xy|`` (mean body speed, the
+    quantity the static-hold terms act on) and ``standing`` (the fraction of
+    envs whose command is zero, i.e. the mask those terms multiply). A stage-1
+    run that wanders shows up there immediately; ``standing=0.00`` would mean the
+    mask is broken rather than the reward being too weak.
     """
     unwrapped = env.unwrapped
     original_step = env.step
@@ -408,11 +414,27 @@ def attach_diagnostics(env, every: int, zero_actions: bool) -> None:
             joint_vel = robot.data.joint_vel
             root_z = robot.data.root_pos_w[:, 2]
             root_vel = robot.data.root_lin_vel_w.abs().max()
+            # "does the robot actually stand still when told to" is otherwise
+            # only visible in tensorboard hours later: |v_xy| is the quantity the
+            # static-hold terms act on, and `standing` is the mask they use. If
+            # standing is 0.00 during stage 1, the mask is broken, not the reward.
+            speed_xy = robot.data.root_lin_vel_b[:, :2].norm(dim=1).mean()
+            extra = f"  |v_xy|={speed_xy.item():.3f}"
+            command_manager = getattr(unwrapped, "command_manager", None)
+            if command_manager is not None:
+                try:
+                    term = command_manager.get_term("base_velocity")
+                except KeyError:
+                    term = None
+                flag = getattr(term, "is_standing_env", None) if term else None
+                if flag is not None:
+                    extra += f"  standing={flag.float().mean().item():.2f}"
             print(
                 f"[health] step={state['n']:8d}"
                 f"  max|qdot|={joint_vel.abs().max().item():10.2f}"
                 f"  max|v|={root_vel.item():8.2f}"
                 f"  z=[{root_z.min().item():.3f},{root_z.max().item():.3f}]"
+                f"{extra}"
                 f"  finite={torch.isfinite(joint_vel).all().item()}",
                 flush=True,
             )

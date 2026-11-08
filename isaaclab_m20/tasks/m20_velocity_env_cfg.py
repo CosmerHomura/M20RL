@@ -14,7 +14,7 @@ observation         56 dims, body frame (see ``observations.py``)
 action              16 dims: 12 leg position targets + 4 wheel speed targets
 control rate        50 Hz (decimation 4 on 200 Hz physics)
 episode             20 s
-rewards             8 weighted terms + fall penalty (see ``rewards.py``)
+rewards             13 weighted terms + fall penalty (see ``rewards.py``)
 command mix         50% single axis / 30% two axes / 10% three / 10% zero,
                     held 2-4 s (last stage: 35% zero, held 1.5-3 s)
 domain random.      OFF: nominal friction, mass and CoM, no pushes
@@ -181,12 +181,19 @@ class RewardsCfg:
     carries its sign here (see the module docstring of ``rewards.py``). The
     ordering below groups task terms, attitude, static hold, then penalties.
 
-    The four ``*_standing`` / masked channels are multiplied by
-    ``rewards.standing_mask`` inside the reward functions: they are active for
-    envs whose command is exactly zero (and for every env in stage 1, where the
-    whole range is zero), and contribute nothing to an env that was told to
-    drive. That is what makes "wheel speed must be low" safe here -- unmasked it
-    would be a reward for refusing the command, which is the plan's objection.
+    The three masked channels (``lin_vel_xy_standing``, ``yaw_rate_standing``,
+    ``wheel_speed_standing``) are multiplied by ``rewards.standing_mask`` inside
+    the reward functions: they are active for envs whose command is exactly zero
+    (and for every env in stage 1, where the whole range is zero), and contribute
+    nothing to an env that was told to drive. That is what makes "wheel speed must
+    be low" safe here -- unmasked it would be a reward for refusing the command,
+    which is the plan's objection.
+
+    Their scales are deliberately tight (0.15 m/s, 0.2 rad/s, 2 rad/s): the
+    tracking terms are exp kernels, which are *flat at zero error*, so a
+    zero-command policy that creeps at 0.05 m/s loses only 0.08 of the 2.0
+    tracking channel. Without the quadratics, "stand still" is a task the reward
+    never actually asks for -- which is why stage 1 used to wander.
 
     NOT present, on purpose: an unmasked wheel absolute-speed penalty, a
     four-wheel-contact term (the trot lifts two legs), and a lateral tyre-slip
@@ -211,10 +218,17 @@ class RewardsCfg:
         params={"target_height": BASE_HEIGHT, "sigma": 0.05})
 
     # -- static hold (masked to zero-command envs) ---------------------------
+    # These three are what make "command == 0" mean "stay here", not merely
+    # "do not accelerate": the exp tracking kernels are flat at zero error, so
+    # without quadratic terms a standing policy can creep at 0.05-0.1 m/s for
+    # free (2 m per episode) and slowly rotate. The scale is the error that
+    # costs 1.0: 0.15 m/s, 0.2 rad/s, 2 rad/s.
     lin_vel_xy_standing = RewardTermCfg(
-        func=rewards.lin_vel_xy_l2_standing, weight=-0.5, params={"scale": 0.25})
+        func=rewards.lin_vel_xy_l2_standing, weight=-1.0, params={"scale": 0.15})
+    yaw_rate_standing = RewardTermCfg(
+        func=rewards.yaw_rate_standing, weight=-1.0, params={"scale": 0.2})
     wheel_speed_standing = RewardTermCfg(
-        func=rewards.wheel_speed_l2_standing, weight=-0.1, params={"scale": 4.0})
+        func=rewards.wheel_speed_l2_standing, weight=-0.5, params={"scale": 2.0})
 
     # -- posture and smoothness ----------------------------------------------
     joint_deviation = RewardTermCfg(
