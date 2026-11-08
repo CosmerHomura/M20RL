@@ -122,7 +122,14 @@ class RewardsCfg:
     # The large negative termination term is what stops the policy from learning
     # to fall over: without it, ending the episode early avoids the per-step
     # smoothness/torque penalties and is the cheaper option.
-    termination_penalty = RewardTermCfg(func=mdp.is_terminated, weight=-200.0)
+    #
+    # Fall-only, not ``mdp.is_terminated``: surviving the 20 s episode is the
+    # competence being trained, so a normal time-out must pay exactly 0. The two
+    # thresholds below mirror ``TerminationsCfg`` (0.25 m / 0.7 rad) so the event
+    # that ends the episode is the event that is penalised.
+    termination_penalty = RewardTermCfg(
+        func=rewards.fall_terminated, weight=-200.0,
+        params={"minimum_height": 0.25, "max_tilt": 0.7})
     alive = RewardTermCfg(func=mdp.is_alive, weight=0.15)
 
 

@@ -186,47 +186,49 @@ class ObservationsCfg:
 
 @configclass
 class RewardsCfg:
-    """Eleven entries: two task channels, three state channels, three
-    regularisers, two gated hold channels and the fall.
+    """Ten per-step channels plus the fall: two tracking, four base-state, three
+    regularisers, and the one gated term.
 
     Weights are the plan's; every penalty term returns a positive magnitude and
     carries its sign here (see the module docstring of ``rewards.py``).
 
-    Ten, not sixteen. The previous revision had a matching pair of channels for
-    each axis group -- an exp kernel *and* a quadratic for linear velocity, again
-    for yaw, plus a gated wheel-speed term and three regularisers that measured
-    almost nothing -- which is two springs of different stiffness on the same
-    error: impossible to attribute, impossible to tune, and the reason the table
-    kept growing. The fix was to replace pairs, not to add a fourth one:
+    The revision that came before this one had a pair of channels for each axis
+    group -- an exp kernel *and* a quadratic for linear velocity, again for yaw --
+    plus a gated position hold and three regularisers that measured almost
+    nothing. Two springs of different stiffness on the same error cannot be
+    attributed or tuned, which is why the table kept growing. This set replaces
+    pairs instead of adding to them:
 
     * one bounded kernel per axis group (``track_lin_vel_xy``, ``track_ang_vel_z``,
-      Cauchy form ``1/(1+e^2/sigma^2)``) instead of exp + quadratic;
-    * ``stand_position`` alone carries "a zero command means zero motion": it
-      prices the *displacement* a drift produces, which is what the acceptance
-      test measures. At 0.05 m/s the drift costs 0.04/step after one second and
-      16/step after twenty -- the velocity channels never needed to be doubled;
-    * ``leg_joint_acc_l2`` replaces the velocity channel (too weak to price
-      chatter by an order of magnitude) and ``action_rate_l2`` is normalised, so
-      jitter is no longer free.
+      Cauchy form ``1/(1+e^2/sigma^2)``): it keeps a usable gradient across the
+      whole command range, where exp is already flat at 0.018 by the far end;
+    * height is a quadratic error, not an exp bonus -- on flat ground 0.50 m is a
+      set point, so the channel wants stiffness around it and no ceiling;
+    * ``leg_joint_acc`` replaces the leg joint-velocity channel and
+      ``action_rate`` is normalised, so joint chatter is no longer free.
 
-    Two terms are gated, both on a strictly-zero command read from the command
-    buffer (``eps = 1e-3``): ``stand_position`` (where the robot ended up) and
-    ``wheel_speed`` (wheels spinning under a still body). Everything else is
-    ungated because it is either relative to the command or meaningful while
-    driving -- an ungated position term would forbid driving away from the anchor
-    point, and an ungated wheel-speed term would tax in-place turns.
+    One gated term only: ``wheel_speed`` (wheels spinning under a still body),
+    gated on a strictly-zero command read from the command buffer
+    (``eps = 1e-3``). Everything else is ungated because it is either relative to
+    the command or meaningful while driving.
 
-    NOT present, on purpose: an absolute (command-independent) wheel-speed or
-    base-speed penalty -- that is a reward for refusing the command; a
-    four-wheel-contact term (the trot lifts two legs); and a lateral tyre-slip
-    penalty (the scrub is how lateral motion happens).
+    Deliberately absent, and each one was a deliberate deletion:
 
-    Also absent: a per-step survival bonus. It reads like the fall penalty's
-    mirror image, but a bonus is collected every step and a penalty once, so it
-    mostly rescales the return, and with the reward floor in
-    ``isaaclab_m20.envs`` every step is already worth at least zero -- dying can
-    no longer be cheaper than living badly. The fall penalty is then a strictly
-    negative event on its own.
+    * **No gated ``||v_xy||^2``.** With a zero command the tracking kernel already
+      asks for zero velocity -- a second quadratic on the same error would be the
+      two-springs problem again, on the axis that matters most.
+    * **No position hold (``p_hold``).** "Get back to where you were pushed from"
+      is a third capability, on top of move / stop / stand. It is measured on its
+      own (net displacement of the hold test) before it earns a reward term;
+      stacking it on the same reward makes every failure ambiguous.
+    * **No survival bonus.** A bonus is paid every step and the fall penalty once,
+      so a survival term mostly rescales the return, and with the reward floor in
+      ``isaaclab_m20.envs`` every step is already worth at least zero -- dying
+      cannot be cheaper than living badly.
+    * **No absolute (command-independent) wheel- or base-speed penalty**, which
+      would tax obeying the command; **no four-wheel-contact term** (the trot
+      lifts two legs); **no lateral tyre-slip penalty** (the scrub is how lateral
+      motion happens).
     """
 
     # -- task ---------------------------------------------------------------
@@ -235,51 +237,50 @@ class RewardsCfg:
     track_ang_vel_z = RewardTermCfg(
         func=rewards.track_ang_vel_z, weight=1.0, params={"sigma": 0.3})
 
-    # -- attitude and height ------------------------------------------------
-    # Quadratic, not exp: on flat ground the tilt should be near zero at all
-    # times and a hold-still command needs stiffness there (see rewards.py).
+    # -- base state ----------------------------------------------------------
+    # Quadratic, not exp: on flat ground the tilt and the ride height should be
+    # near their set points at all times, and a hold-still command needs stiffness
+    # there rather than a bonus with a ceiling (see rewards.py).
+    base_height = RewardTermCfg(
+        func=rewards.base_height_l2, weight=-0.5,
+        params={"target_height": BASE_HEIGHT, "scale": 0.05})
     flat_orientation = RewardTermCfg(
         func=rewards.orientation_sq, weight=-0.5, params={"scale": 0.2})
-    base_height = RewardTermCfg(
-        func=rewards.base_height_exp, weight=1.0,
-        params={"target_height": BASE_HEIGHT, "sigma": 0.05})
+    # Vertical bounce: with no foot contacts, a bouncing body is the cheapest way
+    # to look like it is walking, and neither the tilt nor the height term sees it.
+    lin_vel_z = RewardTermCfg(
+        func=rewards.lin_vel_z_l2, weight=-0.2, params={"scale": 0.2})
     # Attitude *rate*, which the quadratic tilt does not cover: a small-amplitude
     # wobble keeps the mean tilt near zero and is otherwise almost free.
     ang_vel_xy = RewardTermCfg(
         func=rewards.ang_vel_xy_l2, weight=-0.2, params={"scale": 1.0})
 
-    # -- hold still ----------------------------------------------------------
-    # One of the two gated terms, and it is gated on a strictly-zero command read
-    # from the command buffer. No deadband: within one the base would be free to
-    # creep, and 0.25 m of creep already costs 1.0 per step.
-    stand_position = RewardTermCfg(
-        func=rewards.stand_position_l2, weight=-1.0,
-        params={"scale": 0.25})
-    # Spinning wheels under a still body. The body terms cannot see this: with the
-    # legs holding the base up, the wheels can be commanded to any speed without
-    # moving the robot, and ``stand_position`` stays at zero. Gated like the term
-    # above for the same reason -- when driving, the wheels are *supposed* to
-    # spin, and a rollout that did not gate this would tax every command.
+    # -- wheels under a parked body -----------------------------------------
+    # The one gated term. The body-frame channels cannot see this: with the legs
+    # holding the base up, the wheels can be commanded to any speed without moving
+    # the robot. Gated because when a command is present the wheels are *supposed*
+    # to spin -- an ungated version taxes every in-place turn.
     wheel_speed = RewardTermCfg(
-        func=rewards.wheel_speed_l2, weight=-0.5, params={"scale": 2.0})
+        func=rewards.wheel_speed_l2, weight=-0.2, params={"scale": 2.0})
 
     # -- posture and smoothness ----------------------------------------------
     joint_deviation = RewardTermCfg(
-        func=rewards.joint_deviation_l2, weight=-0.1, params={"scale": 0.3})
+        func=rewards.joint_deviation_l2, weight=-0.05, params={"scale": 0.3})
     leg_joint_acc = RewardTermCfg(
         func=rewards.leg_joint_acc_l2, weight=-0.02, params={"acc_scale": 200.0})
     action_rate = RewardTermCfg(
         func=rewards.action_rate_l2, weight=-0.01, params={"action_scale": 0.05})
 
     # -- fall ----------------------------------------------------------------
-    # No survival bonus. It looks like the mirror image of the fall penalty, but
-    # it is not: a bonus is paid every step and a penalty once, so the bonus
-    # mostly rescales the return. What actually stops the policy from falling on
-    # purpose is the reward floor in ``isaaclab_m20.envs``, which makes every
-    # step worth at least zero -- so dying cannot be cheaper than living badly.
-    # With the floor, the fall penalty alone is a strictly negative event.
+    # No survival bonus (see the class docstring). What stops the policy from
+    # falling on purpose is the reward floor in ``isaaclab_m20.envs``: every step
+    # is worth at least zero, so dying cannot be cheaper than living badly, and
+    # the fall penalty is a strictly negative event on its own. It is -10 rather
+    # than -200 because the real cost of falling is the rest of the episode's
+    # positive rewards; a large penalty on top of that only distorts the value
+    # function, which now sees a reward scale of a few units per step.
     termination_penalty = RewardTermCfg(
-        func=rewards.fall_terminated, weight=-200.0,
+        func=rewards.fall_terminated, weight=-10.0,
         params={"minimum_height": MIN_BASE_HEIGHT, "max_tilt": MAX_TILT_RAD})
 
 

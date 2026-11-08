@@ -6,19 +6,19 @@ plus the fall penalty (eleven entries in the config):
 
     r = + 2.0   · r_vel                 speed tracking, 1/(1 + e²/0.25²)
       + 1.0   · r_yaw                 yaw-rate tracking, 1/(1 + e²/0.3²)
-      + 1.0   · r_height              ride height (exp, sigma 0.05 m)
+      - 0.5   · p_h                   ((h - 0.50)/0.05)²                  ride height
       - 0.5   · p_ori                 (gx² + gy²) / 0.2²                    roll/pitch
-      - 1.0   · p_pos                 1[cmd==0]·sum((p_xy - p_hold)²/0.25²) hold
-      - 0.5   · p_wheel               1[cmd==0]·mean((qdot_w / 2)²)          spinning wheels
-      - 0.1   · p_pose                sum((q - q_default)²/0.3²)   legs only
+      - 0.2   · p_vz                  (v_z / 0.2)²                     vertical bounce
       - 0.2   · p_ang                 sum(w_xy² / 1²)                       wobble
+      - 0.2   · p_wheel               1[cmd==0]·mean((qdot_w / 2)²)   spinning wheels
+      - 0.05  · p_pose                sum((q - q_default)²/0.3²)   legs only
       - 0.02  · p_qacc                sum((qdd / 200)²)            legs only
       - 0.01  · p_action              sum((Δa / 0.05)²)
-      - 200   · 1[fallen]             fall penalty, NOT the time-out
+      - 10    · 1[fallen]             fall penalty, NOT the time-out
 
 **Ten, not sixteen.** The earlier set had a pair of channels for each axis group
 -- an exp kernel *and* a quadratic for linear velocity, again for yaw -- plus a
-gated wheel-speed term and regularisers that measured almost nothing (leg joint
+gated position hold and regularisers that measured almost nothing (leg joint
 velocity was 1% of the height term, joint torque less). Two springs of different
 stiffness on the same error cannot be attributed or tuned, which is exactly why
 the table kept growing. The consolidation replaced pairs instead of adding to
@@ -27,10 +27,9 @@ them:
 * one bounded kernel per axis group (``track_lin_vel_xy``, ``track_ang_vel_z``).
   The Cauchy form 1/(1+e²/σ²) keeps a usable gradient across the whole command
   range, where exp is already flat at 0.018 by the far end;
-* ``stand_position_l2`` alone carries "a zero command means zero motion". It
-  prices the *displacement* a drift produces -- 0.05 m/s costs 0.04/step after a
-  second and 16/step after twenty -- which is what the acceptance test measures;
-  a velocity channel would only double-charge the same drift;
+* ride height is a plain quadratic error, not an exp bonus: on flat ground the
+  target is a set point, so what the channel needs is stiffness around it, and a
+  quadratic has no ceiling to saturate against;
 * ``leg_joint_acc_l2`` (new) replaces the leg joint-velocity channel, and
   ``action_rate_l2`` is normalised by 0.05. Together they are the only thing that
   makes joint chatter cost anything: at the old weights a 3 rad/s swing cost
@@ -41,21 +40,27 @@ bonus is paid every step and a penalty once, so a survival term mostly rescales
 the return; and with the reward floor in ``isaaclab_m20.envs`` every step is
 already worth at least zero, which is what removes the incentive to fall on
 purpose. The fall penalty alone is then a strictly negative event: dying is never
-cheaper than living badly. What replaced the bonus is the two channels that pay
-for the *state* the bonus was proxying -- ``p_ori``/``p_ang`` for staying upright
-and ``p_pos``/``p_wheel`` for staying put.
+cheaper than living badly. What replaced the bonus is the channels that pay for
+the *state* the bonus was proxying -- ``p_h``/``p_ori``/``p_ang`` for staying
+upright and ``p_wheel`` for not idling with the wheels spinning.
 
 Sign convention: penalty terms return a POSITIVE magnitude and carry their sign
 in the reward weight, exactly like ``isaaclab.envs.mdp`` (e.g.
-``ang_vel_xy_l2`` returns ``w_xy²`` and the config gives it weight -0.05).
+``ang_vel_xy_l2`` returns ``w_xy²`` and the config gives it weight -0.2).
 Do not add a leading minus here -- it would flip the term into a bonus.
 
-Gate convention: ``stand_position_l2`` and ``wheel_speed_l2`` are masked, and the
-mask is read from the **command buffer** (strictly zero, ``eps = 1e-3``) rather
-than from ``is_standing_env``. A flag that nobody sets switches a whole channel
-off silently; a buffer cannot. There is no deadband anywhere -- a zero command
-means a stopped robot. The other eight terms are ungated because they are
-relative to the command or meaningful while driving.
+Gate convention: ``wheel_speed_l2`` is the only masked term, and the mask is read
+from the **command buffer** (strictly zero, ``eps = 1e-3``) rather than from
+``is_standing_env``. A flag that nobody sets switches a whole channel off
+silently; a buffer cannot. There is no deadband anywhere. Standing is held by the
+tracking kernels themselves (a zero command asks for zero velocity) -- a separate
+gated ``||v_xy||²`` term would be a second spring on the same error.
+
+**No position hold in this revision.** Getting back to the spot you were pushed
+from is a third capability, on top of "move", "stop" and "stand". It is verified
+on its own (net displacement in the acceptance test) before it earns a reward
+term; stacking it on the same reward as the other three makes every failure
+ambiguous.
 
 Also deliberately absent: any term that keeps all four wheels on the ground (the
 trot lifts two legs on purpose), and any un-gated wheel-speed or base-speed
@@ -70,11 +75,6 @@ from isaaclab.managers import SceneEntityCfg
 
 from isaaclab_m20.tasks import observations
 from isaaclab_m20.tasks.observations import LEG_JOINT_NAMES, WHEEL_JOINT_NAMES
-
-# Every ``*_wheel`` link in model/urdf/M20.urdf is
-# <cylinder length="0.054" radius="0.09"/>. The wheel action scale times this
-# radius is the speed ceiling; it is also the rolling-speed gain below.
-WHEEL_RADIUS = 0.09
 
 
 def leg_asset_cfg() -> SceneEntityCfg:
@@ -137,8 +137,10 @@ def wheel_vel_exp(env, sigma: float = 2.0,
 # usable gradient instead of a 0/1 cliff), gently saturating, and -- unlike the
 # masked stand-still channels -- it keeps its shape near zero error.
 #
-# Zero command needs no second channel for "do not move": `stand_position_l2`
-# prices the *displacement*, which is what a drift actually produces.
+# Zero command needs no second channel for "do not move": the kernels are already
+# relative to the command, so a zero command asks for zero velocity, and the only
+# thing they cannot see is a wheel spinning under a parked body -- that is what
+# the gated `wheel_speed_l2` is for.
 # --------------------------------------------------------------------------- #
 def track_lin_vel_xy(env, sigma: float = 0.25, command_name: str = "base_velocity",
                      asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
@@ -167,24 +169,20 @@ def track_ang_vel_z(env, sigma: float = 0.3, command_name: str = "base_velocity"
     return 1.0 / (1.0 + error / (sigma * sigma))
 
 
-def base_height_exp(env, target_height: float = 0.50, sigma: float = 0.05,
-                    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """exp(-(h - h*)^2 / sigma^2), in [0, 1]: the base holds its ride height.
-
-    ``sigma = 0.05 m`` is deliberately tight: base height is the cheapest proxy
-    for "the legs are still carrying the robot" that this model has -- there are
-    no foot contact sensors -- and a 10 cm squat should cost the channel.
-    """
-    height = _robot(env, asset_cfg).data.root_pos_w[:, 2]
-    return torch.exp(-torch.square(height - target_height) / (sigma * sigma))
-
-
 # --------------------------------------------------------------------------- #
 # Shared by both tasks
 # --------------------------------------------------------------------------- #
-def lin_vel_z_l2(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """Vertical velocity squared (positive; weight is negative)."""
-    return torch.square(_robot(env, asset_cfg).data.root_lin_vel_b[:, 2])
+def lin_vel_z_l2(env, scale: float = 1.0,
+                 asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Vertical velocity squared, normalised by ``scale`` (m/s).
+
+    ``scale = 1.0`` keeps the standing task's raw ``v_z²``. The velocity task
+    passes ``0.2`` so that a 0.2 m/s of vertical bounce is one unit of cost:
+    with no foot contacts, a bouncing body is the cheapest way to look like it is
+    walking, and the roll/pitch channels do not see a bounce at all.
+    """
+    lin_vel_z = _robot(env, asset_cfg).data.root_lin_vel_b[:, 2]
+    return torch.square(lin_vel_z / scale)
 
 
 def ang_vel_xy_l2(env, scale: float = 1.0,
@@ -207,11 +205,19 @@ def flat_orientation_l2(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
     return torch.square(gravity[:, 0]) + torch.square(gravity[:, 1])
 
 
-def base_height_l2(env, target_height: float = 0.50,
+def base_height_l2(env, target_height: float = 0.50, scale: float = 1.0,
                    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """Quadratic height error (positive; weight is negative)."""
+    """Quadratic height error, normalised by ``scale`` (positive; weight is negative).
+
+    Both tasks use the same function with different normalisation: the standing
+    task keeps the raw metres (``scale = 1.0``, weight -20), the velocity task
+    prices 5 cm as one unit (``scale = 0.05``, weight -0.5) so that height is
+    stiffness around a set point rather than a bonus with a ceiling. On flat
+    ground 0.50 m is where the legs carry the robot; losing 5 cm means the knees
+    have folded and the next event is the fall termination.
+    """
     height = _robot(env, asset_cfg).data.root_pos_w[:, 2]
-    return torch.square(height - target_height)
+    return torch.square((height - target_height) / scale)
 
 
 def joint_deviation_l1(env, asset_cfg: SceneEntityCfg = SceneEntityCfg(
@@ -295,13 +301,12 @@ def leg_joint_acc_l2(env, acc_scale: float = 200.0,
 
 
 # --------------------------------------------------------------------------- #
-# Standing hold: (where the robot is) - (where it stopped).
-# No deadband: a zero command means zero motion, full stop. The tracking kernels
-# are command-relative and stay ungated (subtracting the command keeps them free
-# while driving); the position hold is gated on a *strictly* zero command, and the
-# gate is read from the command buffer (see ``standing_mask``). A masked term that
-# never fires (an env whose command term forgets to flag standing, a task with no
-# command at all) fails silently; a subtraction cannot.
+# The one gated channel: wheels spinning under a parked body. That is the only
+# state the base-frame kernels cannot observe -- the body is still, so every
+# tracking channel is satisfied. The gate is a *strictly* zero command read from
+# the command buffer (see ``standing_mask``) rather than from ``is_standing_env``,
+# because a flag that nobody sets switches a channel off silently. No deadband: a
+# zero command means zero motion.
 # --------------------------------------------------------------------------- #
 def standing_mask(env, command_name: str = "base_velocity",
                   eps: float = 1e-3) -> torch.Tensor:
@@ -314,72 +319,15 @@ def standing_mask(env, command_name: str = "base_velocity",
     the ground truth; ``eps = 1e-3`` makes the gate strict, so a 0.05 m/s command
     counts as *driving* and does not receive the stand-still treatment.
 
-    Used by the two gated terms, ``stand_position_l2`` and ``wheel_speed_l2``.
-    The tracking kernels are command-relative and need no gate: subtracting the
-    command already makes them free while driving.
+    Used by the one gated term, ``wheel_speed_l2``. The tracking kernels are
+    command-relative and need no gate: subtracting the command already makes them
+    free while driving.
     """
     command_manager = getattr(env, "command_manager", None)
     if command_manager is None:
         return torch.ones(env.num_envs, device=env.device)
     cmd = observations.velocity_command(env, command_name)
     return (cmd.abs() <= eps).all(dim=1).to(dtype=torch.float32)
-
-
-# Where each env's "hold here" reference is anchored. Per-env state, so it lives
-# in a module-level cache keyed by the env instance rather than in the cfg.
-_STAND_REF: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-
-
-def _stand_reference(env, mask: torch.Tensor, pos_xy: torch.Tensor) -> torch.Tensor:
-    """Position each env must hold while its command is zero -- shape (n, 2).
-
-    The reference is re-anchored on the **rising edge** of the stand mask (and on
-    every episode reset), i.e. "hold where you stopped". Anchoring it to the spawn
-    point instead would fight the driving stages: after 3 s at 0.5 m/s the robot is
-    1.5 m away, and a sampled zero command would then demand walking back to the
-    spawn -- which teaches "never drive far" rather than "stop cleanly". A push
-    still produces drift away from the reference, so recovery is still rewarded.
-    """
-    key = id(env)
-    state = _STAND_REF.get(key)
-    reset = env.episode_length_buf <= 1
-    if state is None or state[0].shape != pos_xy.shape or state[0].device != pos_xy.device:
-        return pos_xy.clone()
-    reference, last_mask = state
-    reference = reference.clone()
-    reanchor = ((mask > 0.5) & (last_mask < 0.5)) | reset
-    if bool(reanchor.any()):
-        reference[reanchor] = pos_xy[reanchor]
-    return reference
-
-
-def stand_position_l2(env, scale: float = 0.25, command_name: str = "base_velocity",
-                      asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """1[cmd == 0] * sum(((p_xy - p_xy_hold) / scale)^2) (positive).
-
-    The displacement counterpart of the velocity quadratics, and the term that
-    makes "the command is zero, so the robot must not move" actually hold. A
-    velocity penalty alone is a damper: it charges for the *rate*, so a constant
-    0.05 m/s creep costs 0.11 per step -- noticeable, but a position term charges
-    for the *integral*, and 0.05 m/s becomes 1 m of drift (cost 16 per step) within
-    one 20 s episode. That is also what recovers from a push: the pusher moves the
-    base, drift grows, and the term pays for coming back.
-
-    Gated on a strictly-zero command (see ``standing_mask``) and measured from the
-    position at which the command went to zero, so it is free while driving and
-    never asks the robot to return to where the episode started.
-
-    ``scale = 0.25 m``: 0.05 m costs 0.04, 0.25 m costs 1.0, 1 m costs 16. It is
-    the whole "stay put" mechanism now -- the tracking kernels only measure how
-    well the commanded velocity is followed, this one measures where the robot
-    ended up.
-    """
-    mask = standing_mask(env, command_name)
-    pos_xy = _robot(env, asset_cfg).data.root_pos_w[:, :2]
-    reference = _stand_reference(env, mask, pos_xy)
-    _STAND_REF[id(env)] = (reference, mask.clone())
-    drift = pos_xy - reference
-    return mask * torch.sum(torch.square(drift / scale), dim=1)
 
 
 def wheel_speed_l2(env, scale: float = 2.0, command_name: str = "base_velocity",
@@ -389,9 +337,9 @@ def wheel_speed_l2(env, scale: float = 2.0, command_name: str = "base_velocity",
 
     The one thing the body-frame terms cannot see: with the legs holding the base
     up, a wheel can be commanded to any speed without moving the robot, so a
-    policy can idle with four spinning wheels and collect a perfect
-    ``stand_position`` score. It also fixes the reverse case -- wheels that are
-    *not* spinning while the base creeps, which is the robot skating.
+    policy can idle with four spinning wheels and still track a zero command. It
+    also fixes the reverse case -- wheels that are *not* spinning while the base
+    creeps, which is the robot skating.
 
     Gated, unlike the body terms, because when a command is present the wheels are
     supposed to spin: ungated, an in-place turn would pay for the differential
@@ -416,8 +364,11 @@ def joint_deviation_l2(env, scale: float = 0.3,
     angle is unbounded (see ``joint_deviation_l1``).
 
     ``scale = 0.3 rad`` makes a 0.3 rad offset on one joint cost 1.0; 12 joints
-    at 0.1 rad cost ``12 * 0.11 = 1.3``, which the default weight -0.2 turns into
-    -0.27 per step, about an eighth of the tracking channel.
+    at 0.1 rad cost ``12 * 0.11 = 1.3``, which the default weight -0.05 turns into
+    -0.065 per step. That is deliberately smaller than the tracking channel: with
+    ``kp = 80`` carrying 38.5 kg the legs sag about 0.27 rad at the stance, so a
+    stiff posture term would spend its budget fighting gravity instead of keeping
+    left and right mirrored.
 
     Caveat: it pulls towards ``default_joint_pos``. If that nominal stance is
     itself pitched (unequal hip offsets front to back), this term *enforces* the
@@ -451,9 +402,9 @@ def fall_terminated(env, minimum_height: float = 0.33, max_tilt: float = 0.5,
 
     Deliberately not ``mdp.is_terminated``: that fires on the 20 s time-out too,
     so a policy that stands perfectly for the whole episode would pay the same
-    -200 as one that collapses at step 40. With the terminal penalty costing the
-    same either way, nothing rewards *staying* upright -- it only rewards ending
-    fast. This is the fall-only version.
+    penalty as one that collapses at step 40. With the terminal penalty costing
+    the same either way, nothing rewards *staying* upright -- it only rewards
+    ending fast. This is the fall-only version.
 
     The two conditions mirror ``TerminationsCfg`` exactly (height below
     ``minimum_height``, tilt from ``acos(-g_z)`` above ``max_tilt``) and must be

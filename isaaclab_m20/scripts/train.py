@@ -441,15 +441,16 @@ def attach_diagnostics(env, every: int, zero_actions: bool) -> None:
     height every iteration makes the growth visible a few seconds before the
     crash instead of after it.
 
-    For the velocity task the line also carries ``|v_xy|`` (mean body speed, the
-    quantity the static-hold terms act on), ``standing`` (the fraction of envs
-    whose command buffer is zero, i.e. the gate those terms multiply), and
-    ``rew``/``neg`` (the raw, pre-floor step reward and the fraction of envs where
-    it is negative). A stage-1 run that wanders shows up there immediately;
-    ``standing=0.00`` would mean the command buffer is not zero rather than the
-    reward being too weak, and ``neg=1.00`` means the command range is ahead of the
-    policy (the floor in ``envs.py`` is then the only thing preventing a "fall over
-    early" policy).
+    For the velocity task the line also carries ``|v_xy|`` (mean body speed -- the
+    quantity the tracking kernel prices), ``standing`` (the fraction of envs whose
+    command buffer is zero, which is both the stage-1 set point and the gate that
+    ``wheel_speed`` multiplies), and ``rew``/``neg`` (the raw, pre-floor step
+    reward and the fraction of envs where it is negative). A stage-1 run that
+    wanders shows up in ``|v_xy|`` immediately: the command is zero, so anything
+    above ~0.05 m/s is drift. ``standing=0.00`` would mean the command buffer is
+    not zero rather than the reward being too weak, and ``neg=1.00`` means the
+    command range is ahead of the policy (the floor in ``envs.py`` is then the only
+    thing preventing a "fall over early" policy).
     """
     unwrapped = env.unwrapped
     original_step = env.step
@@ -466,8 +467,9 @@ def attach_diagnostics(env, every: int, zero_actions: bool) -> None:
             root_z = robot.data.root_pos_w[:, 2]
             root_vel = robot.data.root_lin_vel_w.abs().max()
             # "does the robot actually stand still when told to" is otherwise
-            # only visible in tensorboard hours later: |v_xy| is the quantity the
-            # static-hold terms act on, and `standing` is the gate they use. It is
+            # only visible in tensorboard hours later: |v_xy| is the residual the
+            # tracking kernel prices, and `standing` is the fraction of envs whose
+            # command is exactly zero (the same gate `wheel_speed` applies). It is
             # derived from the command buffer -- the same source `standing_mask`
             # reads -- rather than from `is_standing_env`, so this line reports the
             # gate the reward actually applies. If it is 0.00 during stage 1, the

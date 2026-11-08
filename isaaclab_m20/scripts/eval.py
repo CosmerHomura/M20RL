@@ -26,7 +26,8 @@ Acceptance (from the plan):
 * yaw-rate RMSE < 0.15 rad/s
 * roll RMS < 5 deg, pitch RMS < 5 deg
 * flat-ground fall rate < 2%
-* zero command: body speed near 0
+* zero command: body speed near 0 **and** net displacement near 0 -- 0.05 m/s of
+  creep passes a speed check and still walks 0.4 m in the 8 s window
 * switch test: go-phase speed error < 0.12 m/s and, once a stop phase has
   settled, residual speed < 0.08 m/s (course stage 4)
 
@@ -132,6 +133,10 @@ MAX_TILT_RMS = 5.0      # deg, roll and pitch
 MAX_FALLS_PER_1000 = 20.0   # = 2% of 20 s episodes
 MAX_STILL_SPEED = 0.05      # m/s, zero-command test
 MAX_STILL_YAW = 0.10        # rad/s, zero-command test
+# Displacement is what the hold test ultimately claims: a 0.05 m/s creep passes the
+# speed check and still walks 0.4 m in an 8 s window. 0.25 m is "no net travel",
+# not "no motion" -- the legs are allowed to work to keep balance.
+MAX_STILL_DRIFT = 0.25      # m, mean distance from the start of the settled window
 
 # Switching test (course stage 4): alternate "go" and "stop" commands and check
 # that the policy both reaches the speed and comes back to rest, within one run.
@@ -221,6 +226,7 @@ class Result:
     mean_speed: float
     mean_yaw: float
     checks: list[tuple[str, bool, str]]
+    drift_m: float = 0.0
 
     @property
     def passed(self) -> bool:
@@ -240,6 +246,12 @@ def run_test(env, policy, test: Test, steps: int, settle_steps: int,
     sum_sq_pitch = torch.zeros((), device=device)
     sum_abs_speed = torch.zeros((), device=device)
     sum_abs_yaw = torch.zeros((), device=device)
+    # "Stand still" is a displacement claim, not a speed claim: 0.05 m/s of creep
+    # is below the speed threshold yet walks 0.4 m in the 8 s window. Measured as
+    # the mean distance from where each env was when the settled window started.
+    is_hold = test.command == (0.0, 0.0, 0.0)
+    sum_drift = torch.zeros((), device=device) if is_hold else None
+    origin: torch.Tensor | None = None
     counted = 0
     falls = 0
 
@@ -274,6 +286,16 @@ def run_test(env, policy, test: Test, steps: int, settle_steps: int,
         sum_sq_pitch += torch.sum(torch.square(pitch))
         sum_abs_speed += torch.sum(torch.linalg.vector_norm(lin_vel, dim=1))
         sum_abs_yaw += torch.sum(torch.abs(ang_vel_z))
+        if sum_drift is not None:
+            pos_xy = robot.data.root_pos_w[:, :2]
+            # An env that reset inside the window teleports: re-anchor it instead
+            # of counting the spawn jump as drift.
+            reset = env.unwrapped.episode_length_buf <= 1
+            if origin is None or origin.shape != pos_xy.shape:
+                origin = pos_xy.clone()
+            else:
+                origin[reset] = pos_xy[reset]
+            sum_drift += torch.sum(torch.linalg.vector_norm(pos_xy - origin, dim=1)[keep])
         counted += int(keep.sum().item())
 
     counted = max(counted, 1)
@@ -284,6 +306,7 @@ def run_test(env, policy, test: Test, steps: int, settle_steps: int,
     falls_per_1000 = 1000.0 * falls / max(steps * env.unwrapped.num_envs, 1)
     mean_speed = float(sum_abs_speed) / counted
     mean_yaw = float(sum_abs_yaw) / counted
+    drift_m = float(sum_drift) / counted if sum_drift is not None else 0.0
 
     # The message shows the measured value next to the limit, not as an
     # inequality.  "0.304 < 0.1" read as a statement of fact (and, being false,
@@ -303,6 +326,8 @@ def run_test(env, policy, test: Test, steps: int, settle_steps: int,
                        f"{mean_speed:.3f} (limit {MAX_STILL_SPEED:.2f})"))
         checks.append(("still yaw", mean_yaw < MAX_STILL_YAW,
                        f"{mean_yaw:.3f} (limit {MAX_STILL_YAW:.2f})"))
+        checks.append(("still drift", drift_m < MAX_STILL_DRIFT,
+                       f"{drift_m:.3f} (limit {MAX_STILL_DRIFT:.2f})"))
     checks.append(("roll RMS", roll_rms < MAX_TILT_RMS,
                    f"{roll_rms:.1f} (limit {MAX_TILT_RMS:.0f})"))
     checks.append(("pitch RMS", pitch_rms < MAX_TILT_RMS,
@@ -311,7 +336,8 @@ def run_test(env, policy, test: Test, steps: int, settle_steps: int,
                    f"{falls_per_1000:.1f} (limit {MAX_FALLS_PER_1000:.0f})"))
 
     return Result(test.label, test.motion, test.command, rmse_vx, rmse_vy, rmse_wz,
-                  roll_rms, pitch_rms, falls_per_1000, mean_speed, mean_yaw, checks)
+                  roll_rms, pitch_rms, falls_per_1000, mean_speed, mean_yaw, checks,
+                  drift_m=drift_m)
 
 
 def run_switching_test(env, policy, device: torch.device,
@@ -416,6 +442,8 @@ def print_result(result: Result) -> None:
           f"rmse vx/vy/wz={result.rmse_vx:.3f}/{result.rmse_vy:.3f}/{result.rmse_wz:.3f}  "
           f"r/p={result.roll_rms:.1f}/{result.pitch_rms:.1f} deg  "
           f"falls/1000={result.falls_per_1000:.1f}"
+          + (f"  drift={result.drift_m:.3f} m"
+             if result.command == (0.0, 0.0, 0.0) else "")
           + (f"  <- {failures}" if failures else ""), flush=True)
 
 
@@ -487,7 +515,8 @@ def main() -> None:
     print(f"\n{passed}/{len(results)} tests passed")
     print(f"thresholds: vx<{MAX_VX_RMSE} vy<{MAX_VY_RMSE} wz<{MAX_WZ_RMSE} "
           f"roll/pitch<{MAX_TILT_RMS}deg falls<{MAX_FALLS_PER_1000}/1000 steps "
-          f"still<{MAX_STILL_SPEED} m/s {MAX_STILL_YAW} rad/s")
+          f"still<{MAX_STILL_SPEED} m/s {MAX_STILL_YAW} rad/s "
+          f"drift<{MAX_STILL_DRIFT} m")
     print(f"row 10 (switch): vx column = go-phase speed error "
           f"(<{MAX_SWITCH_GO_RMSE}), mean stop-phase speed "
           f"(<{MAX_SWITCH_STOP_SPEED}), stop-phase yaw (<{MAX_STILL_YAW})")
@@ -504,6 +533,7 @@ def main() -> None:
                     "roll_rms_deg": r.roll_rms, "pitch_rms_deg": r.pitch_rms,
                     "falls_per_1000_steps": r.falls_per_1000,
                     "mean_speed": r.mean_speed, "mean_yaw": r.mean_yaw,
+                    "drift_m": r.drift_m,
                     "passed": r.passed,
                     "checks": [{"name": n, "passed": ok, "detail": d} for n, ok, d in r.checks],
                 }

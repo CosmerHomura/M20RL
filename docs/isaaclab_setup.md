@@ -150,8 +150,8 @@ tensorboard --logdir logs/rsl_rl --bind_all --port 6006
 
 重点看：
 
-- `Episode_Reward/flat_orientation` / `base_height`：是否在往 0 / 1 靠（机身水平、高度到位）；
-- `Episode_Reward/stand_position` / `wheel_speed`：零指令下越接近 0 越稳（没有溜达、没有空转）；
+- `Episode_Reward/flat_orientation` / `base_height`：是否在往 0 靠（机身水平、高度到位；两项现在都是**平方惩罚**）；
+- `Episode_Reward/wheel_speed`：零指令下越接近 0 越稳（没有空转）。**唯一带门控的一项**，"零指令不许动"更多看 `Train/mean_reward` 与 `[health]` 的 `|v_xy|`；
 - `Episode_Termination/base_height` / `bad_orientation`：翻车/趴下比例是否在降；
 - `Loss/learning_rate`：`schedule="adaptive"`，学不动时会自动降 lr。
 
@@ -255,9 +255,9 @@ eval 会强制**关掉域随机化、关掉指令重采样**，机器人是标�
 | PD 伺服 | 腿 kp=80 / kd=2，轮 kp=0 / kd=2，200 Hz |
 | 力矩上限 | 腿 76.4 N·m，轮 21.6 N·m |
 | 指令（速度指令任务） | 机体系 `(vx, vy, ωz)`，每 2–4 s 重采样；50% 单轴 / 30% 双轴 / 10% 三轴 / 10% 零指令（阶段 1 的零指令占比 100%，阶段 2/3/4 固定为 50/30/20%）；4 阶段课程，满幅 vx ±0.5、vy ±0.2、ωz ±0.8；阶段 4 保持时间缩短到 1.5–3 s |
-| 奖励 | 站立 14 项 / 速度指令 **10 项每步 + 摔倒 −200**（`track_lin_vel_xy`/`track_ang_vel_z` 用有界柯西核；`stand_position` 按位移的平方计费、`wheel_speed` 管"机身不动而轮子空转"，这两项是唯一带门控的、只在严格零指令时生效；−200 只罚真摔倒、不罚超时；正则里有按 0.05 归一的动作变化率和腿关节加速度 /200 压住关节抖动；不做与指令无关的绝对速度惩罚、不强制四轮着地、不惩罚横向滑移），完整权重表见 [docs/algorithm.md](algorithm.md) §1 与 §6.3 |
+| 奖励 | 站立 14 项 / 速度指令 **10 项每步 + 摔倒 −10**（`track_lin_vel_xy`/`track_ang_vel_z` 用有界柯西核；高度、姿态、垂直速度都是平方惩罚；`wheel_speed` 是**唯一带门控**的一项，只在严格零指令时生效；没有存活加成、没有位置保持、没有死区；−10 只罚真摔倒、不罚超时；正则里有按 0.05 归一的动作变化率和腿关节加速度 /200 压住关节抖动；不做与指令无关的绝对速度惩罚、不强制四轮着地、不惩罚横向滑移），完整权重表见 [docs/algorithm.md](algorithm.md) §1 与 §6.3 |
 | 终止 | 站立：高度 < 0.25、倾角 > 0.7、超时；速度指令：高度 < 0.33、倾角 > 0.5、超时 |
-| 奖励下限 | 速度指令任务用 `isaaclab_m20/envs.py` 的 `M20VelocityEnv`，把**每步**奖励下限压到 0（摔倒 −200 照付），防止"跟不住指令时摔倒更划算"的自杀策略；`Episode_Reward/*` 仍是未 clip 的原始值 |
+| 奖励下限 | 速度指令任务用 `isaaclab_m20/envs.py` 的 `M20VelocityEnv`，把**每步**奖励下限压到 0（摔倒 −10 照付），防止"跟不住指令时摔倒更划算"的自杀策略；`Episode_Reward/*` 仍是未 clip 的原始值 |
 | 域随机化 | 站立全开（带 `--dr_ramp` 课程）；速度指令第一版**默认关闭**，`--dr full` 打开 |
 
 ## 8. 常见问题
@@ -269,7 +269,7 @@ eval 会强制**关掉域随机化、关掉指令重采样**，机器人是标�
 - **轮子一直空转 / 车子原地打滑**：站立任务检查轮的摩擦材质（`EventCfg.physics_material` 会把摩擦随机到 0.5–1.25）和 `damping`；速度指令任务默认是标称摩擦 1.0，先把 `--dr off`（默认）下的跟踪跑通，再开 `--dr full`。
 - **`RuntimeError: CUDA out of memory`**：降 `--num_envs`。
 - **headless 录视频报 Vulkan/EGL**：装 `libvulkan1`，并确认驱动正常；纯训练不需要相机，不加 `--video` 即可。
-- **训练不收敛**：先看 `Episode_Termination/*` 翻车比例有没有降，再看 `Episode_Reward/base_height`。如果一出生就趴下，把 `reset_joints` 的 `position_range` 调小、`stand_position` 权重调低，先让机器人稳住不动。
+- **训练不收敛**：先看 `Episode_Termination/*` 翻车比例有没有降，再看 `Episode_Reward/base_height`。如果一出生就趴下，把 `reset_joints` 的 `position_range` 调小、`joint_deviation` 权重调低，先让机器人稳住不动。
 
 ## 9. 奖励函数 / 网络 / PPO 流程
 
