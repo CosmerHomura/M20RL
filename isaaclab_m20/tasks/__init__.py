@@ -1,4 +1,9 @@
-"""Gym registration for the M20 wheeled tasks."""
+"""Gym registration for the M20 wheeled tasks.
+
+The standing task is a plain ``ManagerBasedRLEnv``. The velocity task uses
+``isaaclab_m20.envs:M20VelocityEnv``, which adds a per-step reward floor so that
+a badly-tracking policy cannot earn more by falling over (see that module).
+"""
 import gymnasium as gym
 
 from . import agents
@@ -15,7 +20,7 @@ gym.register(
 
 gym.register(
     id="Isaac-M20-Wheeled-Velocity-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    entry_point="isaaclab_m20.envs:M20VelocityEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.m20_velocity_env_cfg:M20WheeledVelocityEnvCfg",

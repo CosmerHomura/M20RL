@@ -34,10 +34,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# Stage directory suffixes, in course order: <run>/stage3_lateral/ ...
+# Stage directory suffixes, in course order: <run>/stage3_multi_direction/ ...
 # Kept here as plain data so play.py never imports train.py (which builds an
 # argparse parser and starts the Isaac app at import time).
-STAGE_SLUGS = ("stand", "forward_backward", "lateral", "yaw", "mixed", "static_dynamic")
+STAGE_SLUGS = ("stand", "forward_backward", "multi_direction", "agile")
 
 parser = argparse.ArgumentParser(description="Play a trained M20 policy.")
 parser.add_argument("--task", type=str, default=None,
@@ -49,10 +49,10 @@ parser.add_argument("--checkpoint", type=str, default=None,
                          "Defaults to the newest checkpoint under "
                          "<log_root>/<experiment>, where <experiment> is the task's log dir.")
 parser.add_argument("--stage", type=int, default=None,
-                    choices=range(1, len(STAGE_SLUGS) + 1), metavar="{1..6}",
+                    choices=range(1, len(STAGE_SLUGS) + 1), metavar="{1..4}",
                     help="Play one curriculum stage instead of the newest model: takes the "
                          "highest model_*.pt in <log_root>/<experiment>/<newest run>/stageN_*. "
-                         "e.g. --stage 3 to look at the lateral stage.")
+                         "e.g. --stage 2 to look at the forward/backward stage.")
 parser.add_argument("--log_root", type=str, default=str(REPO_ROOT / "logs" / "rsl_rl"))
 parser.add_argument("--video", action="store_true", help="Record a video instead of opening the viewer.")
 parser.add_argument("--video_length", type=int, default=500, help="Video length in policy steps.")
@@ -120,10 +120,10 @@ def newest_run(experiment_dir: Path) -> Path:
 def resolve_stage_checkpoint(experiment_name: str, stage: int) -> Path:
     """Checkpoint of one curriculum stage of the newest run.
 
-    ``--stage 3`` means "<newest run>/stage3_lateral/model_<highest>.pt", which is
-    the model that stage ended on -- the loop is "train a stage, look at it,
-    decide", and looking at it should not require reading the directory listing
-    to find out which iteration number the stage stopped at.
+    ``--stage 3`` means "<newest run>/stage3_multi_direction/model_<highest>.pt",
+    which is the model that stage ended on -- the loop is "train a stage, look at
+    it, decide", and looking at it should not require reading the directory
+    listing to find out which iteration number the stage stopped at.
     """
     experiment_dir = Path(args_cli.log_root) / experiment_name
     run_dir = newest_run(experiment_dir)
@@ -152,10 +152,10 @@ def resolve_checkpoint(experiment_name: str) -> Path:
     to the velocity env and crash on a shape mismatch.
 
     The velocity run nests its checkpoints one level deeper, one directory per
-    curriculum stage (``<run>/stage6_static_dynamic/model_4950.pt``), so the
-    search is recursive and ordered by modification time: the newest stage wins.
-    The iteration number in those names is cumulative over the whole run, not
-    the stage's own budget -- stage 6 ends around 4950, not 1000.
+    curriculum stage (``<run>/stage4_agile/model_3250.pt``), so the search is
+    recursive and ordered by modification time: the newest stage wins. The
+    iteration number in those names is cumulative over the whole run, not the
+    stage's own budget -- stage 4 ends around 3250, not 1250.
 
     ``--checkpoint`` may also be a directory (a stage directory or the run
     directory), in which case its highest iteration number is used.

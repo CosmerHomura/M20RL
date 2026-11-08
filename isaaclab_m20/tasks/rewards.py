@@ -1,15 +1,17 @@
 """Reward terms for the two M20 tasks.
 
 ``Isaac-M20-Wheeled-v0`` (static standing) keeps the legged_gym / AnymalC term
-set it has always used. ``Isaac-M20-Wheeled-Velocity-v0`` uses ten terms:
+set it has always used. ``Isaac-M20-Wheeled-Velocity-v0`` uses ten per-step terms
+plus the fall penalty (eleven entries in the config):
 
-    r = + 0.5   · 1[alive]             per-step survival (not paid on the time-out step)
-      + 2.0   · r_vel                 speed tracking, 1/(1 + e²/0.25²)
+    r = + 2.0   · r_vel                 speed tracking, 1/(1 + e²/0.25²)
       + 1.0   · r_yaw                 yaw-rate tracking, 1/(1 + e²/0.3²)
-      + 0.5   · r_height              ride height (exp, sigma 0.05 m)
+      + 1.0   · r_height              ride height (exp, sigma 0.05 m)
       - 0.5   · p_ori                 (gx² + gy²) / 0.2²                    roll/pitch
       - 1.0   · p_pos                 1[cmd==0]·sum((p_xy - p_hold)²/0.25²) hold
-      - 0.2   · p_pose                sum((q - q_default)²/0.3²)   legs only
+      - 0.5   · p_wheel               1[cmd==0]·mean((qdot_w / 2)²)          spinning wheels
+      - 0.1   · p_pose                sum((q - q_default)²/0.3²)   legs only
+      - 0.2   · p_ang                 sum(w_xy² / 1²)                       wobble
       - 0.02  · p_qacc                sum((qdd / 200)²)            legs only
       - 0.01  · p_action              sum((Δa / 0.05)²)
       - 200   · 1[fallen]             fall penalty, NOT the time-out
@@ -17,7 +19,7 @@ set it has always used. ``Isaac-M20-Wheeled-Velocity-v0`` uses ten terms:
 **Ten, not sixteen.** The earlier set had a pair of channels for each axis group
 -- an exp kernel *and* a quadratic for linear velocity, again for yaw -- plus a
 gated wheel-speed term and regularisers that measured almost nothing (leg joint
-velocity was 1% of the alive bonus, joint torque less). Two springs of different
+velocity was 1% of the height term, joint torque less). Two springs of different
 stiffness on the same error cannot be attributed or tuned, which is exactly why
 the table kept growing. The consolidation replaced pairs instead of adding to
 them:
@@ -34,28 +36,30 @@ them:
   makes joint chatter cost anything: at the old weights a 3 rad/s swing cost
   0.005 per step.
 
-The survival term and the fall-only penalty are a pair. ``mdp.is_alive`` is 1
-until the terminating step and ``fall_terminated`` is 1 only when a *fall* ended
-the episode, so standing 20 s and paying the time-out is worth ~+500, while
-collapsing at step 40 is worth ~+20 - 200. A terminal penalty on
-``mdp.is_terminated`` scores both the same and, perversely, makes ending the
-episode early free.
+**No survival bonus.** It reads like the mirror image of the fall penalty, but a
+bonus is paid every step and a penalty once, so a survival term mostly rescales
+the return; and with the reward floor in ``isaaclab_m20.envs`` every step is
+already worth at least zero, which is what removes the incentive to fall on
+purpose. The fall penalty alone is then a strictly negative event: dying is never
+cheaper than living badly. What replaced the bonus is the two channels that pay
+for the *state* the bonus was proxying -- ``p_ori``/``p_ang`` for staying upright
+and ``p_pos``/``p_wheel`` for staying put.
 
 Sign convention: penalty terms return a POSITIVE magnitude and carry their sign
 in the reward weight, exactly like ``isaaclab.envs.mdp`` (e.g.
 ``ang_vel_xy_l2`` returns ``w_xy²`` and the config gives it weight -0.05).
 Do not add a leading minus here -- it would flip the term into a bonus.
 
-Gate convention: only ``stand_position_l2`` is masked, and its mask is read from
-the **command buffer** (strictly zero, ``eps = 1e-3``) rather than from
-``is_standing_env``. A flag that nobody sets switches a whole channel off
-silently; a buffer cannot. There is no deadband anywhere -- a zero command means
-a stopped robot.
+Gate convention: ``stand_position_l2`` and ``wheel_speed_l2`` are masked, and the
+mask is read from the **command buffer** (strictly zero, ``eps = 1e-3``) rather
+than from ``is_standing_env``. A flag that nobody sets switches a whole channel
+off silently; a buffer cannot. There is no deadband anywhere -- a zero command
+means a stopped robot. The other eight terms are ungated because they are
+relative to the command or meaningful while driving.
 
 Also deliberately absent: any term that keeps all four wheels on the ground (the
-trot lifts two legs on purpose), and any absolute wheel-speed or base-speed
-penalty, which would tax driving itself. Zero-command braking is handled by
-``p_pos`` (the wheels cannot roll while the base holds position).
+trot lifts two legs on purpose), and any un-gated wheel-speed or base-speed
+penalty, which would tax driving itself.
 """
 from __future__ import annotations
 
@@ -260,7 +264,7 @@ def action_rate_l2(env, action_scale: float = 1.0) -> torch.Tensor:
 
     Raw ``sum((a - a_prev)^2)`` at weight -0.01 is *not* a smoothness penalty: a
     leg chattering by 0.1 action units per step costs 0.16 * 0.01 = 0.0016, i.e.
-    0.3% of the 0.5 alive bonus -- free chatter. ``action_scale`` makes the number
+    0.3% of the +0.5 height term -- free chatter. ``action_scale`` makes the number
     interpretable: with 0.05, a 0.05-unit step costs 0.05, a 0.10-unit step 0.20.
     """
     action_manager = env.action_manager
@@ -274,7 +278,7 @@ def leg_joint_acc_l2(env, acc_scale: float = 200.0,
 
     The anti-chatter channel. Leg velocity alone cannot price it: 12 joints
     swinging at 3 rad/s cost 0.005 under any sane velocity weight, which is 1% of
-    the 0.5 alive bonus. Joint *acceleration* separates the two regimes -- a gait
+    the +0.5 height term. Joint *acceleration* separates the two regimes -- a gait
     accelerating at 100 rad/s^2 costs 12 * 0.25 * 0.02 = 0.06, a 400 rad/s^2 buzz
     costs 0.96.
 
@@ -310,9 +314,9 @@ def standing_mask(env, command_name: str = "base_velocity",
     the ground truth; ``eps = 1e-3`` makes the gate strict, so a 0.05 m/s command
     counts as *driving* and does not receive the stand-still treatment.
 
-    Used by ``stand_position_l2`` -- the only gated term in the set. The tracking
-    kernels are command-relative and need no gate: subtracting the command already
-    makes them free while driving.
+    Used by the two gated terms, ``stand_position_l2`` and ``wheel_speed_l2``.
+    The tracking kernels are command-relative and need no gate: subtracting the
+    command already makes them free while driving.
     """
     command_manager = getattr(env, "command_manager", None)
     if command_manager is None:
@@ -376,6 +380,30 @@ def stand_position_l2(env, scale: float = 0.25, command_name: str = "base_veloci
     _STAND_REF[id(env)] = (reference, mask.clone())
     drift = pos_xy - reference
     return mask * torch.sum(torch.square(drift / scale), dim=1)
+
+
+def wheel_speed_l2(env, scale: float = 2.0, command_name: str = "base_velocity",
+                   asset_cfg: SceneEntityCfg = SceneEntityCfg(
+                       "robot", joint_names=WHEEL_JOINT_NAMES)) -> torch.Tensor:
+    """1[cmd == 0] * mean_4 ((qdot_wheel / scale)^2) (positive).
+
+    The one thing the body-frame terms cannot see: with the legs holding the base
+    up, a wheel can be commanded to any speed without moving the robot, so a
+    policy can idle with four spinning wheels and collect a perfect
+    ``stand_position`` score. It also fixes the reverse case -- wheels that are
+    *not* spinning while the base creeps, which is the robot skating.
+
+    Gated, unlike the body terms, because when a command is present the wheels are
+    supposed to spin: ungated, an in-place turn would pay for the differential
+    rolling that produces it. ``scale = 2 rad/s`` is 0.18 m/s of rolling, a fifth
+    of the 0.72 m/s the wheel action can reach.
+
+    Mean over the four wheels, not sum: a single noisy wheel should not outweigh
+    the whole posture channel.
+    """
+    mask = standing_mask(env, command_name)
+    wheel_vel = _robot(env, asset_cfg).data.joint_vel
+    return mask * torch.mean(torch.square(wheel_vel / scale), dim=1)
 
 
 def joint_deviation_l2(env, scale: float = 0.3,

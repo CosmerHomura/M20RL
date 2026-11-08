@@ -1,31 +1,30 @@
 """Train M20 with rsl_rl PPO in Isaac Lab.
 
-The velocity task trains as a six-stage course, each stage continuing from the
+The velocity task trains as a four-stage course, each stage continuing from the
 previous stage's checkpoint:
 
-======  ==================  ========  =========================================
-stage   name                iters     command range (half-widths)
-======  ==================  ========  =========================================
-1       stand               300       vx 0,           vy 0,      wz 0
-2       forward_backward    700       vx +-0.4,       vy 0,      wz 0
-3       lateral             1000      vx +-0.4,       vy +-0.2,  wz 0
-4       yaw                 700       vx +-0.4,       vy +-0.2,  wz +-0.6
-5       mixed               1250      vx +-0.5,       vy +-0.2,  wz +-0.8
-6       static_dynamic      1000      vx +-0.5,       vy +-0.2,  wz +-0.8
-======  ==================  ========  =========================================
+======  ==================  ========  ================================  =========
+stage   name                iters     command range (half-widths)       zero cmd
+======  ==================  ========  ================================  =========
+1       stand               300       vx 0,        vy 0,     wz 0        100%
+2       forward_backward    700       vx +-0.4,    vy 0,     wz 0        50%
+3       multi_direction     1000      vx +-0.5,    vy +-0.2, wz +-0.6    30%
+4       agile               1250      vx +-0.5,    vy +-0.2, wz +-0.8    20%
+======  ==================  ========  ================================  =========
 
-4950 iterations total, in the order "stand -> forward/back -> lateral -> yaw ->
-everything -> stop/go switching", each axis introduced on its own before it is
-combined with the others.
+3250 iterations total, in the order "stand -> forward/back -> everything ->
+faster and stop/go", one axis group introduced per stage.
 
-Stage 6 keeps stage 5's ranges and changes the *distribution* instead: 35% of the
-commands are "stop" (instead of 10%) and each command holds 1.5-3 s (instead of
-2-4 s), so a 20 s episode contains several start/stop/side-step switches rather
-than two or three long holds. That is what the masked terms in the reward were
-built for -- the same policy has to be stiff when the command is zero and
-permissive when it is not, within one episode.
+The last column is the point of the course. Every stage after the first keeps a
+share of zero commands, so the standing skill is rehearsed while the moving
+skills are learned -- without it, stage 2 and later would train the "stop"
+behaviour out of the actor and it would have to be relearned (that was the bug
+behind "stage 4 falls over the moment `eval` holds still"). The share shrinks
+stage by stage, so the emphasis moves from standing to tracking, and stage 4
+keeps 20% stops with 1.5-3 s holds: one 20 s episode then contains several
+start/stop/side-step switches rather than two or three long holds.
 
-Stage 1 is a zero-command stage: the tracking terms are then "be still", so it
+Stage 1 is 100% zero command: the tracking terms are then "be still", so it
 trains the baseline the later stages build on -- hold the ride height, keep the
 body level, do not spin the wheels, do not drift. That is the answer to the "we
 already have a standing policy" problem: that policy was trained on 57
@@ -36,9 +35,9 @@ checkpoint, which is what makes the later stages comparable: if forward/backward
 never improves on stage 1, the problem is the command, not the baseline.
 
 Every stage that introduces a new axis opens with a short warmup during which
-that axis is interpolated from zero up to its target width over 150-250
-iterations, instead of appearing at full width on the first step. Stage 6 has no
-warmup: its ranges are stage 5's, only the sampling distribution changes.
+that axis is interpolated from zero up to its target width over 150-300
+iterations, instead of appearing at full width on the first step. Stage 4 has no
+warmup for the new width: only the sampling distribution and the hold time change.
 
 Two log-directory rules, both about the "train a stage, look at it, decide"
 loop:
@@ -67,11 +66,10 @@ Example runs::
     python -m isaaclab_m20.scripts.train --stage 2
     python -m isaaclab_m20.scripts.train --stage 2 --iterations 1200
 
-    # --stage all runs the six stages back to back; only then do per-stage
+    # --stage all runs the four stages back to back; only then do per-stage
     # budgets differ, and that is what --iters_stageN is for
     python -m isaaclab_m20.scripts.train --stage all --iters_stage1 200 \
-        --iters_stage2 600 --iters_stage3 900 --iters_stage4 600 \
-        --iters_stage5 1000 --iters_stage6 800
+        --iters_stage2 600 --iters_stage3 900 --iters_stage4 1000
 
     # fewer envs only when the GPU is smaller than 24 GB, or for a smoke test
     python -m isaaclab_m20.scripts.train --num_envs 128
@@ -117,10 +115,11 @@ class Stage:
     earlier must keep their full width while the new axis grows in.
 
     ``zero_prob`` and ``resampling`` override the command term's sampling for
-    this stage (``None`` keeps the config default: 0.10 and 2-4 s). Stage 6 uses
-    them to change the *distribution* -- more stop commands, shorter holds --
-    while keeping stage 5's ranges, which is what makes it a stop/go switching
-    stage rather than a wider-range stage.
+    this stage (``None`` keeps the config default: 0.10 and 2-4 s). Every stage
+    after the first uses ``zero_prob`` to keep a share of stop commands, which is
+    what stops the later stages from training the standing behaviour out of the
+    actor; stage 4 also shortens the hold so one episode contains several
+    start/stop switches.
     """
 
     name: str
@@ -135,16 +134,19 @@ class Stage:
 STAGES: tuple[Stage, ...] = (
     # Zero command: the standing baseline under the new 56-dim observation
     # layout. Every term still runs; the tracking terms just mean "be still".
-    Stage("1_stand", 300, (0.00, 0.0, 0.0), (0.00, 0.0, 0.0), 0),
-    Stage("2_forward_backward", 700, (0.00, 0.0, 0.0), (0.40, 0.0, 0.0), 150),
-    Stage("3_lateral", 1000, (0.40, 0.0, 0.0), (0.40, 0.2, 0.0), 250),
-    Stage("4_yaw", 700, (0.40, 0.2, 0.0), (0.40, 0.2, 0.6), 250),
-    Stage("5_mixed", 1250, (0.40, 0.2, 0.6), (0.50, 0.2, 0.8), 250),
-    # Same full range as stage 5, different distribution: one command in three
-    # is "stop" and holds are shorter, so the policy has to start, stop and
-    # change direction several times per episode.
-    Stage("6_static_dynamic", 1000, (0.50, 0.2, 0.8), (0.50, 0.2, 0.8), 0,
-          zero_prob=0.35, resampling=(1.5, 3.0)),
+    Stage("1_stand", 300, (0.00, 0.0, 0.0), (0.00, 0.0, 0.0), 0, zero_prob=1.0),
+    # Half the commands stay zero, so standing is rehearsed while the first
+    # moving axis is learned.
+    Stage("2_forward_backward", 700, (0.00, 0.0, 0.0), (0.40, 0.0, 0.0), 150,
+          zero_prob=0.5),
+    # Lateral and yaw arrive together: they are the two axes the wheels cannot
+    # produce on their own and the ones that break the standing skill first.
+    Stage("3_multi_direction", 1000, (0.40, 0.0, 0.0), (0.50, 0.2, 0.6), 300,
+          zero_prob=0.3),
+    # Full range, 20% stops and shorter holds: accelerate, stop, turn and side-step
+    # several times per episode.
+    Stage("4_agile", 1250, (0.50, 0.2, 0.6), (0.50, 0.2, 0.8), 0,
+          zero_prob=0.2, resampling=(1.5, 3.0)),
 )
 
 _LAST_STAGE = len(STAGES)
@@ -158,7 +160,7 @@ def stage_by_number(number: int) -> Stage:
 
 
 def stage_label(number: int, stage: Stage) -> str:
-    """Checkpoint directory for a stage, e.g. ``stage3_lateral``.
+    """Checkpoint directory for a stage, e.g. ``stage3_multi_direction``.
 
     The number is part of the directory name because the course order is what
     makes the checkpoints comparable, and it is spelled out here (one place)
@@ -197,7 +199,7 @@ for _number, _course_stage in enumerate(STAGES, start=1):
              f"stage alone, --iterations does the same job more directly.")
 parser.add_argument("--resume_from", type=str, default=None,
                     help="Checkpoint for the first selected stage. Without it, stage 1 starts "
-                         "from scratch and stages 2-6 continue from the previous stage.")
+                         "from scratch and stages 2-4 continue from the previous stage.")
 parser.add_argument("--run_name", type=str, default=None,
                     help="Sub-directory inside logs/rsl_rl/<experiment>; stages get their own "
                          "sub-sub-directory inside it. Without it a single --stage reuses the "
@@ -332,7 +334,7 @@ class CommandSchedule:
         self._steps = 0
         self._applied: tuple[float, float, float] | None = None
         # Sampling defaults, restored for stages that do not override them: a
-        # stage 6 override must not leak into a later run of another stage.
+        # stage 4 override must not leak into a later run of another stage.
         self._base_zero_prob = getattr(command_term.cfg, "zero_prob", None)
         self._base_resampling = command_term.cfg.resampling_time_range
         dr.register_command_term(command_term)
@@ -356,8 +358,9 @@ class CommandSchedule:
 
         ``MixedVelocityCommand`` reads both off ``self.cfg`` on every resample, so
         writing them here takes effect from the next resample on -- no need to
-        recreate the term. Stage 6 uses this to hold the same ranges as stage 5
-        while flipping far more commands to "stop" and shortening the holds.
+        recreate the term. The course uses this to keep a share of stop commands
+        alive in every stage after the first, and to shorten the holds in stage 4
+        so an episode contains several start/stop switches.
         """
         cfg = self.term.cfg
         if stage.zero_prob is not None:
@@ -439,10 +442,14 @@ def attach_diagnostics(env, every: int, zero_actions: bool) -> None:
     crash instead of after it.
 
     For the velocity task the line also carries ``|v_xy|`` (mean body speed, the
-    quantity the static-hold terms act on) and ``standing`` (the fraction of
-    envs whose command is zero, i.e. the mask those terms multiply). A stage-1
-    run that wanders shows up there immediately; ``standing=0.00`` would mean the
-    mask is broken rather than the reward being too weak.
+    quantity the static-hold terms act on), ``standing`` (the fraction of envs
+    whose command buffer is zero, i.e. the gate those terms multiply), and
+    ``rew``/``neg`` (the raw, pre-floor step reward and the fraction of envs where
+    it is negative). A stage-1 run that wanders shows up there immediately;
+    ``standing=0.00`` would mean the command buffer is not zero rather than the
+    reward being too weak, and ``neg=1.00`` means the command range is ahead of the
+    policy (the floor in ``envs.py`` is then the only thing preventing a "fall over
+    early" policy).
     """
     unwrapped = env.unwrapped
     original_step = env.step
@@ -460,8 +467,11 @@ def attach_diagnostics(env, every: int, zero_actions: bool) -> None:
             root_vel = robot.data.root_lin_vel_w.abs().max()
             # "does the robot actually stand still when told to" is otherwise
             # only visible in tensorboard hours later: |v_xy| is the quantity the
-            # static-hold terms act on, and `standing` is the mask they use. If
-            # standing is 0.00 during stage 1, the mask is broken, not the reward.
+            # static-hold terms act on, and `standing` is the gate they use. It is
+            # derived from the command buffer -- the same source `standing_mask`
+            # reads -- rather than from `is_standing_env`, so this line reports the
+            # gate the reward actually applies. If it is 0.00 during stage 1, the
+            # command buffer is not zero, not the reward weights.
             speed_xy = robot.data.root_lin_vel_b[:, :2].norm(dim=1).mean()
             extra = f"  |v_xy|={speed_xy.item():.3f}"
             command_manager = getattr(unwrapped, "command_manager", None)
@@ -470,9 +480,22 @@ def attach_diagnostics(env, every: int, zero_actions: bool) -> None:
                     term = command_manager.get_term("base_velocity")
                 except KeyError:
                     term = None
-                flag = getattr(term, "is_standing_env", None) if term else None
-                if flag is not None:
-                    extra += f"  standing={flag.float().mean().item():.2f}"
+                buffer = getattr(term, "vel_command_b", None) if term else None
+                if buffer is not None:
+                    gate = (buffer[:, :3].abs() <= 1e-3).all(dim=1)
+                    extra += f"  standing={gate.float().mean().item():.2f}"
+            # Raw (pre-floor) step reward. `envs.py` clips it at 0 before the
+            # learner sees it, so a large negative `rew` here is *not* a broken
+            # reward -- it is the regime where "fall over and stop paying" used to
+            # be the cheapest policy. If `neg` sits near 1.00 for a whole stage,
+            # the command range is ahead of the policy and the floor is the only
+            # thing keeping it alive.
+            reward_buf = getattr(unwrapped, "reward_buf", None)
+            if reward_buf is not None:
+                extra += (
+                    f"  rew={reward_buf.mean().item():+.2f}"
+                    f"  neg={(reward_buf < 0).float().mean().item():.2f}"
+                )
             print(
                 f"[health] step={state['n']:8d}"
                 f"  max|qdot|={joint_vel.abs().max().item():10.2f}"

@@ -28,7 +28,7 @@ Acceptance (from the plan):
 * flat-ground fall rate < 2%
 * zero command: body speed near 0
 * switch test: go-phase speed error < 0.12 m/s and, once a stop phase has
-  settled, residual speed < 0.08 m/s (course stage 6)
+  settled, residual speed < 0.08 m/s (course stage 4)
 
 The fall rate is reported per 1000 policy steps. An episode is 20 s at 50 Hz,
 i.e. 1000 steps, so "2% of episodes fall" and "20 falls per 1000 steps" are the
@@ -36,14 +36,14 @@ same threshold.
 
 Usage::
 
-    python -m isaaclab_m20.scripts.eval --stage 6        # that stage of the newest run
-    python -m isaaclab_m20.scripts.eval --stage 3        # look at one stage on its own
-    python -m isaaclab_m20.scripts.eval --checkpoint logs/rsl_rl/m20_velocity/<run>/stage6_static_dynamic
+    python -m isaaclab_m20.scripts.eval --stage 4        # that stage of the newest run
+    python -m isaaclab_m20.scripts.eval --stage 2        # look at one stage on its own
+    python -m isaaclab_m20.scripts.eval --checkpoint logs/rsl_rl/m20_velocity/<run>/stage4_agile
     python -m isaaclab_m20.scripts.eval            # newest checkpoint of the newest run
     python -m isaaclab_m20.scripts.eval --seconds 10 --num_envs 32 --strict
 
 ``--checkpoint`` takes a ``model_*.pt`` file or a directory (stage or run); the
-file names carry the cumulative iteration count, so stage 6 ends around 4950.
+file names carry the cumulative iteration count, so stage 4 ends around 3250.
 ``--stage N`` picks the highest checkpoint of ``<newest run>/stageN_*`` instead,
 which is the "check this stage before spending the next one" entry point.
 """
@@ -65,8 +65,8 @@ if str(REPO_ROOT) not in sys.path:
 VELOCITY_TASK = "Isaac-M20-Wheeled-Velocity-v0"
 POLICY_DT = 0.02          # 50 Hz
 
-# Course order of the stage directory suffixes: <run>/stage3_lateral/ ...
-STAGE_SLUGS = ("stand", "forward_backward", "lateral", "yaw", "mixed", "static_dynamic")
+# Course order of the stage directory suffixes: <run>/stage3_multi_direction/ ...
+STAGE_SLUGS = ("stand", "forward_backward", "multi_direction", "agile")
 
 parser = argparse.ArgumentParser(description="Fixed-command acceptance test for M20.")
 parser.add_argument("--task", type=str, default=VELOCITY_TASK)
@@ -74,7 +74,7 @@ parser.add_argument("--checkpoint", type=str, default=None,
                     help="Path to a model_*.pt, a stage directory, or a run directory. Default: "
                          "newest checkpoint of the newest run under logs/rsl_rl/m20_velocity.")
 parser.add_argument("--stage", type=int, default=None,
-                    choices=range(1, len(STAGE_SLUGS) + 1), metavar="{1..6}",
+                    choices=range(1, len(STAGE_SLUGS) + 1), metavar="{1..4}",
                     help="Evaluate one curriculum stage (highest model_*.pt in "
                          "<newest run>/stageN_*) instead of the newest model overall.")
 parser.add_argument("--num_envs", type=int, default=16)
@@ -133,7 +133,7 @@ MAX_FALLS_PER_1000 = 20.0   # = 2% of 20 s episodes
 MAX_STILL_SPEED = 0.05      # m/s, zero-command test
 MAX_STILL_YAW = 0.10        # rad/s, zero-command test
 
-# Switching test (course stage 6): alternate "go" and "stop" commands and check
+# Switching test (course stage 4): alternate "go" and "stop" commands and check
 # that the policy both reaches the speed and comes back to rest, within one run.
 SWITCH_COMMAND = (0.30, 0.00, 0.00)
 SWITCH_PHASE_S = 2.0        # each command holds this long
@@ -163,7 +163,7 @@ def resolve_checkpoint(log_root: Path, explicit: str | None) -> Path:
 
     ``explicit`` may be a ``model_*.pt`` file, a stage directory, or the whole
     run directory: pointing at a directory takes its highest iteration number,
-    so ``--checkpoint logs/rsl_rl/m20_velocity/m20_v1/stage6_static_dynamic``
+    so ``--checkpoint logs/rsl_rl/m20_velocity/m20_v1/stage4_agile``
     works without spelling out which ``model_<n>.pt`` that stage ended on.
     """
 
@@ -318,7 +318,7 @@ def run_switching_test(env, policy, device: torch.device,
                        label: str = "10") -> Result:
     """Alternate go/stop commands and check both halves of the switch.
 
-    Course stage 6 trains exactly this: the same policy has to hold a speed when
+    Course stage 4 trains exactly this: the same policy has to hold a speed when
     the command is non-zero and come back to rest when it becomes zero. A policy
     that only ever sees long holds can pass tests 1-9 and still creep for a metre
     after every stop, which is what this row is for.
@@ -392,14 +392,17 @@ def run_switching_test(env, policy, device: torch.device,
 
     checks: list[tuple[str, bool, str]] = [
         ("go speed RMSE", rmse_vx < MAX_SWITCH_GO_RMSE,
-         f"{rmse_vx:.3f} < {MAX_SWITCH_GO_RMSE}"),
+         f"{rmse_vx:.3f} (limit {MAX_SWITCH_GO_RMSE:.2f})"),
         ("stop speed", stop_speed < MAX_SWITCH_STOP_SPEED,
-         f"{stop_speed:.3f} < {MAX_SWITCH_STOP_SPEED}"),
-        ("stop yaw", stop_yaw < MAX_STILL_YAW, f"{stop_yaw:.3f} < {MAX_STILL_YAW}"),
-        ("roll RMS", roll_rms < MAX_TILT_RMS, f"{roll_rms:.1f} < {MAX_TILT_RMS}"),
-        ("pitch RMS", pitch_rms < MAX_TILT_RMS, f"{pitch_rms:.1f} < {MAX_TILT_RMS}"),
+         f"{stop_speed:.3f} (limit {MAX_SWITCH_STOP_SPEED:.2f})"),
+        ("stop yaw", stop_yaw < MAX_STILL_YAW,
+         f"{stop_yaw:.3f} (limit {MAX_STILL_YAW:.2f})"),
+        ("roll RMS", roll_rms < MAX_TILT_RMS,
+         f"{roll_rms:.1f} (limit {MAX_TILT_RMS:.1f})"),
+        ("pitch RMS", pitch_rms < MAX_TILT_RMS,
+         f"{pitch_rms:.1f} (limit {MAX_TILT_RMS:.1f})"),
         ("falls/1000", falls_per_1000 < MAX_FALLS_PER_1000,
-         f"{falls_per_1000:.1f} < {MAX_FALLS_PER_1000}"),
+         f"{falls_per_1000:.1f} (limit {MAX_FALLS_PER_1000:.0f})"),
     ]
     return Result(label, "switch go/stop x3", SWITCH_COMMAND, rmse_vx, rmse_vy, rmse_wz,
                   roll_rms, pitch_rms, falls_per_1000, stop_speed, stop_yaw, checks)
@@ -463,7 +466,7 @@ def main() -> None:
         results.append(result)
         print_result(result)
 
-    # Course stage 6's own acceptance: does the same policy also stop when told?
+    # Course stage 4's own acceptance: does the same policy also stop when told?
     switching = run_switching_test(env, policy, device)
     results.append(switching)
     print_result(switching)
