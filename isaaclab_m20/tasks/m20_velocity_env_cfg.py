@@ -276,8 +276,13 @@ class RewardsCfg:
         func=rewards.wheel_speed_l2, weight=-0.2, params={"scale": 2.0})
 
     # -- posture and smoothness ----------------------------------------------
+    # mean over the twelve leg joints, 1 rad scale: -0.0015/step at the nominal
+    # sag (0.27 rad) and -0.054/step with a leg folded 1.65 rad, i.e. the same
+    # order as the +0.06/step the tracking channels can pay. The first version
+    # summed 12 terms over 0.3 rad and charged -0.367/step for the same pose,
+    # which made "unfold the legs" the only gradient the policy could see.
     joint_deviation = RewardTermCfg(
-        func=rewards.joint_deviation_l2, weight=-0.05, params={"scale": 0.3})
+        func=rewards.joint_deviation_l2, weight=-1.0, params={"scale": 1.0})
     # acc_scale 2000 and action_scale 1.0 are *not* arbitrary: the exploration
     # noise is what these two terms mostly price early on (see rewards.py), and at
     # 200 / 0.05 the noise alone cost ~-30/step -- more than the whole positive

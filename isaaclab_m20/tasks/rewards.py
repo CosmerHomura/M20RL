@@ -392,21 +392,25 @@ def wheel_speed_l2(env, scale: float = 2.0, command_name: str = "base_velocity",
     return mask * torch.mean(torch.square(wheel_vel / scale), dim=1)
 
 
-def joint_deviation_l2(env, scale: float = 0.3,
+def joint_deviation_l2(env, scale: float = 1.0,
                        asset_cfg: SceneEntityCfg = SceneEntityCfg(
                            "robot", joint_names=LEG_JOINT_NAMES)) -> torch.Tensor:
-    """sum_legs ((q - q_default) / scale)^2 (positive; weight is negative).
+    """mean_legs ((q - q_default) / scale)^2 (positive; weight is negative).
 
     The posture channel: it keeps the legs near the stance they were designed
     for instead of whatever folded shape happens to balance. Legs only -- a wheel
     angle is unbounded (see ``joint_deviation_l1``).
 
-    ``scale = 0.3 rad`` makes a 0.3 rad offset on one joint cost 1.0; 12 joints
-    at 0.1 rad cost ``12 * 0.11 = 1.3``, which the default weight -0.05 turns into
-    -0.065 per step. That is deliberately smaller than the tracking channel: with
-    ``kp = 80`` carrying 38.5 kg the legs sag about 0.27 rad at the stance, so a
-    stiff posture term would spend its budget fighting gravity instead of keeping
-    left and right mirrored.
+    **Mean, not sum, and ``scale = 1.0``, not 0.3.** The first version summed
+    twelve quadratic terms over ``0.3 rad`` and cost ``-0.367`` per step while
+    the whole positive side of the reward is capped at ``0.06``
+    (``(2.0 + 1.0) * dt``): one folded knee was worth more than perfect tracking,
+    so the policy's gradient was almost entirely "unfold the legs" and the
+    tracking channels never got to speak. With a mean over the twelve joints and
+    a 1 rad scale the same numbers read: nominal ``kp = 80`` sag (0.27 rad) costs
+    ``-0.0015``, a seriously folded leg (1.65 rad) costs ``-0.054`` -- the same
+    order as the reward the policy can earn, which is what a shaping term has to
+    be for PPO to trade it off against tracking.
 
     Caveat: it pulls towards ``default_joint_pos``. If that nominal stance is
     itself pitched (unequal hip offsets front to back), this term *enforces* the
@@ -416,7 +420,7 @@ def joint_deviation_l2(env, scale: float = 0.3,
     robot = _robot(env, asset_cfg)
     deviation = (robot.data.joint_pos[:, asset_cfg.joint_ids]
                  - robot.data.default_joint_pos[:, asset_cfg.joint_ids])
-    return torch.sum(torch.square(deviation / scale), dim=1)
+    return torch.mean(torch.square(deviation / scale), dim=1)
 
 
 def orientation_sq(env, scale: float = 0.2,
