@@ -1,6 +1,6 @@
 """Train M20 with rsl_rl PPO in Isaac Lab.
 
-The velocity task trains as a five-stage course, each stage continuing from the
+The velocity task trains as a six-stage course, each stage continuing from the
 previous stage's checkpoint:
 
 ======  ==================  ========  =========================================
@@ -11,11 +11,19 @@ stage   name                iters     command range (half-widths)
 3       lateral             1000      vx +-0.4,       vy +-0.2,  wz 0
 4       yaw                 700       vx +-0.4,       vy +-0.2,  wz +-0.6
 5       mixed               1250      vx +-0.5,       vy +-0.2,  wz +-0.8
+6       static_dynamic      1000      vx +-0.5,       vy +-0.2,  wz +-0.8
 ======  ==================  ========  =========================================
 
-3950 iterations total, in the order "stand -> forward/back -> lateral -> yaw ->
-everything", each axis introduced on its own before it is combined with the
-others.
+4950 iterations total, in the order "stand -> forward/back -> lateral -> yaw ->
+everything -> stop/go switching", each axis introduced on its own before it is
+combined with the others.
+
+Stage 6 keeps stage 5's ranges and changes the *distribution* instead: 35% of the
+commands are "stop" (instead of 10%) and each command holds 1.5-3 s (instead of
+2-4 s), so a 20 s episode contains several start/stop/side-step switches rather
+than two or three long holds. That is what the masked terms in the reward were
+built for -- the same policy has to be stiff when the command is zero and
+permissive when it is not, within one episode.
 
 Stage 1 is a zero-command stage: the tracking terms are then "be still", so it
 trains the baseline the later stages build on -- hold the ride height, keep the
@@ -27,9 +35,10 @@ its own stage (rather than as a warmup inside stage 2) gives it its own
 checkpoint, which is what makes the later stages comparable: if forward/backward
 never improves on stage 1, the problem is the command, not the baseline.
 
-After stage 1 every stage opens with a short warmup during which the new axis is
-interpolated from zero up to its target width over 150-250 iterations, instead of
-appearing at full width on the first step.
+Every stage that introduces a new axis opens with a short warmup during which
+that axis is interpolated from zero up to its target width over 150-250
+iterations, instead of appearing at full width on the first step. Stage 6 has no
+warmup: its ranges are stage 5's, only the sampling distribution changes.
 
 Example runs::
 
@@ -43,9 +52,10 @@ Example runs::
     python -m isaaclab_m20.scripts.train --stage 2
     python -m isaaclab_m20.scripts.train --stage 2 --iters_stage2 1200
 
-    # every stage length is a parameter: --iters_stage1 ... --iters_stage5
+    # every stage length is a parameter: --iters_stage1 ... --iters_stage6
     python -m isaaclab_m20.scripts.train --stage all --iters_stage1 200 \
-        --iters_stage2 600 --iters_stage3 900 --iters_stage4 600 --iters_stage5 1000
+        --iters_stage2 600 --iters_stage3 900 --iters_stage4 600 \
+        --iters_stage5 1000 --iters_stage6 800
 
     # 1024 envs once 512 is stable
     python -m isaaclab_m20.scripts.train --num_envs 1024
@@ -88,6 +98,12 @@ class Stage:
     iterations and then holds ``ranges_to``. ``ranges_from`` is written as the
     previous stage's ``ranges_to`` -- not as zeros -- because the axes learned
     earlier must keep their full width while the new axis grows in.
+
+    ``zero_prob`` and ``resampling`` override the command term's sampling for
+    this stage (``None`` keeps the config default: 0.10 and 2-4 s). Stage 6 uses
+    them to change the *distribution* -- more stop commands, shorter holds --
+    while keeping stage 5's ranges, which is what makes it a stop/go switching
+    stage rather than a wider-range stage.
     """
 
     name: str
@@ -95,6 +111,8 @@ class Stage:
     ranges_from: tuple[float, float, float]
     ranges_to: tuple[float, float, float]
     warmup: int
+    zero_prob: float | None = None
+    resampling: tuple[float, float] | None = None
 
 
 STAGES: tuple[Stage, ...] = (
@@ -105,6 +123,11 @@ STAGES: tuple[Stage, ...] = (
     Stage("3_lateral", 1000, (0.40, 0.0, 0.0), (0.40, 0.2, 0.0), 250),
     Stage("4_yaw", 700, (0.40, 0.2, 0.0), (0.40, 0.2, 0.6), 250),
     Stage("5_mixed", 1250, (0.40, 0.2, 0.6), (0.50, 0.2, 0.8), 250),
+    # Same full range as stage 5, different distribution: one command in three
+    # is "stop" and holds are shorter, so the policy has to start, stop and
+    # change direction several times per episode.
+    Stage("6_static_dynamic", 1000, (0.50, 0.2, 0.8), (0.50, 0.2, 0.8), 0,
+          zero_prob=0.35, resampling=(1.5, 3.0)),
 )
 
 _LAST_STAGE = len(STAGES)
@@ -124,7 +147,8 @@ parser.add_argument("--num_envs", type=int, default=None,
                          "1024 once that is stable).")
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--stage", type=str, default="all",
-                    help="Velocity task: which course stage to run ('1'..'5' or 'all'). "
+                    help=f"Velocity task: which course stage to run "
+                         f"('1'..'{_LAST_STAGE}' or 'all'). "
                          "Each stage continues from the previous stage's latest checkpoint "
                          "unless --resume_from says otherwise.")
 parser.add_argument("--stage_scale", type=float, default=1.0,
@@ -243,7 +267,8 @@ def select_stages(
         # 150-iteration warmup would hold the new axis near zero the whole run.
         # A stage with no warmup (stage 1) keeps 0, so it never steals iterations.
         warmup = min(stage.warmup, budget // 2) if stage.warmup else 0
-        out.append((index, Stage(stage.name, budget, stage.ranges_from, stage.ranges_to, warmup)))
+        out.append((index, Stage(stage.name, budget, stage.ranges_from, stage.ranges_to,
+                                 warmup, stage.zero_prob, stage.resampling)))
     return out
 
 
@@ -262,6 +287,10 @@ class CommandSchedule:
         self.iteration = 0
         self._steps = 0
         self._applied: tuple[float, float, float] | None = None
+        # Sampling defaults, restored for stages that do not override them: a
+        # stage 6 override must not leak into a later run of another stage.
+        self._base_zero_prob = getattr(command_term.cfg, "zero_prob", None)
+        self._base_resampling = command_term.cfg.resampling_time_range
         dr.register_command_term(command_term)
 
     # -- stage lifecycle ---------------------------------------------------
@@ -270,12 +299,42 @@ class CommandSchedule:
         self.iteration = 0
         self._steps = 0
         self._applied = None
+        self.apply_sampling(stage, announce=True)
         self._apply(stage.ranges_from, announce=True)
         # The buffer still holds commands drawn under the previous stage's
         # range (up to 4 s of them). For stage 1 the new range starts at zero,
         # so wipe them: the robot must not be asked for 0.4 m/s on step 0.
         if max(stage.ranges_from) == 0.0:
             dr.zero_command(self.term)
+
+    def apply_sampling(self, stage: Stage, announce: bool = False) -> None:
+        """Apply the stage's command-distribution overrides (zero_prob, hold time).
+
+        ``MixedVelocityCommand`` reads both off ``self.cfg`` on every resample, so
+        writing them here takes effect from the next resample on -- no need to
+        recreate the term. Stage 6 uses this to hold the same ranges as stage 5
+        while flipping far more commands to "stop" and shortening the holds.
+        """
+        cfg = self.term.cfg
+        if stage.zero_prob is not None:
+            cfg.zero_prob = float(stage.zero_prob)
+        elif self._base_zero_prob is not None:
+            cfg.zero_prob = self._base_zero_prob
+        if stage.resampling is not None:
+            cfg.resampling_time_range = (float(stage.resampling[0]), float(stage.resampling[1]))
+        else:
+            cfg.resampling_time_range = self._base_resampling
+        if hasattr(self.term, "_resampling_time_range"):
+            # The command term caches the tuple at construction in some versions;
+            # keep the private copy in sync when it exists.
+            self.term._resampling_time_range = cfg.resampling_time_range
+        if announce:
+            name = stage.name
+            zero_prob = getattr(cfg, "zero_prob", None)
+            print(f"[cmd] stage={name} hold={cfg.resampling_time_range[0]:.2f}-"
+                  f"{cfg.resampling_time_range[1]:.2f}s"
+                  + (f" zero_prob={zero_prob:.2f}" if zero_prob is not None else ""),
+                  flush=True)
 
     def _apply(self, ranges: tuple[float, float, float], announce: bool = False) -> None:
         if self._applied is not None and all(
@@ -457,9 +516,15 @@ def main() -> None:
         print(f"[INFO] Course plan: {len(stages)} stage(s), {total} iterations "
               f"({env_cfg.scene.num_envs} envs x {agent_cfg.num_steps_per_env} steps/env)")
         for number, stage in stages:
+            sampling = []
+            if stage.zero_prob is not None:
+                sampling.append(f"zero_prob {stage.zero_prob:.2f}")
+            if stage.resampling is not None:
+                sampling.append(f"hold {stage.resampling[0]:.1f}-{stage.resampling[1]:.1f}s")
+            extra = f"  [{', '.join(sampling)}]" if sampling else ""
             print(f"    stage {number + 1} {stage.name:<18} {stage.iterations:5d} it  "
                   f"vx=+-{stage.ranges_to[0]:.2f} vy=+-{stage.ranges_to[1]:.2f} "
-                  f"wz=+-{stage.ranges_to[2]:.2f}  warmup {stage.warmup}")
+                  f"wz=+-{stage.ranges_to[2]:.2f}  warmup {stage.warmup}{extra}")
 
     experiment_dir = Path(args_cli.log_root, agent_cfg.experiment_name)
     if args_cli.run_name:

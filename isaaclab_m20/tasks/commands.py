@@ -27,6 +27,11 @@ backward first" behaviour the staged plan wants, without a second code path.
 Each component is drawn uniformly inside its range, and each command is held
 for 2-4 s (``resampling_time_range``) before being redrawn: the policy has to
 hold a command, not chase noise.
+
+Both numbers are read off the config on every resample, so a course stage can
+change them at runtime without recreating the term. The last stage does exactly
+that: 35% zero commands and 1.5-3 s holds, to train stop/go switching rather
+than long holds (see ``STAGES`` in ``scripts/train.py``).
 """
 from __future__ import annotations
 

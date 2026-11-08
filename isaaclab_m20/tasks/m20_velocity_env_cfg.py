@@ -16,7 +16,7 @@ control rate        50 Hz (decimation 4 on 200 Hz physics)
 episode             20 s
 rewards             8 weighted terms + fall penalty (see ``rewards.py``)
 command mix         50% single axis / 30% two axes / 10% three / 10% zero,
-                    held 2-4 s
+                    held 2-4 s (last stage: 35% zero, held 1.5-3 s)
 domain random.      OFF: nominal friction, mass and CoM, no pushes
 terrain             flat plane
 ==================  ==========================================================
@@ -27,8 +27,9 @@ The config carries the *first* course stage, which is a zero command ("stand
 still"), not the final one, so a plain
 ``train.py --task Isaac-M20-Wheeled-Velocity-v0`` run cannot ask an untrained
 policy for 0.5 m/s on the first step. ``scripts/train.py`` rewrites these ranges
-per stage through ``dr.set_command_ranges``; see ``STAGES`` there for the five
-stages of the course.
+per stage through ``dr.set_command_ranges`` and the command distribution through
+``CommandSchedule.apply_sampling``; see ``STAGES`` there for the six stages of the
+course.
 
 Wheel action scale
 ------------------
@@ -174,18 +175,24 @@ class ObservationsCfg:
 
 @configclass
 class RewardsCfg:
-    """The plan's eight terms plus the fall penalty.
+    """Task terms, attitude, and the static-hold terms.
 
     Weights are the plan's; every penalty term returns a positive magnitude and
     carries its sign here (see the module docstring of ``rewards.py``). The
-    ordering below groups task terms, attitude, then penalties.
+    ordering below groups task terms, attitude, static hold, then penalties.
 
-    NOT present, on purpose: a wheel absolute-speed penalty (forward motion
-    needs the wheels to turn), a four-wheel-contact term (the trot lifts two
-    legs), and a lateral tyre-slip penalty (the scrub is how lateral motion
-    happens). There is also no separate ``is_alive`` bonus -- a constant per-step
-    bonus is already implicit in the eight terms, and adding a ninth channel
-    would change the reward balance the plan specifies.
+    The four ``*_standing`` / masked channels are multiplied by
+    ``rewards.standing_mask`` inside the reward functions: they are active for
+    envs whose command is exactly zero (and for every env in stage 1, where the
+    whole range is zero), and contribute nothing to an env that was told to
+    drive. That is what makes "wheel speed must be low" safe here -- unmasked it
+    would be a reward for refusing the command, which is the plan's objection.
+
+    NOT present, on purpose: an unmasked wheel absolute-speed penalty, a
+    four-wheel-contact term (the trot lifts two legs), and a lateral tyre-slip
+    penalty (the scrub is how lateral motion happens). There is also no separate
+    ``is_alive`` bonus -- a constant per-step bonus is already implicit in the
+    terms below.
     """
 
     # -- task ---------------------------------------------------------------
@@ -195,13 +202,25 @@ class RewardsCfg:
         func=rewards.track_ang_vel_z_cmd, weight=1.0, params={"sigma": 0.3})
 
     # -- attitude and height ------------------------------------------------
+    # Quadratic, not exp: on flat ground the tilt should be near zero at all
+    # times and a hold-still command needs stiffness there (see rewards.py).
     flat_orientation = RewardTermCfg(
-        func=rewards.flat_orientation_exp, weight=0.5, params={"sigma": 0.2})
+        func=rewards.orientation_sq, weight=-0.5, params={"scale": 0.2})
     base_height = RewardTermCfg(
         func=rewards.base_height_exp, weight=0.5,
         params={"target_height": BASE_HEIGHT, "sigma": 0.05})
 
-    # -- penalties -----------------------------------------------------------
+    # -- static hold (masked to zero-command envs) ---------------------------
+    lin_vel_xy_standing = RewardTermCfg(
+        func=rewards.lin_vel_xy_l2_standing, weight=-0.5, params={"scale": 0.25})
+    wheel_speed_standing = RewardTermCfg(
+        func=rewards.wheel_speed_l2_standing, weight=-0.1, params={"scale": 4.0})
+
+    # -- posture and smoothness ----------------------------------------------
+    joint_deviation = RewardTermCfg(
+        func=rewards.joint_deviation_l2, weight=-0.2, params={"scale": 0.3})
+    joint_vel_legs = RewardTermCfg(
+        func=rewards.joint_vel_legs_l2, weight=-0.02, params={"scale": 20.0})
     wheel_slip = RewardTermCfg(
         func=rewards.wheel_slip_l2, weight=-0.1, params={"slip_scale": 0.5})
     action_rate = RewardTermCfg(func=rewards.action_rate_l2, weight=-0.01)

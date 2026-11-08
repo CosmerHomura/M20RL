@@ -1,38 +1,51 @@
 """Reward terms for the two M20 tasks.
 
 ``Isaac-M20-Wheeled-v0`` (static standing) keeps the legged_gym / AnymalC term
-set it has always used. ``Isaac-M20-Wheeled-Velocity-v0`` uses the eight-term
-set of the first formal training plan:
+set it has always used. ``Isaac-M20-Wheeled-Velocity-v0`` uses the plan's term
+set plus the static-hold and posture channels:
 
-    r = 2.0 · r_vel
-      + 1.0 · r_yaw
-      + 0.5 · r_ori                     roll/pitch attitude
-      + 0.5 · r_height
-      - 0.1 · p_slip                    wheel/ground longitudinal slip
-      - 0.01 · p_action                 action rate
-      - 0.005 · p_torque                normalised joint torque
-      - 0.05 · p_ang                    roll/pitch rate
-      - 200 · 1[terminated]             fall penalty
+    r = + 2.0   · r_vel                 speed tracking (exp, sigma 0.25 m/s)
+      + 1.0   · r_yaw                 yaw-rate tracking (exp, sigma 0.3 rad/s)
+      + 0.5   · r_height              ride height (exp, sigma 0.05 m)
+      - 0.5   · p_ori                 (gx² + gy²) / 0.2²        roll/pitch
+      - 0.5   · p_v_stand             ||v_xy||² / 0.25²          zero command only
+      - 0.1   · p_wheel_stand         mean(qdot_w² / 4²)         zero command only
+      - 0.2   · p_pose                sum((q - q_default)²/0.3²) legs only
+      - 0.02  · p_qdot                sum((qdot / 20)²)          legs only
+      - 0.1   · p_slip                wheel/ground longitudinal slip
+      - 0.01  · p_action              action rate
+      - 0.005 · p_torque              normalised joint torque
+      - 0.05  · p_ang                 roll/pitch rate
+      - 200   · 1[terminated]         fall penalty
 
-The four exp kernels are ``exp(-e²/σ²)``: σ is the *error scale* of the
-channel, and the kernel is ~0 once the error is a few σ. Note the division by
-``σ²``, not by ``σ``: this is the plan's formulation, and it is the reason the
-σ values are 0.25 m/s, 0.3 rad/s, 0.2 rad and 0.05 m -- read them as "the error
-that already costs most of the channel", not as a width.
+The exp kernels are ``exp(-e²/σ²)``: σ is the *error scale* of the channel, and
+the kernel is ~0 once the error is a few σ. Note the division by ``σ²``, not by
+``σ``: this is the plan's formulation, and it is the reason the σ values are
+0.25 m/s, 0.3 rad/s, 0.2 rad and 0.05 m -- read them as "the error that already
+costs most of the channel", not as a width.
+
+Two of the eight plan channels are split in two here, on purpose:
+
+* attitude is a *quadratic* (``orientation_sq``) instead of an exp kernel: on
+  flat ground the body should be level at all times, so the cost has to be
+  stiff near zero, and an exp kernel flattens out exactly where the hold-still
+  command needs gradient. ``flat_orientation_exp`` is kept for the terrain
+  version, where a large tilt can be legitimate;
+* the "no wheel-speed penalty" rule became "no *unmasked* wheel-speed penalty".
+  A lifted wheel free-spins because the servo has kp = 0, and with a zero
+  command nothing should be turning at all -- so the term exists, but it is
+  multiplied by a zero-command mask (``standing_mask``) and can never tax a
+  robot that was told to drive.
 
 Sign convention: penalty terms return a POSITIVE magnitude and carry their sign
 in the reward weight, exactly like ``isaaclab.envs.mdp`` (e.g.
 ``ang_vel_xy_l2`` returns ``w_xy²`` and the config gives it weight -0.05).
 Do not add a leading minus here -- it would flip the term into a bonus.
 
-Two things are deliberately NOT in the set, because both would fight the task:
-
-* no penalty on the wheels' absolute speed -- driving forward *requires* the
-  wheels to turn, so ``|w_wheel| -> 0`` is a reward for refusing the command;
-* no term that keeps all four wheels on the ground -- the trot gait lifts two
-  legs at a time on purpose. ``p_slip`` is a mean over the four wheels and is
-  weighted 0.1 for the same reason: a wheel that is in the air for part of the
-  cycle must not be able to dominate the reward.
+Also deliberately absent: any term that keeps all four wheels on the ground --
+the trot gait lifts two legs at a time on purpose. ``p_slip`` is a mean over the
+four wheels and is weighted 0.1 for the same reason: a wheel that is in the air
+for part of the cycle must not be able to dominate the reward.
 """
 from __future__ import annotations
 
@@ -288,3 +301,124 @@ def action_rate_l2(env) -> torch.Tensor:
     action_manager = env.action_manager
     return torch.sum(
         torch.square(action_manager.action - action_manager.prev_action), dim=1)
+
+
+# --------------------------------------------------------------------------- #
+# Static-hold terms: multiplied by a zero-command mask, so they only shape the
+# behaviour of envs that were told to stand still
+# --------------------------------------------------------------------------- #
+def standing_mask(env, command_name: str = "base_velocity") -> torch.Tensor:
+    """1.0 for envs whose command is exactly zero, else 0.0 -- shape (num_envs,).
+
+    ``is_standing_env`` is set by ``MixedVelocityCommand._resample_command`` for
+    the zero-command share, and it is *all ones* while a stage's ranges are all
+    zero (stage 1), so these terms are fully active exactly when the task is
+    "hold still".
+
+    Multiplying by this mask is how "enable when static" is expressed: an env
+    that was told to drive contributes nothing to these channels, so they cannot
+    fight the tracking terms. Without the mask, a wheel-speed penalty would be a
+    reward for refusing to move (the plan's original objection to it).
+
+    An env with no command term (the standing task) gets all ones: there the
+    whole run is a static hold.
+    """
+    command_manager = getattr(env, "command_manager", None)
+    if command_manager is None:
+        return torch.ones(env.num_envs, device=env.device)
+    term = command_manager.get_term(command_name)
+    flag = getattr(term, "is_standing_env", None)
+    if flag is None:
+        return torch.zeros(env.num_envs, device=env.device)
+    return flag.to(device=env.device, dtype=torch.float32)
+
+
+def lin_vel_xy_l2_standing(env, scale: float = 0.25, command_name: str = "base_velocity",
+                           asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """masked ||v_xy||^2 / scale^2 (positive; weight is negative).
+
+    The tracking term is an exp kernel, so at a zero command it still pays about
+    2.0 for a 0.05 m/s drift (``exp(-0.04) = 0.96``): the gradient there is far
+    too flat to pin the base down. This quadratic is what actually holds the
+    still command: 0.1 m/s costs ``(0.1/0.25)^2 = 0.16``, 0.2 m/s costs 0.64, and
+    the gradient grows with the error instead of vanishing.
+    """
+    lin_vel = _robot(env, asset_cfg).data.root_lin_vel_b[:, :2]
+    error = torch.sum(torch.square(lin_vel / scale), dim=1)
+    return standing_mask(env, command_name) * error
+
+
+def wheel_speed_l2_standing(env, scale: float = 4.0, command_name: str = "base_velocity",
+                            asset_cfg: SceneEntityCfg = SceneEntityCfg(
+                                "robot", joint_names=WHEEL_JOINT_NAMES)) -> torch.Tensor:
+    """masked mean_wheel (qdot_w / scale)^2 (positive; weight is negative).
+
+    Static only. A lifted wheel has no ground reaction, so the velocity servo
+    (kp = 0, kd = 2) drives it to whatever the policy asked for and it just
+    spins: wasted action, no motion. With a zero command there is no reason to
+    turn the wheels at all, so this term is free to punish it.
+
+    ``scale = 4 rad/s`` = 0.36 m/s of rolling speed, half the 0.72 m/s the wheel
+    action can ask for. The mean over the four wheels (not the sum) keeps a
+    single lifted wheel from dominating.
+
+    Never enable this without the mask: penalising wheel speed while driving is
+    a reward for refusing the command.
+    """
+    robot = _robot(env, asset_cfg)
+    wheel_vel = robot.data.joint_vel[:, asset_cfg.joint_ids]
+    error = torch.mean(torch.square(wheel_vel / scale), dim=1)
+    return standing_mask(env, command_name) * error
+
+
+def joint_deviation_l2(env, scale: float = 0.3,
+                       asset_cfg: SceneEntityCfg = SceneEntityCfg(
+                           "robot", joint_names=LEG_JOINT_NAMES)) -> torch.Tensor:
+    """sum_legs ((q - q_default) / scale)^2 (positive; weight is negative).
+
+    The posture channel: it keeps the legs near the stance they were designed
+    for instead of whatever folded shape happens to balance. Legs only -- a wheel
+    angle is unbounded (see ``joint_deviation_l1``).
+
+    ``scale = 0.3 rad`` makes a 0.3 rad offset on one joint cost 1.0; 12 joints
+    at 0.1 rad cost ``12 * 0.11 = 1.3``, which the default weight -0.2 turns into
+    -0.27 per step, about an eighth of the tracking channel.
+
+    Caveat: it pulls towards ``default_joint_pos``. If that nominal stance is
+    itself pitched (unequal hip offsets front to back), this term *enforces* the
+    pitch instead of correcting it -- the attitude term is what levels the body.
+    Keep the weight modest and fix the default pose rather than out-weighting it.
+    """
+    robot = _robot(env, asset_cfg)
+    deviation = (robot.data.joint_pos[:, asset_cfg.joint_ids]
+                 - robot.data.default_joint_pos[:, asset_cfg.joint_ids])
+    return torch.sum(torch.square(deviation / scale), dim=1)
+
+
+def joint_vel_legs_l2(env, scale: float = 20.0,
+                      asset_cfg: SceneEntityCfg = SceneEntityCfg(
+                          "robot", joint_names=LEG_JOINT_NAMES)) -> torch.Tensor:
+    """sum_legs (qdot / scale)^2 over the 12 leg joints (positive; weight negative).
+
+    Legs only, same reason as ``joint_deviation_l2``: wheel speed is commanded
+    and is covered by ``wheel_speed_l2_standing`` when it matters. ``scale = 20
+    rad/s`` is half the leg actuator's 40 rad/s limit.
+    """
+    joint_vel = _robot(env, asset_cfg).data.joint_vel[:, asset_cfg.joint_ids]
+    return torch.sum(torch.square(joint_vel / scale), dim=1)
+
+
+def orientation_sq(env, scale: float = 0.2,
+                   asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """(gx^2 + gy^2) / scale^2 (positive; weight is negative).
+
+    The hard version of ``flat_orientation_exp``: same error measure, but the
+    cost grows as the square of the tilt instead of saturating. On flat ground
+    the tilt should be small at all times, so a quadratic is the right shape --
+    it is the *stiffness near zero* that a hold-still command needs. The exp
+    kernel is kept for the day the robot trains on terrain, where a large tilt
+    can be legitimate and must not be scored to death.
+    """
+    gravity = _robot(env, asset_cfg).data.projected_gravity_b
+    tilt = torch.square(gravity[:, 0]) + torch.square(gravity[:, 1])
+    return tilt / (scale * scale)

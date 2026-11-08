@@ -7,9 +7,9 @@ Two runners:
   training plan's hyper-parameters.
 
 The stager that actually uses the velocity runner is ``scripts/train.py``: it
-runs the five course stages back to back, loading the previous stage's
+runs the six course stages back to back, loading the previous stage's
 checkpoint each time, so ``max_iterations`` here is only the sum of the stage
-budgets (300 + 700 + 1000 + 700 + 1250) used as the fallback total.
+budgets (300 + 700 + 1000 + 700 + 1250 + 1000) used as the fallback total.
 """
 from isaaclab.utils import configclass
 from isaaclab_rl.rsl_rl import (
@@ -68,7 +68,7 @@ class M20VelocityRslRlPpoRunnerCfg(M20RslRlPpoRunnerCfg):
       but the plan fixes the architecture and comparing runs is only meaningful
       if the architecture does not also move.
     * lr 3e-4 instead of 1e-3 -- 1e-3 is a fine rate for a single static pose and
-      a fast way to blow up a 5-stage course, where each stage starts from the
+      a fast way to blow up a 6-stage course, where each stage starts from the
       previous stage's weights.
     * 8 mini-batches instead of 4 -- with 1024 envs x 24 steps = 24576 transitions
       per iteration, 8 batches is 3072 samples per update, which keeps each PPO
@@ -86,7 +86,8 @@ class M20VelocityRslRlPpoRunnerCfg(M20RslRlPpoRunnerCfg):
     """
 
     experiment_name = "m20_velocity"
-    max_iterations = 3950    # 300 + 700 + 1000 + 700 + 1250, see scripts/train.py
+    # 300 + 700 + 1000 + 700 + 1250 + 1000, see scripts/train.py
+    max_iterations = 4950
     save_interval = 50
 
     policy = RslRlPpoActorCriticCfg(

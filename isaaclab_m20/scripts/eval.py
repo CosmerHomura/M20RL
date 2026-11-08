@@ -16,6 +16,7 @@ robot is the nominal one, and the numbers are what deployment would see.
 7                  (0.30, 0, 0.30)   forward + turn left
 8                  (-0.30, 0.20, -0.30) backward + strafe left + turn right
 9                  (0, 0, 0)        hold still
+10                 (0.30,0,0) <-> (0,0,0)   switch go/stop, 3 cycles
 =================  ===============  ===============
 
 Acceptance (from the plan):
@@ -26,6 +27,8 @@ Acceptance (from the plan):
 * roll RMS < 5 deg, pitch RMS < 5 deg
 * flat-ground fall rate < 2%
 * zero command: body speed near 0
+* switch test: go-phase speed error < 0.12 m/s and, once a stop phase has
+  settled, residual speed < 0.08 m/s (course stage 6)
 
 The fall rate is reported per 1000 policy steps. An episode is 20 s at 50 Hz,
 i.e. 1000 steps, so "2% of episodes fall" and "20 falls per 1000 steps" are the
@@ -33,7 +36,7 @@ same threshold.
 
 Usage::
 
-    python -m isaaclab_m20.scripts.eval --checkpoint logs/rsl_rl/m20_velocity/<run>/stage5_mixed/model_1250.pt
+    python -m isaaclab_m20.scripts.eval --checkpoint logs/rsl_rl/m20_velocity/<run>/stage6_static_dynamic/model_1000.pt
     python -m isaaclab_m20.scripts.eval            # newest checkpoint of the newest run
     python -m isaaclab_m20.scripts.eval --seconds 10 --num_envs 32 --strict
 """
@@ -115,6 +118,14 @@ MAX_TILT_RMS = 5.0      # deg, roll and pitch
 MAX_FALLS_PER_1000 = 20.0   # = 2% of 20 s episodes
 MAX_STILL_SPEED = 0.05      # m/s, zero-command test
 MAX_STILL_YAW = 0.10        # rad/s, zero-command test
+
+# Switching test (course stage 6): alternate "go" and "stop" commands and check
+# that the policy both reaches the speed and comes back to rest, within one run.
+SWITCH_COMMAND = (0.30, 0.00, 0.00)
+SWITCH_PHASE_S = 2.0        # each command holds this long
+SWITCH_SETTLE_S = 1.0       # ignored at the start of each phase (transient)
+MAX_SWITCH_GO_RMSE = 0.12   # m/s, speed error in the measured part of a "go" phase
+MAX_SWITCH_STOP_SPEED = 0.08  # m/s, residual speed once a "stop" phase has settled
 
 
 def resolve_checkpoint(log_root: Path, explicit: str | None) -> Path:
@@ -256,6 +267,108 @@ def run_test(env, policy, test: Test, steps: int, settle_steps: int,
                   roll_rms, pitch_rms, falls_per_1000, mean_speed, mean_yaw, checks)
 
 
+def run_switching_test(env, policy, device: torch.device,
+                       label: str = "10") -> Result:
+    """Alternate go/stop commands and check both halves of the switch.
+
+    Course stage 6 trains exactly this: the same policy has to hold a speed when
+    the command is non-zero and come back to rest when it becomes zero. A policy
+    that only ever sees long holds can pass tests 1-9 and still creep for a metre
+    after every stop, which is what this row is for.
+
+    Phases are 2 s of "go" and 2 s of "stop", repeated three times; the first
+    second of each phase is discarded as the transient, the second is measured.
+    """
+    term = env.unwrapped.command_manager.get_term("base_velocity")
+    robot = env.unwrapped.scene["robot"]
+    num_envs = env.unwrapped.num_envs
+
+    phase_steps = int(round(SWITCH_PHASE_S / POLICY_DT))
+    settle_steps = int(round(SWITCH_SETTLE_S / POLICY_DT))
+    phases = [(1.0, SWITCH_COMMAND), (0.0, (0.0, 0.0, 0.0))] * 3
+
+    sum_sq = torch.zeros(3, device=device)
+    sum_sq_roll = torch.zeros((), device=device)
+    sum_sq_pitch = torch.zeros((), device=device)
+    sum_abs_speed = torch.zeros((), device=device)
+    sum_abs_yaw = torch.zeros((), device=device)
+    go_counted = 0
+    stop_counted = 0
+    falls = 0
+    total_steps = 0
+
+    obs = env.get_observations()
+    for _, command_tuple in phases:
+        command = torch.tensor(command_tuple, dtype=torch.float, device=device).expand(num_envs, 3)
+        is_go = command_tuple[0] != 0.0 or command_tuple[1] != 0.0 or command_tuple[2] != 0.0
+        for step in range(phase_steps):
+            term.vel_command_b[:, :3] = command
+            with torch.inference_mode():
+                actions = policy(obs)
+                obs, _, _, _ = env.step(actions)
+            total_steps += 1
+
+            terminated = env.unwrapped.termination_manager.terminated
+            falls += int(terminated.sum().item())
+            if step < settle_steps:
+                continue
+            keep = ~terminated
+            if not bool(keep.any()):
+                continue
+
+            lin_vel = robot.data.root_lin_vel_b[keep, :2]
+            ang_vel_z = robot.data.root_ang_vel_b[keep, 2]
+            roll, pitch = tilt_deg(robot.data.projected_gravity_b[keep])
+            sum_sq_roll += torch.sum(torch.square(roll))
+            sum_sq_pitch += torch.sum(torch.square(pitch))
+            if is_go:
+                error = torch.stack(
+                    (lin_vel[:, 0] - command[keep, 0],
+                     lin_vel[:, 1] - command[keep, 1],
+                     ang_vel_z - command[keep, 2]), dim=1)
+                sum_sq += torch.sum(torch.square(error), dim=0)
+                go_counted += int(keep.sum().item())
+            else:
+                sum_abs_speed += torch.sum(torch.linalg.vector_norm(lin_vel, dim=1))
+                sum_abs_yaw += torch.sum(torch.abs(ang_vel_z))
+                stop_counted += int(keep.sum().item())
+
+    measured = max(go_counted + stop_counted, 1)
+    go_counted = max(go_counted, 1)
+    stop_counted = max(stop_counted, 1)
+    rmse_vx, rmse_vy, rmse_wz = torch.sqrt(sum_sq / go_counted).tolist()
+    roll_rms = math.sqrt(float(sum_sq_roll) / measured)
+    pitch_rms = math.sqrt(float(sum_sq_pitch) / measured)
+    stop_speed = float(sum_abs_speed) / stop_counted
+    stop_yaw = float(sum_abs_yaw) / stop_counted
+    falls_per_1000 = 1000.0 * falls / max(total_steps * num_envs, 1)
+
+    checks: list[tuple[str, bool, str]] = [
+        ("go speed RMSE", rmse_vx < MAX_SWITCH_GO_RMSE,
+         f"{rmse_vx:.3f} < {MAX_SWITCH_GO_RMSE}"),
+        ("stop speed", stop_speed < MAX_SWITCH_STOP_SPEED,
+         f"{stop_speed:.3f} < {MAX_SWITCH_STOP_SPEED}"),
+        ("stop yaw", stop_yaw < MAX_STILL_YAW, f"{stop_yaw:.3f} < {MAX_STILL_YAW}"),
+        ("roll RMS", roll_rms < MAX_TILT_RMS, f"{roll_rms:.1f} < {MAX_TILT_RMS}"),
+        ("pitch RMS", pitch_rms < MAX_TILT_RMS, f"{pitch_rms:.1f} < {MAX_TILT_RMS}"),
+        ("falls/1000", falls_per_1000 < MAX_FALLS_PER_1000,
+         f"{falls_per_1000:.1f} < {MAX_FALLS_PER_1000}"),
+    ]
+    return Result(label, "switch go/stop x3", SWITCH_COMMAND, rmse_vx, rmse_vy, rmse_wz,
+                  roll_rms, pitch_rms, falls_per_1000, stop_speed, stop_yaw, checks)
+
+
+def print_result(result: Result) -> None:
+    verdict = "PASS" if result.passed else "FAIL"
+    failures = ", ".join(f"{name} {detail}" for name, ok, detail in result.checks if not ok)
+    print(f"[{verdict}] {result.label:>2}  {result.motion:<30} "
+          f"cmd=({result.command[0]:+.2f},{result.command[1]:+.2f},{result.command[2]:+.2f})  "
+          f"rmse vx/vy/wz={result.rmse_vx:.3f}/{result.rmse_vy:.3f}/{result.rmse_wz:.3f}  "
+          f"r/p={result.roll_rms:.1f}/{result.pitch_rms:.1f} deg  "
+          f"falls/1000={result.falls_per_1000:.1f}"
+          + (f"  <- {failures}" if failures else ""), flush=True)
+
+
 def main() -> None:
     spec = gym.spec(args_cli.task)
     module_name, class_name = spec.kwargs["env_cfg_entry_point"].split(":")
@@ -297,14 +410,12 @@ def main() -> None:
     for test in TESTS:
         result = run_test(env, policy, test, steps, settle_steps, device)
         results.append(result)
-        verdict = "PASS" if result.passed else "FAIL"
-        failures = ", ".join(f"{name} {detail}" for name, ok, detail in result.checks if not ok)
-        print(f"[{verdict}] {result.label:>2}  {result.motion:<30} "
-              f"cmd=({result.command[0]:+.2f},{result.command[1]:+.2f},{result.command[2]:+.2f})  "
-              f"rmse vx/vy/wz={result.rmse_vx:.3f}/{result.rmse_vy:.3f}/{result.rmse_wz:.3f}  "
-              f"r/p={result.roll_rms:.1f}/{result.pitch_rms:.1f} deg  "
-              f"falls/1000={result.falls_per_1000:.1f}"
-              + (f"  <- {failures}" if failures else ""), flush=True)
+        print_result(result)
+
+    # Course stage 6's own acceptance: does the same policy also stop when told?
+    switching = run_switching_test(env, policy, device)
+    results.append(switching)
+    print_result(switching)
 
     env.close()
 
@@ -323,6 +434,9 @@ def main() -> None:
     print(f"thresholds: vx<{MAX_VX_RMSE} vy<{MAX_VY_RMSE} wz<{MAX_WZ_RMSE} "
           f"roll/pitch<{MAX_TILT_RMS}deg falls<{MAX_FALLS_PER_1000}/1000 steps "
           f"still<{MAX_STILL_SPEED} m/s {MAX_STILL_YAW} rad/s")
+    print(f"row 10 (switch): vx column = go-phase speed error "
+          f"(<{MAX_SWITCH_GO_RMSE}), mean stop-phase speed "
+          f"(<{MAX_SWITCH_STOP_SPEED}), stop-phase yaw (<{MAX_STILL_YAW})")
 
     if args_cli.json_out:
         payload = {
