@@ -23,10 +23,10 @@
 
 ```text
 model/
-├── urdf/              # 官方 URDF（训练资产由它导入生成）
-├── M20_urdf.usd       # 生成的训练 USD（不进 git）
-├── usd/               # 官方 USD（组合层，需要完整的 configuration/ 子层）
-└── M20.xml + meshes/  # 官方 MJCF（备用）
+├── usd/               # 官方 USD（默认加载：M20.usd + configuration/ 子层）
+├── urdf/              # 官方 URDF（回退路线 M20_USD=urdf 的导入源）
+├── M20_urdf.usd       # URDF 导入版（不进 git，只有 M20_USD=urdf 时才用）
+└── M20.xml + meshes/  # 官方 MJCF（备用；关节轴与限位可在这里核对）
 isaaclab_m20/
 ├── assets/m20.py      # ArticulationCfg：USD、初始姿态、PD 增益
 ├── envs.py            # M20VelocityEnv：摔倒惩罚按终止标志加（只罚真摔倒，不做奖励裁剪）
@@ -51,8 +51,11 @@ isaaclab_m20/
 仓库根目录执行（脚本是模块入口，不能 `cd` 进 `scripts/`）：
 
 ```bash
-# 1. 从官方 URDF 导入一次训练 USD，然后验证（16 个关节、总质量 ≈38.5 kg）
-python -m isaaclab_m20.scripts.check_m20 --headless --convert urdf
+# 1. 验证资产（默认加载官方 USD model/usd/M20.usd，不需要导入步骤）
+python -m isaaclab_m20.scripts.check_m20 --headless
+
+#    回退路线：从官方 URDF 导入一份再验证（会折叠 4 个无质量传感器 link）
+M20_USD=urdf python -m isaaclab_m20.scripts.check_m20 --headless --convert urdf
 
 # 1b. 关节配置审计：正则解析到的 joint_ids、init_state 与 USD 默认姿态是否一致、
 #     零动作 200 步后腿落在哪（怀疑"腿在折叠"或"默认姿态对不上"时先跑这个）

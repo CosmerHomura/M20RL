@@ -85,14 +85,15 @@ python -m isaaclab_m20.scripts.train --help
 
 ## 4. 先验证 USD（务必先做）
 
-训练加载的是 `model/M20_urdf.usd`，由官方 URDF 一次性导入生成（这个文件不进 git，换机器要重新生成）：
+训练默认加载**官方 USD** `model/usd/M20.usd`（`isaaclab_m20/assets/m20.py` 里的 `M20_USD_PATH`）。想用 URDF 导入版就设环境变量 `M20_USD=urdf`：
 
 ```bash
-# 首次：从官方 URDF 导入（约 1 分钟，首次会自动下载 URDF 导入扩展）
-python -m isaaclab_m20.scripts.check_m20 --headless --convert urdf
-
-# 之后每次：只做检查
+# 默认：检查官方 USD（层链 model/usd/M20.usd → configuration/M20_physics.usd → configuration/M20_base.usd）
 python -m isaaclab_m20.scripts.check_m20 --headless
+
+# 回退：从官方 URDF 导入一份（这个文件不进 git，换机器要重新生成）
+M20_USD=urdf python -m isaaclab_m20.scripts.check_m20 --headless --convert urdf
+M20_USD=urdf python -m isaaclab_m20.scripts.check_m20 --headless
 ```
 
 它会加载 USD，打印 body / joint 名字、默认关节角、根状态、各刚体质量。对照预期：
@@ -103,14 +104,14 @@ python -m isaaclab_m20.scripts.check_m20 --headless
 - 总质量 ≈ 38.5 kg；
 - 根高度 0.50 m。
 
-官方 URDF 里 `front_camera_link` / `rear_camera_link` / `front_lidar_link` / `rear_lidar_link` 都是**空标签**（`<link name="x"/>`，没有 inertial / visual / collision）。保留它们会生成 4 个**零质量零惯量**的刚体，在 PhysX GPU 求解器里构成奇异质量矩阵，并在组合后的 stage 里留下 `/visuals/<link>` 的悬空引用——表现为运行时偶发的 `CUDA error: an illegal memory access`。所以导入时用 `merge_fixed_joints=True` 把它们并入 `base_link`。如果 body 数是 21 而不是 17，说明这个开关没生效，重新 `--convert urdf`。
+官方 URDF 里 `front_camera_link` / `rear_camera_link` / `front_lidar_link` / `rear_lidar_link` 都是**空标签**（`<link name="x"/>`，没有 inertial / visual / collision）。保留它们会生成 4 个**零质量零惯量**的刚体，在 PhysX GPU 求解器里构成奇异质量矩阵，并在组合后的 stage 里留下 `/visuals/<link>` 的悬空引用——表现为运行时偶发的 `CUDA error: an illegal memory access`。所以 URDF 导入用 `merge_fixed_joints=True` 把它们并入 `base_link`。这也是 `M20_USD=urdf` 这条路唯一比官方 USD 更"干净"的地方：如果官方 USD 打印出 **21 个 body**（4 个传感器 link 独立成刚体），就切回 URDF 版。
 
-**为什么不直接用 `model/usd/M20.usd`**：那是个组合层，`M20.usd`（1.4 KB）的默认变体早已选中 `PhysX / Sensors / Robot`，但它的子层链末端是 `configuration/M20_physics.usd` → `configuration/M20_base.usd`（17 MB，几何+质量）。这个 17 MB 文件一缺，整条链就塌成一个空 prim，报错是 `Failed to find an articulation when resolving '/World/envs/env_0/Robot'`。如果你确实想用官方 USD，把本地 `model/usd/configuration/M20_base.usd`（17,196,921 字节）传全，再 `--usd model/usd/M20.usd --headless` 检查即可，关节和质量应当一致。
+**为什么曾经默认用 URDF 导入版**：`model/usd/M20.usd`（1.4 KB）是个组合层，默认变体选中 `PhysX / Sensors / Robot`，子层链末端是 `configuration/M20_physics.usd` → `configuration/M20_base.usd`（17 MB，几何+质量）。这个 17 MB 文件一旦缺失，整条链就塌成一个空 prim，报错是 `Failed to find an articulation when resolving '/World/envs/env_0/Robot'`。现在 `model/usd/configuration/` 是完整随仓库提供的，所以官方 USD 可以直接用，关节顺序、限位与默认姿态都以它为准。
 
 **如果对不上**，按下面顺序排查：
 
 1. **关节名不对** → 改 `isaaclab_m20/assets/m20.py` 和 `tasks/m20_env_cfg.py` 里的正则（`.*_hipx_joint` 等）；
-2. **`FileNotFoundError: model/M20_urdf.usd`** → 还没跑 `--convert urdf`；
+2. **`FileNotFoundError: model/M20_urdf.usd`** → 设了 `M20_USD=urdf` 但还没跑 `--convert urdf`；
 3. **质量/惯量为 0 或整个模型塌掉** → 检查 `init_state.pos` 的 z 是不是 0.50；
 4. **力矩上限不对** → 执行器配置里已经写死 `effort_limit_sim`（76.4 / 21.6），不依赖 USD 自带值。
 

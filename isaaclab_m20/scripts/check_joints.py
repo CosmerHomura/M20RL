@@ -24,6 +24,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import math
 import re
 import sys
 from pathlib import Path
@@ -39,6 +40,10 @@ parser.add_argument(
     "--task", type=str, default="Isaac-M20-Wheeled-Velocity-v0",
     help="Task to build. The velocity task is the one whose reward is being questioned.")
 parser.add_argument("--num_envs", type=int, default=1, help="Envs to build (1 is enough).")
+parser.add_argument(
+    "--usd", type=str, default=None,
+    help="Override the robot USD (e.g. model/usd/M20.usd vs model/M20_urdf.usd). "
+         "Default: whatever M20_USD dictates in isaaclab_m20/assets/m20.py.")
 parser.add_argument("--steps", type=int, default=200,
                     help="Zero-action steps before reading the settled pose.")
 parser.add_argument(
@@ -77,13 +82,19 @@ def section(title: str) -> None:
 
 
 def fmt_gain(value) -> str:
-    """Actuator gains are floats in some versions and tensors in others."""
+    """Actuator gains are scalars in some Isaac Lab versions and per-joint tensors in others.
+
+    A per-joint tensor is worth seeing whole, so multi-element values print as
+    ``min/mean/max`` instead of being collapsed to "only one element" errors.
+    """
     if value is None:
         return "?"
-    try:
-        return f"{float(value):.1f}"
-    except TypeError:
-        return f"{float(value.flatten().mean()):.1f}"
+    tensor = torch.as_tensor(value, dtype=torch.float32).flatten()
+    if tensor.numel() == 0:
+        return "?"
+    if tensor.numel() == 1:
+        return f"{tensor.item():.1f}"
+    return f"{tensor.min().item():.1f}/{tensor.mean().item():.1f}/{tensor.max().item():.1f}"
 
 
 def group_indices(robot, pattern: str) -> list[int]:
@@ -115,6 +126,7 @@ def print_joint_table(robot) -> None:
         indices = actuator.joint_indices.tolist()
         print(f"  {group_name}: {len(indices)} joints, stiffness={fmt_gain(getattr(actuator, 'stiffness', None))}, "
               f"damping={fmt_gain(getattr(actuator, 'damping', None))}")
+        print("    gains are shown as min/mean/max when the actuator stores one value per joint")
         print(f"    {[robot.joint_names[i] for i in indices]}")
 
 
@@ -178,6 +190,26 @@ def deviation_report(robot, label: str) -> None:
               f"q mean={robot.data.joint_pos[:, indices].mean().item():+.3f}  "
               f"|qdot| mean={robot.data.joint_vel[:, indices].abs().mean().item():.2f} rad/s")
 
+    # A knee sitting on its limit is the difference between "the PD is pushing the
+    # wrong way" and "the legs are merely sagging": within the action range
+    # (default +- 0.25 rad) the policy can never command a joint to its limit.
+    try:
+        limits = robot.data.soft_joint_pos_limits[0]
+    except Exception:  # pragma: no cover - diagnostics only
+        return
+    positions = robot.data.joint_pos[0]
+    pinned: list[str] = []
+    for index, name in enumerate(robot.joint_names):
+        low, high = limits[index, 0].item(), limits[index, 1].item()
+        if not math.isfinite(low) or not math.isfinite(high):
+            continue
+        if min(positions[index].item() - low, high - positions[index].item()) < 0.05:
+            pinned.append(f"{name}={positions[index].item():+.2f}")
+    if pinned:
+        print(f"  [{label}] pinned at a limit (<0.05 rad): {', '.join(pinned)}")
+    else:
+        print(f"  [{label}] no joint is pinned at a limit")
+
 
 def build_env() -> gym.Env:
     """Build the task through its registered config, the same way train.py does."""
@@ -187,6 +219,9 @@ def build_env() -> gym.Env:
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.sim.device = args_cli.device
     env_cfg.seed = 0
+    if args_cli.usd:
+        env_cfg.scene.robot.spawn.usd_path = str(Path(args_cli.usd).expanduser().resolve())
+    print(f"[INFO] robot USD: {env_cfg.scene.robot.spawn.usd_path}")
     return gym.make(args_cli.task, cfg=env_cfg)
 
 
@@ -227,11 +262,12 @@ def main() -> None:
     leg_cfg = SceneEntityCfg("robot", joint_names=LEG_JOINT_NAMES)
     leg_cfg.resolve(unwrapped.scene)
     new_form = rewards.joint_deviation_l2(unwrapped, scale=1.0, asset_cfg=leg_cfg).mean().item()
-    old_form = rewards.joint_deviation_l2(unwrapped, scale=0.3, asset_cfg=leg_cfg).mean().item()
+    # The old code summed over the 12 leg joints, so its value is 12x this mean.
+    old_form = 12.0 * rewards.joint_deviation_l2(unwrapped, scale=0.3, asset_cfg=leg_cfg).mean().item()
     dt = unwrapped.step_dt
     print(f"  new form mean_legs((dq/1.0)^2) = {new_form:.3f}  -> per-step "
           f"{-1.0 * new_form * dt:+.4f} at weight -1.0")
-    print(f"  old form {old_form:.1f} (mean_legs((dq/0.3)^2)) -> per-step "
+    print(f"  old form sum_legs((dq/0.3)^2)  = {old_form:.1f}  -> per-step "
           f"{-0.05 * old_form * dt:+.4f} at the old weight -0.05")
     print(f"  the per-step positive side caps at {(2.0 + 1.0) * dt:.3f} "
           "(tracking + yaw, both <= 1.0)")
