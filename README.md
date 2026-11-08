@@ -9,7 +9,7 @@
 | `Isaac-M20-Wheeled-v0` | 静态站立 | 57 维（无指令） | 10 s | `logs/rsl_rl/m20_wheeled/` |
 | `Isaac-M20-Wheeled-Velocity-v0` | `(vx, vy, ωz)` 速度指令跟踪 | 56 维 | 20 s | `logs/rsl_rl/m20_velocity/<run>/stage{N}_*/` |
 
-两者的 checkpoint **不能互换**（观测维度不同）。速度指令任务是第一版正式训练配置：4 阶段课程（站稳 → 前后 → 全向 → 更快、含起步/急停切换）、10 项每步奖励 + 摔倒 −10（追踪用有界柯西核、零指令下只有轮速一项带门控、腿关节加速度抗抖、无存活加成、无位置保持、每步奖励有 0 下限）、域随机化默认关闭、阶段间自动续训。
+两者的 checkpoint **不能互换**（观测维度不同）。速度指令任务是第一版正式训练配置：4 阶段课程（站稳 → 前后 → 全向 → 更快、含起步/急停切换）、10 项每步奖励 + 摔倒 −10（追踪用有界柯西核、零指令下只有轮速一项带门控、无存活加成、无位置保持、每步奖励**没有** 0 下限）、域随机化默认关闭、阶段间自动续训。
 
 详细安装与排错见 [docs/isaaclab_setup.md](docs/isaaclab_setup.md)，奖励函数/网络结构/PPO 流程/课程与验收见 [docs/algorithm.md](docs/algorithm.md)。
 
@@ -29,7 +29,7 @@ model/
 └── M20.xml + meshes/  # 官方 MJCF（备用）
 isaaclab_m20/
 ├── assets/m20.py      # ArticulationCfg：USD、初始姿态、PD 增益
-├── envs.py            # M20VelocityEnv：速度任务的每步奖励下限（防自杀策略）
+├── envs.py            # M20VelocityEnv：摔倒惩罚按终止标志加（只罚真摔倒，不做奖励裁剪）
 ├── tasks/
 │   ├── m20_env_cfg.py            # 站立任务：场景/观测/动作/奖励/域随机化
 │   ├── m20_velocity_env_cfg.py   # 速度指令任务：56 维观测、10 项奖励、4 阶段
@@ -111,9 +111,9 @@ tensorboard --logdir logs/rsl_rl --bind_all --port 6006
 - **观测 56 维**：`base_ang_vel(3) + projected_gravity(3) + base_lin_vel(3) + 腿关节位置偏差(12) + 腿关节速度(12) + 车轮角速度(4) + 指令(3) + last_action(16)`。线速度和指令都在**机体系**，训练/播放/部署必须同一个坐标系。
 - **动作 16 维** ∈ [-1, 1]，都是**目标值**：腿 12 维 `q* = q_default + 0.25·a`（rad），轮 4 维 `ω* = 8.0·a`（rad/s，轮半径 0.09 m → 0.72 m/s 上限）。
 - **指令**：机体系 `(vx, vy, ωz)`，每 2–4 s 重采样，混合采样 50% 单轴 / 30% 双轴 / 10% 三轴 / 10% 零指令。
-- **奖励 10 项每步 + 摔倒 −10**：任务项 `track_lin_vel_xy +2.0`（σ 0.25，有界柯西核 `1/(1+e²/σ²)`）、`track_ang_vel_z +1.0`（σ 0.3，同核）；机身状态项 `base_height −0.5`（`((h−0.50)/0.05)²`，平方误差不是奖金）、`flat_orientation −0.5`（姿态**平方**惩罚，0.2）、`lin_vel_z −0.2`（上下弹跳，0.2 m/s）、`ang_vel_xy −0.2`（姿态**角速度**，补"幅度小但抖得快"）；轮/姿态保持 `wheel_speed −0.2`（**唯一带门控**的一项，只在命令严格为零时生效，压住"机身不动但轮子空转"）；正则项 `joint_deviation −0.05`（只腿）、`leg_joint_acc −0.02`（腿关节加速度 /200）、`action_rate −0.01`（按 0.05 归一，与加速度项一起抗抖）；`termination_penalty −10`（**只在真摔倒时**扣，20 s 超时不扣）。**没有存活加成、没有位置保持项、没有任何死区**——存活加成与摔倒惩罚不是同一件事的两面（一个每步发钱、一个只罚一次），而 `envs.py` 的每步 0 下限已经让"活着"永远不比"摔死"差；"零指令不许动"由第 1 项自己承担（指令为零就是跟踪零速度），被推之后回到原处是**第四种能力**，先在 `eval` 第 9 行的 `drift` 列里单独量，不塞进同一个奖励。**不做与指令无关的绝对速度惩罚、不强制四轮着地、不惩罚横向滑移。**
+- **奖励 10 项每步 + 摔倒 −10**：任务项 `track_lin_vel_xy +2.0`（σ 0.25，有界柯西核 `1/(1+e²/σ²)`）、`track_ang_vel_z +1.0`（σ 0.3，同核）；机身状态项 `base_height −0.5`（`((h−0.50)/0.05)²`，平方误差不是奖金）、`flat_orientation −0.5`（姿态**平方**惩罚，0.2）、`lin_vel_z −0.2`（上下弹跳，0.2 m/s）、`ang_vel_xy −0.2`（姿态**角速度**，补"幅度小但抖得快"）；轮/姿态保持 `wheel_speed −0.2`（**唯一带门控**的一项，只在命令严格为零时生效，压住"机身不动但轮子空转"）；正则项 `joint_deviation −0.05`（只腿）、`leg_joint_acc −0.02`（腿关节加速度 /2000）、`action_rate −0.01`（按 1.0 归一，与加速度项一起抗抖——这两个尺度不能按"可读"收紧，否则会把探索噪声放大成 −40/步）；摔倒 `−10` 由 `M20VelocityEnv` 在 `terminated & ~truncated` 的步上加（**只罚真摔倒，20 s 超时不罚**）。**没有存活加成、没有位置保持项、没有任何死区**——"零指令不许动"由第 1 项自己承担（指令为零就是跟踪零速度），被推之后回到原处是**第四种能力**，先在 `eval` 第 9 行的 `drift` 列里单独量，不塞进同一个奖励。**不做与指令无关的绝对速度惩罚、不强制四轮着地、不惩罚横向滑移。**
 - **终止**：高度 < 0.33 m、倾角 > 0.5 rad、超时 20 s。两个门限与摔倒惩罚共用同一对常量（结束回合的判据就是扣钱的判据）。
-- **奖励下限**：速度任务用 `isaaclab_m20/envs.py` 的 `M20VelocityEnv`，它把**每步**奖励下限压到 0（摔倒的 −10 照付）。没有这一道，跟不住指令时每步净亏、摔倒只付一次钱，策略会算出来"秒速摔倒更划算"。代价是 tensorboard 的 `Episode_Reward/*` 仍是未 clip 的原始值，看学习信号请用 `Train/mean_reward`。
+- **没有奖励裁剪**：`isaaclab_m20/envs.py` 的 `M20VelocityEnv` **不**把每步奖励压到 0（legged_gym 的 `only_positive_rewards` 试过又删了：策略早期每步为负，被 clip 成常数 0、整轮梯度消失、平均奖励恒为 0）。PPO 不需要非负奖励，`A = R − V` 归一化只缩放不改序。所以 `Train/mean_reward` 与 `Episode_Reward/*` 是同一套数字，可以直接读；每步为负不是故障。
 - **课程 4 阶段**（合计 3250 iterations，每阶段内有线性 warmup）：零指令站稳（300，**100% 零指令**）→ 前进/后退 `vx ±0.4`（700，**零指令 50%**）→ 全向 `vx ±0.5 / vy ±0.2 / ωz ±0.6`（1000，**零指令 30%**）→ 更快、含起步急停 `ωz ±0.8`（1250，**零指令 20%，每条指令只保持 1.5–3 s**）。每个阶段都保留一部分零指令，是为了让"站住"在学新动作时被反复复习——不保留的话，后面的阶段会把停止能力训掉（这正是之前"放出来一听指令就倒、一 hold 住就溜"的原因）；零指令占比逐阶段下降，重心从站立移到跟踪。
 - **域随机化默认关闭**（摩擦 1.0、质量/质心固定、无推力），`--dr full` 打开。
 
@@ -141,6 +141,8 @@ tensorboard --logdir logs/rsl_rl --bind_all --port 6006
 | 奖励权重、终止条件、域随机化（站立） | `isaaclab_m20/tasks/m20_env_cfg.py` |
 | 观测布局、奖励权重、动作尺度、终止、DR 开关（速度指令） | `isaaclab_m20/tasks/m20_velocity_env_cfg.py` |
 | 奖励函数本身 | `isaaclab_m20/tasks/rewards.py` |
+| 摔倒惩罚量级 | `isaaclab_m20/tasks/m20_velocity_env_cfg.py` 的 `fall_penalty`（默认 −10；由 `isaaclab_m20/envs.py` 在 `terminated & ~truncated` 的步上加，不是奖励项） |
+| 终端诊断输出 | `--health_every 24`（`[health]` 行：`|v_xy|`/`standing`/`rew`/`neg`/`fall_rew`/`timeout_rew`）、`--per_term_every 200`（`[terms]` 行：逐项 `value×weight×dt` 的每步实际贡献 + `_episode_sums` 累计值；`sum=` 应等于同一时刻的 `rew=`） |
 | 观测拆分项（腿/轮/指令） | `isaaclab_m20/tasks/observations.py` |
 | 指令混合采样比例 | `isaaclab_m20/tasks/commands.py` |
 | 课程阶段、轮数、warmup、续训逻辑（含每阶段的零指令占比与最后一阶段的保持时间） | `isaaclab_m20/scripts/train.py`（`STAGES`） |

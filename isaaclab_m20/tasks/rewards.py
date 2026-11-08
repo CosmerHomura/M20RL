@@ -1,8 +1,9 @@
 """Reward terms for the two M20 tasks.
 
 ``Isaac-M20-Wheeled-v0`` (static standing) keeps the legged_gym / AnymalC term
-set it has always used. ``Isaac-M20-Wheeled-Velocity-v0`` uses ten per-step terms
-plus the fall penalty (eleven entries in the config):
+set it has always used. ``Isaac-M20-Wheeled-Velocity-v0`` uses ten per-step
+terms, plus a fall penalty that is applied by the environment rather than by a
+reward term:
 
     r = + 2.0   · r_vel                 speed tracking, 1/(1 + e²/0.25²)
       + 1.0   · r_yaw                 yaw-rate tracking, 1/(1 + e²/0.3²)
@@ -12,9 +13,12 @@ plus the fall penalty (eleven entries in the config):
       - 0.2   · p_ang                 sum(w_xy² / 1²)                       wobble
       - 0.2   · p_wheel               1[cmd==0]·mean((qdot_w / 2)²)   spinning wheels
       - 0.05  · p_pose                sum((q - q_default)²/0.3²)   legs only
-      - 0.02  · p_qacc                sum((qdd / 200)²)            legs only
-      - 0.01  · p_action              sum((Δa / 0.05)²)
-      - 10    · 1[fallen]             fall penalty, NOT the time-out
+      - 0.02  · p_qacc                sum((qdd / 2000)²)           legs only
+      - 0.01  · p_action              sum((Δa / 1.0)²)
+
+    terminal: -10 on the fall step only, applied by ``M20VelocityEnv`` (see
+    ``fall_penalty`` on the env cfg). It is not one of the terms below because the
+    termination flags are only known after the reward manager has run.
 
 **Ten, not sixteen.** The earlier set had a pair of channels for each axis group
 -- an exp kernel *and* a quadratic for linear velocity, again for yaw -- plus a
@@ -30,19 +34,33 @@ them:
 * ride height is a plain quadratic error, not an exp bonus: on flat ground the
   target is a set point, so what the channel needs is stiffness around it, and a
   quadratic has no ceiling to saturate against;
-* ``leg_joint_acc_l2`` (new) replaces the leg joint-velocity channel, and
-  ``action_rate_l2`` is normalised by 0.05. Together they are the only thing that
-  makes joint chatter cost anything: at the old weights a 3 rad/s swing cost
-  0.005 per step.
+* ``leg_joint_acc_l2`` replaces the leg joint-velocity channel, and
+  ``action_rate_l2`` (both at their un-scaled magnitudes) make joint chatter cost
+  something.
 
-**No survival bonus.** It reads like the mirror image of the fall penalty, but a
-bonus is paid every step and a penalty once, so a survival term mostly rescales
-the return; and with the reward floor in ``isaaclab_m20.envs`` every step is
-already worth at least zero, which is what removes the incentive to fall on
-purpose. The fall penalty alone is then a strictly negative event: dying is never
-cheaper than living badly. What replaced the bonus is the channels that pay for
-the *state* the bonus was proxying -- ``p_h``/``p_ori``/``p_ang`` for staying
-upright and ``p_wheel`` for not idling with the wheels spinning.
+**No survival bonus, and no reward floor either.** Both were tried and both were
+compensations for other mistakes, so neither is in this file. The floor
+(``only_positive_rewards``, a clamp at 0 on the per-step reward) is only safe
+while the ordinary step reward is positive; while the policy is bad it is not, so
+the clamp turned every step into a constant 0 and the gradient disappeared -- the
+symptom was a mean reward of exactly 0 for a whole run. An ``alive`` bonus then
+had to be added to lift the step above the clamp. The root cause was the reward
+shape (penalties that do not shrink when the policy stops trying) plus
+normalisation scales that priced exploration noise at -30/step; both are fixed,
+which leaves no reason for either the clamp or the bonus. PPO does not need
+non-negative rewards: ``A = R - V`` normalised rescales without reordering, so a
+step that is merely less bad than the critic expected still gets a positive
+advantage.
+
+**Normalisation scales are anti-noise, not readability.** ``action_scale = 0.05``
+and ``acc_scale = 200`` read nicely ("a 0.05 action step counts as 1") but they
+multiply the *exploration* noise by the same factor: actions are resampled every
+control step from N(0, sigma), so at ``init_noise_std = 0.5`` the step-to-step
+difference has std 0.7 and ``sum((da/0.05)²)`` is ~3200 -- -32 per step at weight
+-0.01, dwarfing the +3 the tracking terms can pay. At ``action_scale = 1.0`` /
+``acc_scale = 2000`` the same noise costs 0.08 / 0.17. The honest cost: a quadratic
+cannot tell noise from chatter, so these two terms are mild on real vibration
+until the noise floor drops -- vibration is mostly priced by the return it loses.
 
 Sign convention: penalty terms return a POSITIVE magnitude and carry their sign
 in the reward weight, exactly like ``isaaclab.envs.mdp`` (e.g.
@@ -268,25 +286,45 @@ def joint_torques_l2(env, torque_scale: float = 1.0,
 def action_rate_l2(env, action_scale: float = 1.0) -> torch.Tensor:
     """sum(((a - a_prev) / action_scale)^2) (positive).
 
-    Raw ``sum((a - a_prev)^2)`` at weight -0.01 is *not* a smoothness penalty: a
-    leg chattering by 0.1 action units per step costs 0.16 * 0.01 = 0.0016, i.e.
-    0.3% of the +0.5 height term -- free chatter. ``action_scale`` makes the number
-    interpretable: with 0.05, a 0.05-unit step costs 0.05, a 0.10-unit step 0.20.
+    ``action_scale`` is left at 1.0 on purpose. It is tempting to normalise by
+    the smallest step that "should" be free (0.05 action units), but the same
+    normalisation multiplies the *exploration noise* by the same factor: actions
+    are resampled every control step from N(0, sigma), so with ``init_noise_std =
+    0.5`` the step-to-step difference has std 0.7 and ``sum((da / 0.05)^2)`` is
+    about 3200 -- i.e. -32 reward per step at weight -0.01, dwarfing the +3 the
+    tracking terms can pay, so the noise (not the policy) would set the cost.
+
+    At ``action_scale = 1.0`` the same noise costs ``8 * 0.01 = 0.08``, and a
+    policy that has learned to move smoothly pays almost nothing -- which is the
+    honest way round: the term prices *unnecessary* motion, not exploration.
     """
     action_manager = env.action_manager
     delta = (action_manager.action - action_manager.prev_action) / action_scale
     return torch.sum(torch.square(delta), dim=1)
 
 
-def leg_joint_acc_l2(env, acc_scale: float = 200.0,
+def leg_joint_acc_l2(env, acc_scale: float = 2000.0,
                      asset_cfg: SceneEntityCfg | None = None) -> torch.Tensor:
     """sum(((qdd / acc_scale)^2) over the 12 leg joints) (positive).
 
     The anti-chatter channel. Leg velocity alone cannot price it: 12 joints
     swinging at 3 rad/s cost 0.005 under any sane velocity weight, which is 1% of
-    the +0.5 height term. Joint *acceleration* separates the two regimes -- a gait
-    accelerating at 100 rad/s^2 costs 12 * 0.25 * 0.02 = 0.06, a 400 rad/s^2 buzz
-    costs 0.96.
+    the +0.5 height term. Joint *acceleration* separates the two regimes.
+
+    The catch, and why ``acc_scale`` is 2000 rather than 200: the exploration
+    noise lands in this term too. Actions are resampled every control step from
+    N(0, sigma), so with ``init_noise_std = 0.5`` the joints see accelerations
+    around 1700 rad/s^2 before the policy has learned anything. At ``acc_scale =
+    200`` that is ``12 * 72 = 870`` per step, i.e. two orders of magnitude more
+    than the whole positive side of the reward, so the noise alone would decide
+    whether the policy learns anything. At 2000 the same noise costs
+    ``12 * 0.72 * 0.02 = 0.17``.
+
+    Consequence worth accepting: a quadratic term cannot tell noise from chatter
+    (both are just qdd), so a weight that tolerates the noise is also mild on the
+    chatter -- 400 rad/s^2 costs 0.01/step. Vibration is therefore priced mostly
+    by the return it loses, not by this term. Raise the weight once the policy
+    moves smoothly enough that the noise floor is lower.
 
     Legs only: the wheels reach 200 rad/s and are velocity-servoed, so their
     smoothness belongs in ``action_rate_l2``, not here. (This is deliberately a
@@ -399,6 +437,12 @@ def orientation_sq(env, scale: float = 0.2,
 def fall_terminated(env, minimum_height: float = 0.33, max_tilt: float = 0.5,
                     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     """1.0 for envs that ended in a *failure*, 0.0 otherwise (positive; weight is negative).
+
+    Used by the **standing** task, which runs on the stock ``ManagerBasedRLEnv`` and
+    has no other way to attach a terminal penalty. The velocity task does *not* use
+    this: ``isaaclab_m20.envs.M20VelocityEnv`` applies ``cfg.fall_penalty`` on the
+    steps where ``terminated & ~truncated``, straight from the termination flags,
+    so that task cannot drift out of sync with ``TerminationsCfg``.
 
     Deliberately not ``mdp.is_terminated``: that fires on the 20 s time-out too,
     so a policy that stands perfectly for the whole episode would pay the same

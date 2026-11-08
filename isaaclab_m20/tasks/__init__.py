@@ -1,8 +1,9 @@
 """Gym registration for the M20 wheeled tasks.
 
 The standing task is a plain ``ManagerBasedRLEnv``. The velocity task uses
-``isaaclab_m20.envs:M20VelocityEnv``, which adds a per-step reward floor so that
-a badly-tracking policy cannot earn more by falling over (see that module).
+``isaaclab_m20.envs:M20VelocityEnv``, which applies the fall penalty from the
+termination flags (falls only, never the time-out) and adds no reward floor
+(see that module for why the floor was removed).
 """
 import gymnasium as gym
 

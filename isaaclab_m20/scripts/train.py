@@ -225,6 +225,11 @@ parser.add_argument(
     "--health_every", type=int, default=24,
     help="Print sim-health stats every N env steps (0 disables).")
 parser.add_argument(
+    "--per_term_every", type=int, default=200,
+    help="Print the per-step reward decomposition (value*weight*dt for every term, "
+         "plus the accumulated episode sums) every N env steps. This is the only "
+         "scale in which the reward weights are comparable; 0 disables.")
+parser.add_argument(
     "--dr", type=str, default="off", choices=("off", "full"),
     help="Velocity task only: 'off' trains on the nominal robot (flat ground, "
          "friction 1.0, no payload spread, no pushes) -- the first version's setting. "
@@ -432,7 +437,74 @@ def attach_stage_schedule(env, schedule: CommandSchedule) -> None:
     env.step = step
 
 
-def attach_diagnostics(env, every: int, zero_actions: bool) -> None:
+def reward_term_contributions(env, manager) -> dict[str, float] | None:
+    """Per-step contribution of every reward term: ``value * weight * dt``.
+
+    ``_episode_sums`` answers "what did this term contribute over the episode",
+    which is what tensorboard plots -- but it is dt-scaled and keeps growing
+    until the episode ends, so a term can look healthy while its per-step value
+    is already negative (or the other way round). This evaluates each term once
+    more and returns the number that actually enters ``Train/mean_reward`` every
+    step, which is the only scale in which the weights are comparable.
+
+    The extra evaluation is read-only: every term in ``rewards.py`` only reads
+    ``robot.data`` / the command buffer, so calling it twice in a step is safe.
+    Terms that raise are skipped rather than taking the run down.
+    """
+    term_cfgs = getattr(manager, "_term_cfgs", None)
+    if not term_cfgs:
+        return None
+    dt = getattr(env, "step_dt", None)
+    if dt is None:
+        dt = getattr(manager, "_dt", None)
+    if dt is None:
+        return None
+    names = getattr(manager, "_term_names", None)
+    if not names or len(names) != len(term_cfgs):
+        names = [getattr(term_cfg, "name", f"term{index}")
+                 for index, term_cfg in enumerate(term_cfgs)]
+    contributions: dict[str, float] = {}
+    for name, term_cfg in zip(names, term_cfgs):
+        # Class-based terms keep state inside an instance the manager owns; calling
+        # the class again would build a fresh one and report zeros.
+        if isinstance(term_cfg.func, type):
+            continue
+        try:
+            value = term_cfg.func(env, **term_cfg.params)
+            value = torch.as_tensor(value, dtype=torch.float32)
+        except Exception:  # noqa: BLE001 - diagnostics must never break training
+            continue
+        contributions[name] = float((value * term_cfg.weight * dt).mean().item())
+    return contributions or None
+
+
+def episode_sums(manager) -> dict[str, float] | None:
+    """Mean of ``_episode_sums`` per term: the accumulated episode reward.
+
+    This is the number tensorboard's ``Episode_Reward/*`` is built from, so
+    printing it next to the per-step contributions lets one check that the two
+    agree in sign and order of magnitude.
+    """
+    sums = getattr(manager, "_episode_sums", None)
+    if not sums:
+        return None
+    values: dict[str, float] = {}
+    for name, tensor in sums.items():
+        try:
+            values[name] = float(tensor.mean().item())
+        except Exception:  # noqa: BLE001 - diagnostics must never break training
+            continue
+    return values or None
+
+
+def format_terms(values: dict[str, float], unit: str) -> str:
+    """One line, biggest contributors first, so the tail of the list is quiet."""
+    ordered = sorted(values.items(), key=lambda item: abs(item[1]), reverse=True)
+    body = "  ".join(f"{name}={value:+.3f}" for name, value in ordered)
+    return f"[terms] per-step ({unit}): {body}  sum={sum(values.values()):+.3f}"
+
+
+def attach_diagnostics(env, every: int, zero_actions: bool, per_term_every: int = 0) -> None:
     """Log simulation health, optionally replacing the policy output with zeros.
 
     PhysX reports a divergence as a bare ``CUDA error 700`` (illegal memory
@@ -444,18 +516,34 @@ def attach_diagnostics(env, every: int, zero_actions: bool) -> None:
     For the velocity task the line also carries ``|v_xy|`` (mean body speed -- the
     quantity the tracking kernel prices), ``standing`` (the fraction of envs whose
     command buffer is zero, which is both the stage-1 set point and the gate that
-    ``wheel_speed`` multiplies), and ``rew``/``neg`` (the raw, pre-floor step
-    reward and the fraction of envs where it is negative). A stage-1 run that
-    wanders shows up in ``|v_xy|`` immediately: the command is zero, so anything
-    above ~0.05 m/s is drift. ``standing=0.00`` would mean the command buffer is
-    not zero rather than the reward being too weak, and ``neg=1.00`` means the
-    command range is ahead of the policy (the floor in ``envs.py`` is then the only
-    thing preventing a "fall over early" policy).
+    ``wheel_speed`` multiplies), and ``rew``/``neg`` (the per-step reward and the
+    fraction of envs where it is negative). A stage-1 run that wanders shows up in
+    ``|v_xy|`` immediately: the command is zero, so anything above ~0.05 m/s is
+    drift. ``standing=0.00`` would mean the command buffer is not zero rather than
+    the reward being too weak. ``neg=1.00`` is *not* an error by itself -- with no
+    reward floor a bad policy legitimately earns a negative step -- but if it sits
+    at 1.00 for a whole stage while ``Train/mean_reward`` does not rise, the
+    command range is ahead of the policy.
+
+    ``fall_rew`` / ``timeout_rew`` are the mean of the tensor actually handed to
+    rsl_rl on the steps where the episode ends by a fall / by the time-out. They
+    are the end-to-end proof that the fall penalty arrives (``fall_rew`` should
+    read ≈ -10, which ``M20VelocityEnv`` adds from the termination flags) and that
+    a time-out pays nothing extra (``timeout_rew`` >= 0).
+
+    ``per_term_every`` adds a ``[terms] per-step`` line every that many steps: the
+    contribution of each reward term as ``value * weight * dt``, i.e. the number
+    that enters ``Train/mean_reward`` every step. ``Episode_Reward/*`` is the
+    accumulated version (``_episode_sums``) and it grows with episode length, so
+    a term whose weight is far too large can still look bounded there while its
+    per-step cost is the whole positive side of the reward. This line is the one
+    to read when ``Train/mean_reward`` sits at some value and the question is
+    "which term is doing that". Its ``sum=`` should equal ``rew=`` on the health
+    line at the same step (up to the fall penalty, which the env adds later).
     """
     unwrapped = env.unwrapped
     original_step = env.step
     state = {"n": 0}
-
     def step(action):
         if zero_actions:
             action = torch.zeros_like(action)
@@ -486,18 +574,43 @@ def attach_diagnostics(env, every: int, zero_actions: bool) -> None:
                 if buffer is not None:
                     gate = (buffer[:, :3].abs() <= 1e-3).all(dim=1)
                     extra += f"  standing={gate.float().mean().item():.2f}"
-            # Raw (pre-floor) step reward. `envs.py` clips it at 0 before the
-            # learner sees it, so a large negative `rew` here is *not* a broken
-            # reward -- it is the regime where "fall over and stop paying" used to
-            # be the cheapest policy. If `neg` sits near 1.00 for a whole stage,
-            # the command range is ahead of the policy and the floor is the only
-            # thing keeping it alive.
+            # Per-step reward as the reward manager summed it (no clamp since the
+            # floor was removed). A large negative `rew` here is not a broken
+            # reward -- it is the regime where the penalties outweigh the tracking
+            # credit. If `neg` sits near 1.00 for a whole stage and
+            # `Train/mean_reward` does not climb, the command range is ahead of
+            # the policy.
             reward_buf = getattr(unwrapped, "reward_buf", None)
             if reward_buf is not None:
                 extra += (
                     f"  rew={reward_buf.mean().item():+.2f}"
                     f"  neg={(reward_buf < 0).float().mean().item():.2f}"
                 )
+            # What the *learner* actually receives on the terminal steps. `rew` above
+            # is the sum from the reward manager; `out[1]` is the tensor handed to
+            # rsl_rl, after `M20VelocityEnv` added the fall penalty. A fall must show
+            # `fall_rew` ≈ -10, and a time-out must show `timeout_rew` >= 0 (it pays
+            # nothing extra). These two numbers are the end-to-end proof that the
+            # penalty is applied once, on falls only.
+            #
+            # Shape differs by where this wrapper sits: the raw env returns
+            # (obs, reward, terminated, truncated, extras), while
+            # ``RslRlVecEnvWrapper`` returns (obs, reward, dones, infos) with the
+            # time-out flag in ``infos["time_outs"]``. Handle both.
+            terminated = truncated = None
+            if len(out) == 5:
+                terminated, truncated = out[2], out[3]
+            elif len(out) == 4 and isinstance(out[3], dict):
+                terminated = out[2]
+                truncated = out[3].get("time_outs")
+                if truncated is None:
+                    truncated = torch.zeros_like(terminated)
+            if terminated is not None:
+                fell = terminated & ~truncated
+                if bool(fell.any()):
+                    extra += f"  fall_rew={out[1][fell].mean().item():+7.2f}"
+                if bool(truncated.any()):
+                    extra += f"  timeout_rew={out[1][truncated].mean().item():+6.2f}"
             print(
                 f"[health] step={state['n']:8d}"
                 f"  max|qdot|={joint_vel.abs().max().item():10.2f}"
@@ -507,6 +620,22 @@ def attach_diagnostics(env, every: int, zero_actions: bool) -> None:
                 f"  finite={torch.isfinite(joint_vel).all().item()}",
                 flush=True,
             )
+            # Which term is actually paying for the number above. The health line
+            # says `rew=-3.4`; this says it is `joint_deviation=-1.9` and
+            # `action_rate=-1.2`, without waiting for tensorboard -- and in the
+            # only scale where weights are comparable (the dt-scaled episode sums
+            # grow with episode length and hide the per-step cost).
+            if per_term_every > 0 and state["n"] % per_term_every == 0:
+                manager = getattr(unwrapped, "reward_manager", None)
+                if manager is not None:
+                    steps = reward_term_contributions(unwrapped, manager)
+                    if steps:
+                        print(format_terms(steps, "value*weight*dt"), flush=True)
+                    totals = episode_sums(manager)
+                    if totals:
+                        body = "  ".join(
+                            f"{name}={value:+.1f}" for name, value in totals.items())
+                        print(f"[terms] episode sums: {body}", flush=True)
         return out
 
     env.step = step
@@ -702,7 +831,8 @@ def main() -> None:
     print(f"[INFO] Action space: {env.action_space}  Observation space: {env.observation_space}")
     if args_cli.zero_actions:
         print("[INFO] --zero_actions: holding the default pose, actions are forced to 0.")
-    attach_diagnostics(env, args_cli.health_every, args_cli.zero_actions)
+    attach_diagnostics(
+        env, args_cli.health_every, args_cli.zero_actions, args_cli.per_term_every)
 
     schedule = None
     if is_velocity_task:

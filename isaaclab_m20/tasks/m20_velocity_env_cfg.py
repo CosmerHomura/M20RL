@@ -14,7 +14,8 @@ observation         56 dims, body frame (see ``observations.py``)
 action              16 dims: 12 leg position targets + 4 wheel speed targets
 control rate        50 Hz (decimation 4 on 200 Hz physics)
 episode             20 s
-rewards             10 weighted terms + fall penalty (see ``rewards.py``)
+rewards             10 weighted per-step terms (see ``rewards.py``) and a
+                    terminal -10 applied by ``M20VelocityEnv`` on falls only
 command mix         50% single axis / 30% two axes / 10% three / 10% zero,
                     held 2-4 s; stages 2-4 keep 50/30/20% zero commands
                     (stage 4 also shortens the hold to 1.5-3 s)
@@ -186,8 +187,10 @@ class ObservationsCfg:
 
 @configclass
 class RewardsCfg:
-    """Ten per-step channels plus the fall: two tracking, four base-state, three
-    regularisers, and the one gated term.
+    """Ten per-step channels: two tracking, four base-state, three regularisers and
+    the one gated term. The fall penalty is *not* here -- it is applied by
+    ``isaaclab_m20.envs.M20VelocityEnv`` from the termination flags (see
+    ``fall_penalty`` on the env cfg).
 
     Weights are the plan's; every penalty term returns a positive magnitude and
     carries its sign here (see the module docstring of ``rewards.py``).
@@ -221,10 +224,19 @@ class RewardsCfg:
       is a third capability, on top of move / stop / stand. It is measured on its
       own (net displacement of the hold test) before it earns a reward term;
       stacking it on the same reward makes every failure ambiguous.
-    * **No survival bonus.** A bonus is paid every step and the fall penalty once,
-      so a survival term mostly rescales the return, and with the reward floor in
-      ``isaaclab_m20.envs`` every step is already worth at least zero -- dying
-      cannot be cheaper than living badly.
+    * **No survival bonus (``alive``).** It was tried twice: once as "the fall
+      penalty's opposite", then again as "the counterweight to the reward floor".
+      Both were compensations for other mistakes. The floor is gone (it clamped
+      every negative step to a constant 0 and erased the gradient -- see
+      ``envs.py``), and with it the need for a bonus that lifts the ordinary step
+      above it. PPO does not require non-negative rewards: the advantage is
+      ``R - V`` and normalising rescales without reordering, so a step that is
+      merely less bad than the critic expected still gets a positive advantage.
+      What a survival bonus does add is a constant offset per step, which inflates
+      the return scale without telling the policy anything about *how* to survive.
+    * **No reward floor either.** The clamp used to live in ``envs.py``; it is
+      deleted, so ``Train/mean_reward`` is now the sum of the real terms and can
+      legitimately go negative while the policy is bad.
     * **No absolute (command-independent) wheel- or base-speed penalty**, which
       would tax obeying the command; **no four-wheel-contact term** (the trot
       lifts two legs); **no lateral tyre-slip penalty** (the scrub is how lateral
@@ -266,22 +278,22 @@ class RewardsCfg:
     # -- posture and smoothness ----------------------------------------------
     joint_deviation = RewardTermCfg(
         func=rewards.joint_deviation_l2, weight=-0.05, params={"scale": 0.3})
+    # acc_scale 2000 and action_scale 1.0 are *not* arbitrary: the exploration
+    # noise is what these two terms mostly price early on (see rewards.py), and at
+    # 200 / 0.05 the noise alone cost ~-30/step -- more than the whole positive
+    # side of the reward, which left the policy with nothing to learn from.
     leg_joint_acc = RewardTermCfg(
-        func=rewards.leg_joint_acc_l2, weight=-0.02, params={"acc_scale": 200.0})
+        func=rewards.leg_joint_acc_l2, weight=-0.02, params={"acc_scale": 2000.0})
     action_rate = RewardTermCfg(
-        func=rewards.action_rate_l2, weight=-0.01, params={"action_scale": 0.05})
+        func=rewards.action_rate_l2, weight=-0.01, params={"action_scale": 1.0})
 
-    # -- fall ----------------------------------------------------------------
-    # No survival bonus (see the class docstring). What stops the policy from
-    # falling on purpose is the reward floor in ``isaaclab_m20.envs``: every step
-    # is worth at least zero, so dying cannot be cheaper than living badly, and
-    # the fall penalty is a strictly negative event on its own. It is -10 rather
-    # than -200 because the real cost of falling is the rest of the episode's
-    # positive rewards; a large penalty on top of that only distorts the value
-    # function, which now sees a reward scale of a few units per step.
-    termination_penalty = RewardTermCfg(
-        func=rewards.fall_terminated, weight=-10.0,
-        params={"minimum_height": MIN_BASE_HEIGHT, "max_tilt": MAX_TILT_RAD})
+    # The fall penalty is not a reward term: ``isaaclab_m20.envs.M20VelocityEnv``
+    # adds it on the steps where ``terminated & ~truncated``, i.e. exactly the
+    # steps the termination manager ended with a fall. A reward term would have to
+    # re-derive that condition from the robot state (a second copy of the
+    # height/tilt test) and could only read the *previous* step's flags, because
+    # the termination manager runs after the reward manager. The magnitude lives
+    # on the env cfg as ``fall_penalty = -10``.
 
 
 @configclass
@@ -296,10 +308,10 @@ class TerminationsCfg:
     height.
 
     Both limits live in the module constants ``MIN_BASE_HEIGHT`` / ``MAX_TILT_RAD``
-    because ``RewardsCfg.termination_penalty`` re-tests the same two conditions:
-    the fall that ends the episode is the fall that is penalised. Keep them in
-    sync -- the reward function takes them as parameters precisely so that one
-    edit moves both.
+    so that a single edit moves the whole rule. The penalty itself is applied by
+    ``M20VelocityEnv`` from these flags, so there is no second copy of the test to
+    keep in sync: the fall that ends the episode is exactly the fall that is
+    penalised.
 
     The plan also lists "unexpected contact". M20's articulation config carries
     no contact sensor, so there is nothing to test against; a collision is
@@ -460,6 +472,13 @@ class M20WheeledVelocityEnvCfg(ManagerBasedRLEnvCfg):
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
     events: EventCfg = EventCfg()
+
+    # Fall penalty, applied by ``isaaclab_m20.envs.M20VelocityEnv`` on the steps
+    # that ended in a fall (``terminated & ~truncated``). -10 rather than -200
+    # because the real cost of falling is losing the rest of the episode's positive
+    # rewards; a large penalty on top of that only inflates the value scale the
+    # critic has to fit. Zero would make falling free, so it is kept negative.
+    fall_penalty: float = -10.0
 
     def __post_init__(self) -> None:
         # 200 Hz physics, 50 Hz policy.
