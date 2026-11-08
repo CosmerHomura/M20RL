@@ -87,9 +87,13 @@ def resolve_checkpoint(experiment_name: str) -> Path:
 
     The search is scoped to the task's experiment directory: standing and
     velocity log to ``m20_wheeled/`` and ``m20_velocity/`` respectively, and
-    their checkpoints are not interchangeable (57 vs 60 observation dims). A
+    their checkpoints are not interchangeable (57 vs 56 observation dims). A
     flat "newest model anywhere under log_root" would hand a standing checkpoint
     to the velocity env and crash on a shape mismatch.
+
+    The velocity run nests its checkpoints one level deeper, one directory per
+    curriculum stage (``<run>/stage4_mixed/model_1250.pt``), so the search is
+    recursive and ordered by modification time: the newest stage wins.
     """
     if args_cli.checkpoint:
         path = Path(args_cli.checkpoint).expanduser()

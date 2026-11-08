@@ -1,6 +1,6 @@
 # Isaac Lab 训练（云端 4090）
 
-训练在 Isaac Lab + rsl_rl 上跑，重点利用**并行环境数**：4090 上可以开 4096 个环境。
+训练在 Isaac Lab + rsl_rl 上跑，重点利用**并行环境数**：站立任务在 4090 上可以开 4096 个环境；速度指令任务因为观测/网络更大、还要留显存给 PPO 更新，从 512 起步、稳定后 1024。
 
 资产来自 Deep Robotics 官方仓库 [DeepRoboticsLab/deep_robotics_model](https://github.com/DeepRoboticsLab/deep_robotics_model/tree/main/M20)：
 
@@ -36,7 +36,7 @@ isaaclab_m20/
 | 系统 | Ubuntu 22.04（推荐）/ 24.04 |
 | 驱动 | 580.65 以上（Isaac Sim 5.x）；`nvidia-smi` 确认 |
 | Python | 3.11（IsaacLab 2.3.2 对应 Isaac Sim 5.x） |
-| 显存 | ≥ 16 GB（4090 24 GB，开 4096 环境没问题） |
+| 显存 | ≥ 16 GB（4090 24 GB：站立任务 4096 环境没问题，速度指令任务建议 512–1024） |
 | 内存 | ≥ 32 GB |
 | 磁盘 | ≥ 20 GB（Isaac Sim wheels 本身就有十几 GB） |
 
@@ -120,16 +120,22 @@ python -m isaaclab_m20.scripts.check_m20 --headless
 
 ```bash
 tmux new -s m20
+# 站立任务（4096 环境，模型很小，24 GB 卡放得下）
 python -m isaaclab_m20.scripts.train --headless --num_envs 4096
+
+# 速度指令任务：4 阶段课程 + 阶段间续训（512 起步，稳定后改 1024）
+python -m isaaclab_m20.scripts.train --headless --num_envs 512 --run_name m20_v1
 ```
 
-- 每个 iteration 采集 4096 × 24 = 98,304 步；默认跑 2000 iterations（约 2 亿步）。
-- 日志：`logs/rsl_rl/m20_wheeled/<时间戳>/`，每 100 iterations 存一个 `checkpoints/model_*.pt`。
-- 想给这次实验起名：`--run_name v1`，日志就落在 `logs/rsl_rl/m20_wheeled/v1/`。
-- 显存不够就降到 `--num_envs 2048`；这个场景很轻，一般不会不够。
-- 断点续训：`--resume --run_name v1`（加载该目录下最新的 checkpoint）。
+- 站立任务每个 iteration 采集 4096 × 24 = 98,304 步；默认跑 3000 iterations。
+- 速度指令任务每个 iteration 采集 512 × 24 = 12,288 步（1024 环境翻倍），4 阶段合计 3650 iterations。
+- 日志：`logs/rsl_rl/m20_wheeled/<时间戳>/`（站立，每 100 iterations 存一个 checkpoint）；速度指令任务按阶段分目录，`logs/rsl_rl/m20_velocity/<run_name>/stage{N}_<name>/`，每阶段每 50 iterations 存一个 `model_*.pt`。
+- 想给这次实验起名：`--run_name v1`，日志就落在 `logs/rsl_rl/m20_velocity/v1/`。
+- 显存不够就降 `--num_envs`。**训练期间只跑一个 Isaac Lab 进程**——两个进程抢同一张卡的表现是帧率崩到个位数，而不是干脆的 OOM。
+- 断点续训：站立任务 `--resume --run_name v1`（加载该目录下最新 checkpoint）；速度指令任务默认每阶段自动从上一阶段最新 checkpoint 续训，也可 `--stage 3 --resume_from <path>` 手指定。
+- 只有一份配置文件、想快速看流程通不通：`--stage_scale 0.1 --num_envs 128 --run_name smoke`。
 
-粗略预期（4090，单场景，无相机）：每秒几万步，2000 iterations 大概几小时量级。
+粗略预期（4090，单场景，无相机）：站立任务 3000 iterations 几小时量级；速度指令任务 1024 环境下约 20–30 min / 1000 iterations，整条 4 阶段课程通常 2–4 小时。
 
 ### 看曲线
 
@@ -161,7 +167,7 @@ python -m isaaclab_m20.scripts.play --headless --video
 
 `play.py` 加载 checkpoint 后就地站立推演，视频写到 `videos/`，`--video_length` 是策略步数（50 Hz，500 步 = 10 s）。
 
-`--task` 决定加载哪个任务的模型：不传 `--checkpoint` 时，脚本在 `logs/rsl_rl/<experiment>/` 下自动找最新 checkpoint——站立是 `m20_wheeled/`、速度指令是 `m20_velocity/`，两个目录的 checkpoint 维度不同（57 vs 60），按目录隔离就不会串。
+`--task` 决定加载哪个任务的模型：不传 `--checkpoint` 时，脚本在 `logs/rsl_rl/<experiment>/` 下自动找最新 checkpoint——站立是 `m20_wheeled/`、速度指令是 `m20_velocity/`，两个目录的 checkpoint 维度不同（57 vs 56），按目录隔离就不会串。速度指令任务的 checkpoint 按阶段多一层目录（`.../stage4_mixed/model_1250.pt`），脚本递归查找、按修改时间取最新，所以默认拿到的就是最后一阶段的最新模型。
 
 ### 推一把试试
 
@@ -191,7 +197,23 @@ python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0 \
     --cmd_vx 0.6 --cmd_vy 0.0 --cmd_wz 0.3 --headless --video
 ```
 
-速度指令任务里，`play.py` 会把指令重采样时间改成无穷大，并在每个策略步覆写指令缓冲——否则训练配置里 4 s 一次的重采样会不停覆盖人工输入。
+速度指令任务里，`play.py` 会把指令重采样时间改成无穷大，并在每个策略步覆写指令缓冲——否则训练配置里 2–4 s 一次的重采样会不停覆盖人工输入。速度指令范围以当前 checkpoint 所在阶段的 `cfg.ranges` 为准（打印在启动日志里），键盘 ±`--cmd_step` 就在这个范围之外手动推。
+
+### 验收测试
+
+`logs/` 里最好的 checkpoint 不等于"能跑起来就等于学会了"。固定指令序列的自动验收：
+
+```bash
+# 9 组固定指令（前进/后退/左右横移/左右转/两个组合/零指令），输出 RMSE、roll-pitch RMS、摔倒率
+python -m isaaclab_m20.scripts.eval
+
+# 指定 checkpoint，结果同时写 JSON，任一项不过就返回非零退出码
+python -m isaaclab_m20.scripts.eval \
+    --checkpoint logs/rsl_rl/m20_velocity/m20_v1/stage4_mixed/model_1250.pt \
+    --json_out eval.json --strict
+```
+
+eval 会强制**关掉域随机化、关掉指令重采样**，机器人是标称参数——测的是部署会看到的东西，不是训练环境的鲁棒性。阈值：前进/后退 RMSE < 0.10 m/s、横移 < 0.12 m/s、偏航 < 0.15 rad/s、roll/pitch RMS < 5°、摔倒率 < 2%（20 次/1000 策略步）、零指令机身速度 < 0.05 m/s。
 
 推力用的和训练时的 `push_robot` 是同一个机制（`write_root_velocity_to_sim`，瞬时改变机身速度），所以可以直接对比：训练时是 ±0.5 m/s，`--push_speed 1.0` 就是**两倍于训练强度**的测试。
 
@@ -204,20 +226,26 @@ python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0 \
 | gym id | 任务 | 观测 | 回合 | 日志目录 |
 | --- | --- | --- | --- | --- |
 | `Isaac-M20-Wheeled-v0` | 静态站立，无指令 | 57 维 | 10 s | `logs/rsl_rl/m20_wheeled/` |
-| `Isaac-M20-Wheeled-Velocity-v0` | `(vx, vy, ωz)` 跟踪 | 60 维 | 20 s | `logs/rsl_rl/m20_velocity/` |
+| `Isaac-M20-Wheeled-Velocity-v0` | `(vx, vy, ωz)` 跟踪 | 56 维 | 20 s | `logs/rsl_rl/m20_velocity/<run>/stage{N}_*/` |
 
-观测 57 维 = base_lin_vel(3) + base_ang_vel(3) + projected_gravity(3) + joint_pos(16) + joint_vel(16) + last_action(16)；速度指令任务在最前面再加 3 维指令。**两边的 checkpoint 不能互换。**
+观测维度：
+
+- 站立 57 = base_lin_vel(3) + base_ang_vel(3) + projected_gravity(3) + joint_pos(16) + joint_vel(16) + last_action(16)；
+- 速度指令 56 = base_ang_vel(3) + projected_gravity(3) + base_lin_vel(3) + 腿关节位置偏差(12) + 腿关节速度(12) + 车轮角速度(4) + 指令(3) + last_action(16)。
+
+**两边的 checkpoint 不能互换**（观测维度不同）。
 
 | 项 | 配置 |
 | --- | --- |
 | 控制频率 | 50 Hz（`sim.dt=0.005` × `decimation=4`） |
 | 腿动作 | `JointPositionActionCfg(scale=0.25, use_default_offset=True)` |
-| 轮动作 | `JointVelocityActionCfg(scale=20)`，`use_default_offset=False` |
+| 轮动作 | `JointVelocityActionCfg`，`use_default_offset=False`；站立 scale=20（1.8 m/s），速度指令任务 scale=8.0（0.72 m/s） |
 | PD 伺服 | 腿 kp=80 / kd=2，轮 kp=0 / kd=2，200 Hz |
 | 力矩上限 | 腿 76.4 N·m，轮 21.6 N·m |
-| 指令范围（速度指令任务） | vx ±1.0 m/s，vy ±0.4 m/s，ωz ±1.0 rad/s，每 4 s 重采样 |
-| 奖励 | 站立 14 项 / 速度指令 13 项（去掉轮速归零），完整权重表见 [docs/algorithm.md](algorithm.md) 第 1 节与第 6 节 |
-| 终止 | 高度 < 0.25、倾角 > 0.7、超时 |
+| 指令（速度指令任务） | 机体系 `(vx, vy, ωz)`，每 2–4 s 重采样；50% 单轴 / 30% 双轴 / 10% 三轴 / 10% 零指令；4 阶段课程，满幅 vx ±0.5、vy ±0.2、ωz ±0.8 |
+| 奖励 | 站立 14 项 / 速度指令 **8 项 + 摔倒 −200**（不惩罚轮速、不强制四轮着地、不惩罚横向滑移），完整权重表见 [docs/algorithm.md](algorithm.md) §1 与 §6.3 |
+| 终止 | 站立：高度 < 0.25、倾角 > 0.7、超时；速度指令：高度 < 0.28、倾角 > 0.8、超时 |
+| 域随机化 | 站立全开（带 `--dr_ramp` 课程）；速度指令第一版**默认关闭**，`--dr full` 打开 |
 
 ## 8. 常见问题
 
@@ -225,7 +253,7 @@ python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0 \
 - **`ModuleNotFoundError: isaaclab_m20`**：没在仓库根目录跑，或者用 `python isaaclab_m20/scripts/train.py` 直接跑脚本。用 `python -m ...`。
 - **启动时报 Omniverse/Carb 错误**：必须是 `AppLauncher` 先启动、再 import 任何 `isaaclab` 模块；三个脚本都已经按这个顺序写好了，不要再把 import 往上挪。
 - **机器人一出生就塌**：`init_state.pos.z=0.50` 和 USD 里的默认关节角不匹配；用 `--convert` 时再确认 `fix_base=False`。
-- **轮子一直空转 / 车子原地打滑**：检查轮的摩擦材质（`EventCfg.physics_material` 会把摩擦随机到 0.7–1.2）和 `damping`。
+- **轮子一直空转 / 车子原地打滑**：站立任务检查轮的摩擦材质（`EventCfg.physics_material` 会把摩擦随机到 0.5–1.25）和 `damping`；速度指令任务默认是标称摩擦 1.0，先把 `--dr off`（默认）下的跟踪跑通，再开 `--dr full`。
 - **`RuntimeError: CUDA out of memory`**：降 `--num_envs`。
 - **headless 录视频报 Vulkan/EGL**：装 `libvulkan1`，并确认驱动正常；纯训练不需要相机，不加 `--video` 即可。
 - **训练不收敛**：先看 `Episode_Termination/*` 翻车比例有没有降，再看 `Episode_Reward/base_height`。如果一出生就趴下，把 `reset_joints` 的 `position_range` 调小、`base_motion` 权重调低，先让机器人稳住不动。

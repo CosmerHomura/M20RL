@@ -1,39 +1,38 @@
 """Reward terms for the two M20 tasks.
 
-The term set and default weights follow the standard legged-locomotion reward
-formulation used by legged_gym (Rudin et al., "Learning to Walk in Minutes")
-and IsaacLab's own AnymalC task.
+``Isaac-M20-Wheeled-v0`` (static standing) keeps the legged_gym / AnymalC term
+set it has always used. ``Isaac-M20-Wheeled-Velocity-v0`` uses the eight-term
+set of the first formal training plan:
 
-* ``Isaac-M20-Wheeled-v0`` -- static standing; the velocity command is hard
-  wired to zero, so the tracking kernels compare against zero.
-* ``Isaac-M20-Wheeled-Velocity-v0`` -- (vx, vy, wz) command tracking, using the
-  ``*_cmd`` kernels that compare against ``env.command_manager``.
+    r = 2.0 · r_vel
+      + 1.0 · r_yaw
+      + 0.5 · r_ori                     roll/pitch attitude
+      + 0.5 · r_height
+      - 0.1 · p_slip                    wheel/ground longitudinal slip
+      - 0.01 · p_action                 action rate
+      - 0.005 · p_torque                normalised joint torque
+      - 0.05 · p_ang                    roll/pitch rate
+      - 200 · 1[terminated]             fall penalty
 
-Standing reward:
-
-    r = 1.5·exp(-|v_xy|^2/0.25) + 0.75·exp(-w_z^2/0.25)
-        + 0.5·exp(-|w_wheel|^2/4)                     # wheels stand still
-        - 2.0·v_z^2 - 0.05·|w_xy|^2 - 2.5·(gx^2+gy^2)
-        - 20·(h - 0.5)^2 - 0.5·sum_legs|q - q_default|
-        - 1e-4·sum(qd^2) - 2.5e-7·sum(qdd^2) - 1e-5·sum(tau^2)
-        - 0.01·sum(a - a_prev)^2
-        - 200·1[terminated]  (+ 0.15 alive)
-
-Velocity-command reward: the same set, with
-
-    track   = 1.5·exp(-(v_x − cmd_x)^2/sigma_x) + 1.0·exp(-(v_y − cmd_y)^2/sigma_y)
-              + 0.75·exp(-(w_z − cmd_wz)^2/0.25)
-    posture = -0.5·sum_legs|q − q_default|      (always on, no stand_still gate)
-    roll    = 0.5·exp(-(v_x + 0.09·mean(qd_wheel))^2/0.25)
-
-and no wheel-standstill term -- a moving robot's wheels are supposed to turn.
-sigma_x and sigma_y are per-axis and shrink as the command shrinks; see the
-docstrings of the three terms below.
+The four exp kernels are ``exp(-e²/σ²)``: σ is the *error scale* of the
+channel, and the kernel is ~0 once the error is a few σ. Note the division by
+``σ²``, not by ``σ``: this is the plan's formulation, and it is the reason the
+σ values are 0.25 m/s, 0.3 rad/s, 0.2 rad and 0.05 m -- read them as "the error
+that already costs most of the channel", not as a width.
 
 Sign convention: penalty terms return a POSITIVE magnitude and carry their sign
 in the reward weight, exactly like ``isaaclab.envs.mdp`` (e.g.
-``lin_vel_z_l2`` returns ``v_z^2`` and the config gives it weight -2.0).
+``ang_vel_xy_l2`` returns ``w_xy²`` and the config gives it weight -0.05).
 Do not add a leading minus here -- it would flip the term into a bonus.
+
+Two things are deliberately NOT in the set, because both would fight the task:
+
+* no penalty on the wheels' absolute speed -- driving forward *requires* the
+  wheels to turn, so ``|w_wheel| -> 0`` is a reward for refusing the command;
+* no term that keeps all four wheels on the ground -- the trot gait lifts two
+  legs at a time on purpose. ``p_slip`` is a mean over the four wheels and is
+  weighted 0.1 for the same reason: a wheel that is in the air for part of the
+  cycle must not be able to dominate the reward.
 """
 from __future__ import annotations
 
@@ -42,6 +41,7 @@ import torch
 from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
 
+from isaaclab_m20.tasks.observations import LEG_JOINT_NAMES, WHEEL_JOINT_NAMES
 
 # Every ``*_wheel`` link in model/urdf/M20.urdf is
 # <cylinder length="0.054" radius="0.09"/>. The wheel action scale times this
@@ -49,11 +49,29 @@ from isaaclab.managers import SceneEntityCfg
 WHEEL_RADIUS = 0.09
 
 
+def leg_asset_cfg() -> SceneEntityCfg:
+    """A fresh SceneEntityCfg for the 12 leg joints.
+
+    Fresh per call, not a module-level constant: the manager resolves the cfg in
+    place (it writes ``joint_ids`` back onto it), and two reward terms sharing
+    one instance would then share those indices. Here that happens to be
+    harmless, but it is not a habit worth keeping.
+    """
+    return SceneEntityCfg("robot", joint_names=LEG_JOINT_NAMES)
+
+
+def wheel_asset_cfg() -> SceneEntityCfg:
+    """A fresh SceneEntityCfg for the 4 wheel joints."""
+    return SceneEntityCfg("robot", joint_names=WHEEL_JOINT_NAMES)
+
+
 def _robot(env, asset_cfg: SceneEntityCfg) -> Articulation:
     return env.scene[asset_cfg.name]
 
 
-# -- standing task (Isaac-M20-Wheeled-v0): command is hard-wired to zero ------
+# --------------------------------------------------------------------------- #
+# Standing task (Isaac-M20-Wheeled-v0): the command is hard-wired to zero
+# --------------------------------------------------------------------------- #
 def track_lin_vel_xy_zero(env, sigma: float = 0.25,
                           asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     """exp(-|v_xy|^2/sigma), in [0, 1]: the legged_gym tracking kernel at a zero command."""
@@ -80,93 +98,131 @@ def wheel_vel_exp(env, sigma: float = 2.0,
     return torch.exp(-torch.sum(torch.square(wheel_vel), dim=1) / (sigma * sigma))
 
 
-# -- velocity-command task (Isaac-M20-Wheeled-Velocity-v0) --------------------
-def track_lin_vel_cmd(env, axis: int = 0, sigma_max: float = 0.5,
-                      sigma_min: float = 0.0625, fade: float = 1.5,
-                      command_name: str = "base_velocity",
-                      asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """exp(-(v_axis - cmd_axis)^2 / sigma), in [0, 1]: one axis of velocity tracking.
+# --------------------------------------------------------------------------- #
+# Velocity-command task (Isaac-M20-Wheeled-Velocity-v0): 8 terms + fall penalty
+# --------------------------------------------------------------------------- #
+def track_lin_vel_xy_cmd(env, sigma: float = 0.25, command_name: str = "base_velocity",
+                         asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """exp(-((vx-cmd_x)^2 + (vy-cmd_y)^2) / sigma^2), in [0, 1].
 
-    Two things made the old single-kernel version too loose, and both come from
-    using one ``sigma`` for two axes whose ranges differ by 5x (+-3.0 m/s vs
-    +-0.6 m/s):
+    One kernel over both linear axes, as in the plan. ``sigma = 0.25 m/s``
+    against a command range of +-0.5 / +-0.2: a 0.25 m/s error keeps
+    ``exp(-1) = 0.37``, a 0.5 m/s error (the whole forward range) keeps 0.018.
+    That is a usable gradient across the whole range, which is what makes the
+    exponential preferable to an L2 penalty here -- the L2 version has no
+    gradient left once the channel has saturated.
 
-    * ``sigma`` is an *error scale*. 0.5 is right for the drive axis, where a
-      1 m/s error is a real tracking failure against a 3 m/s command. On the
-      lateral axis a 0.6 m/s error is 100% of the range and still scores
-      ``exp(-0.72) = 0.49`` -- a policy that never moves sideways keeps half
-      the lateral reward, so the channel carries almost no gradient.
-    * the kernel was shared, so a forward slip during a lateral command was
-      only one component of a 2-norm. Wheels roll freely along x, so there is
-      no friction to stop that slip: the only thing that can is this term.
-
-    So the axes are split, and ``sigma`` additionally follows the *magnitude*
-    of the command on that axis: ``sigma_min`` when asked to hold zero
-    (a 0.25 m/s slip must not be free), widening to ``sigma_max`` at ``fade``
-    so that high-speed tracking still has a usable gradient instead of being a
-    step function.
+    Both velocities are body-frame. So is the command, so the comparison is
+    frame-consistent by construction.
     """
     robot = _robot(env, asset_cfg)
-    velocity = robot.data.root_lin_vel_b[:, axis]
-    command = env.command_manager.get_command(command_name)[:, axis]
-    sigma = sigma_min + (sigma_max - sigma_min) * torch.clamp(
-        torch.abs(command) / fade, max=1.0)
-    return torch.exp(-torch.square(velocity - command) / sigma)
+    velocity = robot.data.root_lin_vel_b[:, :2]
+    command = env.command_manager.get_command(command_name)[:, :2]
+    error = torch.sum(torch.square(velocity - command), dim=1)
+    return torch.exp(-error / (sigma * sigma))
 
 
-def track_ang_vel_z_cmd(env, sigma: float = 0.25, command_name: str = "base_velocity",
+def track_ang_vel_z_cmd(env, sigma: float = 0.3, command_name: str = "base_velocity",
                         asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """exp(-(w_z - cmd_wz)^2 / sigma), in [0, 1]: yaw-rate tracking."""
+    """exp(-(w_z - cmd_wz)^2 / sigma^2), in [0, 1]: yaw-rate tracking."""
     ang_vel_z = _robot(env, asset_cfg).data.root_ang_vel_b[:, 2]
     cmd = env.command_manager.get_command(command_name)[:, 2]
-    return torch.exp(-torch.square(ang_vel_z - cmd) / sigma)
+    return torch.exp(-torch.square(ang_vel_z - cmd) / (sigma * sigma))
 
 
-def wheel_roll_vel_exp(env, sigma: float = 0.25,
-                       wheel_radius: float = WHEEL_RADIUS,
-                       wheel_sign: float = -1.0,
-                       asset_cfg: SceneEntityCfg = SceneEntityCfg(
-                           "robot", joint_names=[".*_wheel_joint"])) -> torch.Tensor:
-    """exp(-(v_x - v_roll)^2 / sigma), in [0, 1]: the wheels are actually rolling.
+def flat_orientation_exp(env, sigma: float = 0.2,
+                         asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """exp(-(gx^2 + gy^2) / sigma^2), in [0, 1]: roll and pitch small.
 
-    ``v_roll`` is the speed the wheels imply when they roll without slipping.
-    Where they agree with the body's forward speed the wheels are doing the
-    work; where they disagree the robot is skating -- wheels spinning on the
-    spot (v_roll > v_x) or being dragged along with the wheels locked
-    (v_roll < v_x). Same idea as the wheel term in the Booster T1 skating
-    work, ``exp(-(v_x - r*sum(w_i c_i)/sum(c_i))^2 / sigma)``, minus the
-    contact indicator: M20 has no foot sensor, so it uses the mean over all
-    four wheels.
+    ``g`` is gravity projected on the base frame. For roll φ and pitch θ,
+    ``gx = sin θ`` and ``gy = -sin φ cos θ``, so ``gx^2 + gy^2 = φ^2 + θ^2`` to
+    first order -- the plan's ``(φ² + θ²)`` without an ``asin``/``atan2`` per
+    step. At ``sigma = 0.2 rad`` (11.5 deg) a 10 deg tilt keeps 0.72, a 20 deg
+    tilt keeps 0.13.
 
-    Sign: every wheel joint in the URDF turns about ``(0, -1, 0)`` in the base
-    frame at the nominal stance (hipx = 0; the hipy and knee axes point the
-    same way and rotations about y leave y alone). A spin about -y moves the
-    contact point at the bottom of the wheel along +x, so rolling without slip
-    puts the *body* at ``v_x = -r*dq``. Hence ``wheel_sign = -1``. Flip it to
-    +1 if ``Episode_Reward/wheel_roll`` sits near 0 while the robot visibly
-    drives straight -- that would mean the joint-velocity sign came through
-    the USD importer the other way.
+    The exp form is what makes this usable at all here: as a *penalty*
+    (``-2.5·(gx²+gy²)``, the standing task) it is a spring towards level with a
+    constant stiffness; as an exp kernel it saturates, so a recovered robot can
+    score almost 1 again instead of being marked down for the rest of the
+    episode.
+    """
+    gravity = _robot(env, asset_cfg).data.projected_gravity_b
+    return torch.exp(-(torch.square(gravity[:, 0]) + torch.square(gravity[:, 1]))
+                     / (sigma * sigma))
 
-    At zero command this term still pays 1.0 (standing still on locked wheels
-    is perfect rolling), so it is neutral between driving and standing, not an
-    incentive to do either.
+
+def base_height_exp(env, target_height: float = 0.50, sigma: float = 0.05,
+                    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """exp(-(h - h*)^2 / sigma^2), in [0, 1]: the base holds its ride height.
+
+    ``sigma = 0.05 m`` is deliberately tight: base height is the cheapest proxy
+    for "the legs are still carrying the robot" that this model has -- there are
+    no foot contact sensors -- and a 10 cm squat should cost the channel.
+    """
+    height = _robot(env, asset_cfg).data.root_pos_w[:, 2]
+    return torch.exp(-torch.square(height - target_height) / (sigma * sigma))
+
+
+def wheel_slip_l2(env, slip_scale: float = 0.5,
+                  wheel_radius: float = WHEEL_RADIUS,
+                  wheel_sign: float = -1.0,
+                  asset_cfg: SceneEntityCfg = SceneEntityCfg(
+                      "robot", joint_names=[".*_wheel_joint"])) -> torch.Tensor:
+    """mean_wheel ((v_roll - v_x) / slip_scale)^2, positive (weight is negative).
+
+    ``v_roll = wheel_sign * radius * qdot`` is the speed the wheel implies when
+    it rolls without slipping; ``v_x`` is the body's forward speed in the base
+    frame. ``v_roll - v_x`` is therefore the longitudinal slip at the contact
+    patch: positive while the wheels spin faster than the robot moves (wheelspin
+    on the spot, or on a low-friction surface), negative while the robot is
+    dragged along on locked wheels. Both waste the only forward actuator M20
+    has, and neither is visible to the tracking term when the command itself is
+    small.
+
+    Only the LONGITUDINAL direction is penalised, on purpose. The wheels are not
+    omnidirectional: during a lateral command the tyres scrub sideways, and that
+    scrub is the mechanism that produces the lateral motion. Penalising it would
+    penalise the behaviour the task is asking for.
+
+    ``slip_scale = 0.5 m/s`` is a reference, not a limit: a 0.5 m/s slip costs
+    1.0 per wheel, so the term stays small next to the 2.0 tracking channel at
+    ``weight = -0.1``.
+
+    Sign note: every wheel joint turns about ``(0, -1, 0)`` in the base frame at
+    the nominal stance. A spin about -y moves the contact point at the bottom of
+    the wheel along +x, so rolling without slip puts the *body* at
+    ``v_x = -radius * qdot``. Hence ``wheel_sign = -1``. If the trained policy
+    drives backwards when commanded forwards, this sign is the first suspect:
+    flip it to +1.0.
     """
     robot = _robot(env, asset_cfg)
     wheel_vel = robot.data.joint_vel[:, asset_cfg.joint_ids]
-    v_roll = wheel_sign * wheel_radius * torch.mean(wheel_vel, dim=1)
-    v_forward = robot.data.root_lin_vel_b[:, 0]
-    return torch.exp(-torch.square(v_forward - v_roll) / sigma)
+    v_roll = wheel_sign * wheel_radius * wheel_vel            # (num_envs, 4)
+    v_forward = robot.data.root_lin_vel_b[:, 0:1]             # (num_envs, 1)
+    slip = (v_roll - v_forward) / slip_scale
+    return torch.mean(torch.square(slip), dim=1)
 
 
+# --------------------------------------------------------------------------- #
+# Shared by both tasks
+# --------------------------------------------------------------------------- #
 def lin_vel_z_l2(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     """Vertical velocity squared (positive; weight is negative)."""
     return torch.square(_robot(env, asset_cfg).data.root_lin_vel_b[:, 2])
 
 
-def ang_vel_xy_l2(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """Roll/pitch rate squared (positive; weight is negative)."""
+def ang_vel_xy_l2(env, scale: float = 1.0,
+                  asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Roll/pitch rate squared, normalised by ``scale`` (rad/s).
+
+    ``scale = 1.0`` keeps the standing task's raw ``sum(w_xy^2)``. The velocity
+    task states it explicitly as "normalised squared penalty": 1 rad/s of roll
+    rate is one unit of cost, which at ``weight = -0.05`` is a 0.05-per-rad/s
+    tax on wobble -- small enough to permit the body sway a trot needs, large
+    enough to stop the robot from rocking itself over.
+    """
     ang_vel = _robot(env, asset_cfg).data.root_ang_vel_b[:, :2]
-    return torch.sum(torch.square(ang_vel), dim=1)
+    return torch.sum(torch.square(ang_vel / scale), dim=1)
 
 
 def flat_orientation_l2(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
@@ -187,20 +243,11 @@ def joint_deviation_l1(env, asset_cfg: SceneEntityCfg = SceneEntityCfg(
         ) -> torch.Tensor:
     """L1 distance from the default stand pose over the LEG joints (positive; weight is negative).
 
-    Applied unconditionally -- there is no ``stand_still`` gate. legged_gym
-    gates it because a walking robot must leave the nominal pose to move; M20
-    does not. The default stance is where the legs belong while the wheels are
-    doing the work, and it is also the target every lateral step should return
-    to.
-
-    Because the target pose is symmetric left-to-right, minimizing this term
-    also pulls the legs into symmetric configurations: a rear-left hipy ahead
-    of the rear-right one costs the sum of both offsets, while both at the
-    default costs zero. Note the cost is flat among symmetric offsets (both at
-    +0.3 scores the same as one at +0.3 and one at -0.3), so if an asymmetry
-    survives, the targeted fix is a pairwise |q_left - q_right| term -- but
-    that term also forbids trotting, so it belongs with the terrain work, not
-    here.
+    Standing task only in this version -- the eight-term velocity set has no
+    posture channel. It is kept here (and one config line away in the velocity
+    task) because it is the term that keeps the left and right legs mirrored:
+    the default stance is symmetric, so a symmetric deviation costs the sum of
+    both offsets while an asymmetric one costs the same and looks wrong.
 
     Wheels are deliberately excluded. A wheel joint's absolute angle is
     unbounded -- it grows without limit as the wheel rolls -- so penalising it
@@ -221,8 +268,19 @@ def joint_acc_l2(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> to
     return torch.sum(torch.square(_robot(env, asset_cfg).data.joint_acc), dim=1)
 
 
-def joint_torques_l2(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    return torch.sum(torch.square(_robot(env, asset_cfg).data.applied_torque), dim=1)
+def joint_torques_l2(env, torque_scale: float = 1.0,
+                     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """sum((tau / torque_scale)^2), positive (weight is negative).
+
+    ``torque_scale`` is the expression of "normalised": with ``scale = 40 N·m``
+    one unit of cost is 40 N·m on one joint, so the leg actuators (76.4 N·m
+    limit) reach 3.6 at saturation and the wheels (21.6 N·m) 0.29. The plan's
+    ``weight = -0.005`` then costs a fully loaded leg 0.018 per step -- a
+    regulariser, not a task term. Raw ``tau^2`` would instead scale with
+    (76.4)^2 and need a weight near 1e-5, which is where the standing task is.
+    """
+    torque = _robot(env, asset_cfg).data.applied_torque
+    return torch.sum(torch.square(torque / torque_scale), dim=1)
 
 
 def action_rate_l2(env) -> torch.Tensor:

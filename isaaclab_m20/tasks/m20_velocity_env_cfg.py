@@ -1,93 +1,161 @@
-"""Velocity-command version of the M20 task: track (vx, vy, wz).
+"""Velocity-command environment for M20: the first formal training task.
 
-Registered separately as ``Isaac-M20-Wheeled-Velocity-v0``. The static-standing
-task (``Isaac-M20-Wheeled-v0`` in ``m20_env_cfg.py``) is untouched -- the two
-differ in the observation, the reward set and the presence of a command term,
-so they cannot share a checkpoint and are kept as independent configs.
+This is the task the training plan describes: one policy that takes a
+``(vx, vy, wz)`` command and coordinates 12 leg joints and 4 wheels to follow it
+on flat ground. The static-standing task in ``m20_env_cfg.py`` is untouched and
+stays available as a separate gym id; only the shared scene is imported from it.
 
-Difference from the standing task:
+What is fixed by the plan and implemented here
+----------------------------------------------
+==================  ==========================================================
+item                value
+==================  ==========================================================
+observation         56 dims, body frame (see ``observations.py``)
+action              16 dims: 12 leg position targets + 4 wheel speed targets
+control rate        50 Hz (decimation 4 on 200 Hz physics)
+episode             20 s
+rewards             8 weighted terms + fall penalty (see ``rewards.py``)
+command mix         50% single axis / 30% two axes / 10% three / 10% zero,
+                    held 2-4 s
+domain random.      OFF: nominal friction, mass and CoM, no pushes
+terrain             flat plane
+==================  ==========================================================
 
-* observation 57 -> 60 dims: the 3-dim (vx, vy, wz) command is prepended
-* the tracking kernels measure the error against the command instead of zero
-* the wheel-standstill reward is gone -- a moving robot's wheels must turn --
-  and is replaced by a wheel/body rolling-consistency term, so that spinning
-  the wheels on the spot is not free
-* the leg-posture penalty is applied unconditionally, with no ``stand_still``
-  gate: forward driving is pure rolling and needs no leg deviation, and lateral
-  stepping should return to the (symmetric) nominal stance every step
-* velocity tracking is split per axis, because +-3.0 m/s and +-0.6 m/s cannot
-  share one error scale, and that scale also shrinks with the command
-* 20 s episodes so one episode contains five 4 s command segments
-* a wider wheel action scale, so the command range is actually reachable (below)
-* the wheel joints are out of the joint-velocity penalty; a wheel spinning at
-  the commanded speed is the goal, not a cost
+Why the command range defaults to +-0.4 / 0 / 0
+-----------------------------------------------
+The config carries the *first* course stage, not the final one, so a plain
+``train.py --task Isaac-M20-Wheeled-Velocity-v0`` run behaves conservatively: it
+cannot ask an untrained policy for 3 m/s on the first step. ``scripts/train.py``
+rewrites these ranges per stage through ``dr.set_command_ranges``; see
+``COMMAND_STAGES`` there for the four stages of the plan.
 
-Speed ceiling: the wheel action scale times the 0.09 m wheel radius is the
-fastest the policy can ask for. ``scale=45`` -> 45 * 0.09 = 4.05 m/s, and the
-3.0 m/s top command uses about 74% of that, leaving headroom for tracking error,
-slip on a low-friction surface and the pushes. The standing task keeps
-``scale=20`` (1.8 m/s cap) because its wheels are supposed to stay still anyway.
+Wheel action scale
+------------------
+8.0 rad/s per unit action against a 0.09 m wheel radius is 0.72 m/s at full
+action, i.e. 69% of the +-0.5 m/s final forward command and ~2.9x the +-0.25 m/s
+forward acceptance target. The old 20.0 (~1.8 m/s) is faster than anything this
+task commands, and every rad/s of unusable range is a rad/s the policy has to
+search through. Speed is worth revisiting only after the tracking numbers in
+``scripts/eval.py`` are met.
 """
 from __future__ import annotations
 
-import math
-
 import isaaclab.envs.mdp as mdp
 from isaaclab.managers import (
+    EventTermCfg,
     ObservationGroupCfg,
     ObservationTermCfg,
     RewardTermCfg,
     SceneEntityCfg,
+    TerminationTermCfg,
 )
+from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.utils import configclass
 
-from isaaclab_m20.tasks import rewards
-from isaaclab_m20.tasks.m20_env_cfg import M20WheeledEnvCfg
+from isaaclab_m20.tasks import commands, dr, observations, rewards
+from isaaclab_m20.tasks.m20_env_cfg import M20SceneCfg, fit_viewer_to_grid
+
+# Base ride height. The USD spawns the base at z = 0.50 and the legs' default
+# stance (hipy 0.61, knee -1.22) keeps it there, so the height reward and the
+# fall termination are both measured against this number.
+BASE_HEIGHT = 0.50
+
+
+def leg_obs_cfg() -> SceneEntityCfg:
+    """A fresh SceneEntityCfg over the 12 leg joints (see ``rewards.leg_asset_cfg``)."""
+    return SceneEntityCfg("robot", joint_names=observations.LEG_JOINT_NAMES)
+
+
+def wheel_obs_cfg() -> SceneEntityCfg:
+    """A fresh SceneEntityCfg over the 4 wheel joints."""
+    return SceneEntityCfg("robot", joint_names=observations.WHEEL_JOINT_NAMES)
 
 
 @configclass
 class VelocityCommandsCfg:
-    """Uniform sampling of a body-frame velocity command."""
-
-    base_velocity = mdp.UniformVelocityCommandCfg(
+    base_velocity = commands.MixedVelocityCommandCfg(
         asset_name="robot",
-        # One command per 4 s. Episode is 20 s, so five segments per episode.
-        resampling_time_range=(4.0, 4.0),
-        rel_heading_envs=0.0,
+        # Held 2-4 s per the plan: long enough that the policy has to *hold* a
+        # command, short enough that one episode of 20 s covers ~6 commands.
+        resampling_time_range=(2.0, 4.0),
+        # Yaw is commanded as a rate. Heading mode would replace the third
+        # column with a feedback law and the command mix below would be
+        # meaningless on that axis.
         heading_command=False,
-        debug_vis=True,
-        ranges=mdp.UniformVelocityCommandCfg.Ranges(
-            # The full range, reached in the last stage of the staged command
-            # schedule (see COMMAND_STAGES in scripts/train.py). 3.0 m/s is
-            # ~74% of the 4.05 m/s the action scale allows: keep the command
-            # under that ceiling, because a command the actuators cannot reach
-            # is a permanent reward loss the policy can do nothing about.
-            lin_vel_x=(-3.0, 3.0),
-            # Lateral motion is limited by the legs (hipx 外展 + hipy 俯仰, no
-            # hip yaw), so the wheels cannot roll sideways.
-            lin_vel_y=(-0.6, 0.6),
-            ang_vel_z=(-1.0, 1.0),
-            heading=(-math.pi, math.pi),
-        ),
+        rel_standing_envs=0.0,     # standing is the 10% zero share instead
+        rel_heading_envs=0.0,
+        debug_vis=False,
+    )
+
+    def __post_init__(self) -> None:
+        # Stage 1 of the course: forward and backward only. ``scripts/train.py``
+        # widens these per stage at runtime.
+        ranges = self.base_velocity.ranges
+        ranges.lin_vel_x = (-0.4, 0.4)
+        ranges.lin_vel_y = (0.0, 0.0)
+        ranges.ang_vel_z = (0.0, 0.0)
+        ranges.heading = (0.0, 0.0)
+
+
+@configclass
+class ActionsCfg:
+    """12 leg position targets + 4 wheel velocity targets.
+
+    The leg scale is the plan's 0.25 rad around the default stance, which is
+    what makes ``q_des = q_default + 0.25 * a`` and lets the un-learned policy
+    start from the stance the USD was authored in.
+
+    The wheel term is a *speed* target: ``JointVelocityActionCfg`` drives the
+    implicit actuator's velocity setpoint, and the actuator's ``kd = 2`` turns
+    the error into torque. ``use_default_offset=False`` because a wheel's
+    default angle is arbitrary -- adding an offset there would make the target
+    depend on how far the wheel happens to have rolled.
+    """
+
+    leg_positions = mdp.JointPositionActionCfg(
+        asset_name="robot",
+        joint_names=observations.LEG_JOINT_NAMES,
+        scale=0.25,
+        use_default_offset=True,
+    )
+    wheel_velocities = mdp.JointVelocityActionCfg(
+        asset_name="robot",
+        joint_names=observations.WHEEL_JOINT_NAMES,
+        scale=8.0,
+        use_default_offset=False,
     )
 
 
 @configclass
-class VelocityObservationsCfg:
-    """60 dims: 3 command + 3 lin vel + 3 ang vel + 3 gravity + 16 q + 16 qd + 16 a."""
+class ObservationsCfg:
+    """The 56-dim actor input. Declaration order IS the layout."""
 
     @configclass
     class PolicyCfg(ObservationGroupCfg):
-        velocity_commands = ObservationTermCfg(
-            func=mdp.generated_commands, params={"command_name": "base_velocity"})
-        base_lin_vel = ObservationTermCfg(func=mdp.base_lin_vel)
+        # -- 3: IMU gyro, body frame -----------------------------------------
         base_ang_vel = ObservationTermCfg(func=mdp.base_ang_vel)
+        # -- 3: attitude, body frame (roll/pitch as a gravity projection) -----
         projected_gravity = ObservationTermCfg(func=mdp.projected_gravity)
-        joint_pos = ObservationTermCfg(func=mdp.joint_pos_rel)
-        joint_vel = ObservationTermCfg(func=mdp.joint_vel_rel)
+        # -- 3: body-frame linear velocity ------------------------------------
+        base_lin_vel = ObservationTermCfg(func=mdp.base_lin_vel)
+        # -- 12: leg joints relative to the default stance ---------------------
+        joint_pos = ObservationTermCfg(
+            func=mdp.joint_pos_rel, params={"asset_cfg": leg_obs_cfg()})
+        # -- 12: leg joint velocities -----------------------------------------
+        joint_vel = ObservationTermCfg(
+            func=mdp.joint_vel_rel, params={"asset_cfg": leg_obs_cfg()})
+        # -- 4: wheel angular velocities --------------------------------------
+        wheel_vel = ObservationTermCfg(
+            func=mdp.joint_vel_rel, params={"asset_cfg": wheel_obs_cfg()})
+        # -- 3: the command itself (must be part of the input) ----------------
+        velocity_command = ObservationTermCfg(func=observations.velocity_command)
+        # -- 16: previous action, for action smoothness ------------------------
         last_action = ObservationTermCfg(func=mdp.last_action)
 
         def __post_init__(self) -> None:
+            # No sensor noise in the first version: the plan asks for a fixed
+            # robot and clean state, and noise on top of a not-yet-converged
+            # policy makes the tracking numbers harder to attribute.
             self.enable_corruption = False
             self.concatenate_terms = True
 
@@ -95,82 +163,251 @@ class VelocityObservationsCfg:
 
 
 @configclass
-class VelocityRewardsCfg:
-    """Same legged_gym set as the standing task, with command tracking."""
+class RewardsCfg:
+    """The plan's eight terms plus the fall penalty.
 
-    # -- task: exp tracking kernels against the commanded velocity ------------
-    # sigma is the error scale of the kernel, not a speed. exp(-e^2/sigma) is
-    # ~0 once the error is a few sigma, so sigma has to be a similar fraction of
-    # the command range on that axis -- and the two axes are 5x apart, which is
-    # why they are separate terms now instead of one 2-norm.
-    #
-    # Each sigma also follows the command magnitude: sharp (sigma_min) when the
-    # command asks to hold ~zero, widening to sigma_max at `fade`. A single
-    # sigma for the whole axis cannot serve both ends -- 0.5 gives no gradient
-    # to 3 m/s tracking, 0.0625 makes 3 m/s unreachable.
-    track_lin_vel_x = RewardTermCfg(
-        func=rewards.track_lin_vel_cmd, weight=1.5,
-        params={"axis": 0, "sigma_max": 0.5, "sigma_min": 0.0625, "fade": 1.5})
-    # Lateral: range is only +-0.6, so both sigma values are much smaller.
-    # 0.1 at full command means a 0.3 m/s error still scores 0.41; 0.02 at a
-    # zero command means a 0.1 m/s slip already costs half the channel.
-    track_lin_vel_y = RewardTermCfg(
-        func=rewards.track_lin_vel_cmd, weight=1.0,
-        params={"axis": 1, "sigma_max": 0.1, "sigma_min": 0.02, "fade": 0.3})
+    Weights are the plan's; every penalty term returns a positive magnitude and
+    carries its sign here (see the module docstring of ``rewards.py``). The
+    ordering below groups task terms, attitude, then penalties.
+
+    NOT present, on purpose: a wheel absolute-speed penalty (forward motion
+    needs the wheels to turn), a four-wheel-contact term (the trot lifts two
+    legs), and a lateral tyre-slip penalty (the scrub is how lateral motion
+    happens). There is also no separate ``is_alive`` bonus -- a constant per-step
+    bonus is already implicit in the eight terms, and adding a ninth channel
+    would change the reward balance the plan specifies.
+    """
+
+    # -- task ---------------------------------------------------------------
+    track_lin_vel_xy = RewardTermCfg(
+        func=rewards.track_lin_vel_xy_cmd, weight=2.0, params={"sigma": 0.25})
     track_ang_vel_z = RewardTermCfg(
-        func=rewards.track_ang_vel_z_cmd, weight=0.75, params={"sigma": 0.25})
-    # Wheels and body agree on forward speed = the wheels are not slipping.
-    # Neutral at a standstill (see the docstring), so it does not bias toward
-    # standing; it only makes "spin the wheels, go nowhere" unprofitable.
-    wheel_roll = RewardTermCfg(
-        func=rewards.wheel_roll_vel_exp, weight=0.5, params={"sigma": 0.25})
+        func=rewards.track_ang_vel_z_cmd, weight=1.0, params={"sigma": 0.3})
 
-    # -- base stability -------------------------------------------------------
-    lin_vel_z = RewardTermCfg(func=rewards.lin_vel_z_l2, weight=-2.0)
-    ang_vel_xy = RewardTermCfg(func=rewards.ang_vel_xy_l2, weight=-0.05)
-    flat_orientation = RewardTermCfg(func=rewards.flat_orientation_l2, weight=-2.5)
+    # -- attitude and height ------------------------------------------------
+    flat_orientation = RewardTermCfg(
+        func=rewards.flat_orientation_exp, weight=0.5, params={"sigma": 0.2})
     base_height = RewardTermCfg(
-        func=rewards.base_height_l2, weight=-20.0, params={"target_height": 0.50})
+        func=rewards.base_height_exp, weight=0.5,
+        params={"target_height": BASE_HEIGHT, "sigma": 0.05})
 
-    # -- posture and smoothness ----------------------------------------------
-    # Always on -- no stand_still gate. Gating it off for lateral/yaw commands
-    # removed the constraint exactly where the legs move most, which is how the
-    # rear legs ended up one fore and one aft. The default stance is the target
-    # every step should return to, and it is symmetric, so this term is also
-    # what keeps the left and right legs mirrored.
-    joint_deviation = RewardTermCfg(func=rewards.joint_deviation_l1, weight=-0.5)
-    # Legs only. Four wheels at 40 rad/s contribute 4 * 1600 * 1e-4 = 0.64 per
-    # step -- 40% of the maximum tracking reward -- which is a direct tax on the
-    # behaviour being asked for. Wheel smoothness is already covered by
-    # action_rate and joint_acc.
-    joint_vel = RewardTermCfg(
-        func=rewards.joint_vel_l2, weight=-1e-4,
-        params={"asset_cfg": SceneEntityCfg(
-            "robot",
-            joint_names=[".*_hipx_joint", ".*_hipy_joint", ".*_knee_joint"])})
-    joint_acc = RewardTermCfg(func=rewards.joint_acc_l2, weight=-2.5e-7)
-    joint_torques = RewardTermCfg(func=rewards.joint_torques_l2, weight=-1e-5)
+    # -- penalties -----------------------------------------------------------
+    wheel_slip = RewardTermCfg(
+        func=rewards.wheel_slip_l2, weight=-0.1, params={"slip_scale": 0.5})
     action_rate = RewardTermCfg(func=rewards.action_rate_l2, weight=-0.01)
+    joint_torques = RewardTermCfg(
+        func=rewards.joint_torques_l2, weight=-0.005, params={"torque_scale": 40.0})
+    ang_vel_xy = RewardTermCfg(
+        func=rewards.ang_vel_xy_l2, weight=-0.05, params={"scale": 1.0})
 
-    # -- survival -------------------------------------------------------------
+    # -- fall ---------------------------------------------------------------
+    # Without this the cheapest way out of a bad command is to fall over: the
+    # episode ends, and the remaining per-step penalties are never paid.
     termination_penalty = RewardTermCfg(func=mdp.is_terminated, weight=-200.0)
-    alive = RewardTermCfg(func=mdp.is_alive, weight=0.15)
 
 
 @configclass
-class M20WheeledVelocityEnvCfg(M20WheeledEnvCfg):
-    """Inherits scene, actions, terminations, randomisation and sim settings."""
+class TerminationsCfg:
+    """Fall and timeout.
 
-    observations: VelocityObservationsCfg = VelocityObservationsCfg()
-    rewards: VelocityRewardsCfg = VelocityRewardsCfg()
+    Height, not attitude alone: a robot that has pitched onto its knees can
+    still project gravity near vertical, but its base has dropped. 0.28 m is
+    22 cm below the ride height -- below anything the legs can hold, above the
+    lowest body point of a folded robot. ``bad_orientation`` at 0.8 rad (46 deg)
+    catches the other failure mode, a slow tip-over that keeps some height.
+
+    The plan also lists "unexpected contact". M20's articulation config carries
+    no contact sensor, so there is nothing to test against; a collision is
+    instead caught by the two terms above, which is what the height and
+    orientation limits do in practice.
+    """
+
+    time_out = TerminationTermCfg(func=mdp.time_out, time_out=True)
+    base_height = TerminationTermCfg(
+        func=mdp.root_height_below_minimum, params={"minimum_height": 0.28})
+    bad_orientation = TerminationTermCfg(
+        func=mdp.bad_orientation, params={"limit_angle": 0.8})
+
+
+@configclass
+class EventCfg:
+    """Per-episode reset spread, with domain randomization OFF by default.
+
+    The plan's third implementation rule is "fix terrain and dynamics, get
+    velocity tracking working, then add friction / mass / terrain
+    randomization". So the *nominal* values live here and ``--dr full`` in
+    ``scripts/train.py`` widens them (see ``set_domain_randomization`` below).
+
+    Reset spread is kept even with DR off. It is not domain randomization of the
+    robot -- it is the initial condition: without it the policy memorises one
+    exact starting pose and stumbles the first time a real robot starts 3 cm off.
+    """
+
+    # -- reset: initial state (always active, nominal values) ----------------
+    reset_base = EventTermCfg(
+        func=mdp.reset_root_state_uniform,     # not the dr wrapper: no LEVEL scaling
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "pose_range": {
+                "x": (-0.05, 0.05),
+                "y": (-0.05, 0.05),
+                "z": (0.0, 0.03),
+                "roll": (-0.05, 0.05),
+                "pitch": (-0.05, 0.05),
+                "yaw": (-0.30, 0.30),
+            },
+            "velocity_range": {
+                "x": (-0.1, 0.1), "y": (-0.1, 0.1), "z": (0.0, 0.0),
+                "roll": (0.0, 0.0), "pitch": (0.0, 0.0), "yaw": (-0.1, 0.1),
+            },
+        },
+    )
+    reset_joints = EventTermCfg(
+        func=mdp.reset_joints_by_offset,
+        mode="reset",
+        params={
+            "asset_cfg": leg_obs_cfg(),
+            "position_range": (-0.10, 0.10),
+            "velocity_range": (-0.5, 0.5),
+        },
+    )
+    # Continuous wheel joints: zero the accumulated angle each episode, without
+    # an offset. Bookkeeping, not randomization -- a non-zero range here would
+    # only make the first step noisier for no benefit.
+    reset_wheels = EventTermCfg(
+        func=mdp.reset_joints_by_offset,
+        mode="reset",
+        params={
+            "asset_cfg": wheel_obs_cfg(),
+            "position_range": (0.0, 0.0),
+            "velocity_range": (0.0, 0.0),
+        },
+    )
+
+    # -- startup: nominal dynamics (widened by --dr full) -------------------
+    physics_material = EventTermCfg(
+        func=mdp.randomize_rigid_body_material,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
+            "static_friction_range": (1.0, 1.0),
+            "dynamic_friction_range": (1.0, 1.0),
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 64,
+        },
+    )
+    base_mass = EventTermCfg(
+        func=mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
+            "mass_distribution_params": (0.0, 0.0),
+            "operation": "add",
+            "recompute_inertia": True,
+        },
+    )
+    base_com = EventTermCfg(
+        func=mdp.randomize_rigid_body_com,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
+            "com_range": {"x": (0.0, 0.0), "y": (0.0, 0.0), "z": (0.0, 0.0)},
+        },
+    )
+
+    # -- interval: shoves ---------------------------------------------------
+    # Kept registered but gated by ``dr.LEVEL``: at LEVEL 0 the wrapper returns
+    # without touching the robot, which is "no disturbance" rather than a
+    # (0, 0) velocity command that would *freeze* the base every few seconds.
+    push_robot = EventTermCfg(
+        func=dr.push_by_setting_velocity,
+        mode="interval",
+        interval_range_s=(4.0, 8.0),
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)},
+        },
+    )
+
+
+# Full ranges for ``--dr full``. Written out here rather than applied through a
+# global LEVEL multiplier: friction, mass and CoM are startup terms sampled once
+# per environment, so "ramping" them at runtime would do nothing -- they have to
+# change before the scene is built, which is exactly when this is called.
+FULL_FRICTION = (0.5, 1.25)
+FULL_MASS = (-2.0, 3.0)
+FULL_COM = {"x": (-0.03, 0.03), "y": (-0.03, 0.03), "z": (-0.02, 0.02)}
+
+
+def set_domain_randomization(env_cfg: ManagerBasedRLEnvCfg, enabled: bool) -> bool:
+    """Turn the dynamics randomization and the shoves on or off, before gym.make.
+
+    Returns the state actually applied., so the caller can log it. Must be called
+    after the config is built and before the environment exists: the event
+    manager deep-copies the term configs at construction.
+    """
+    events = env_cfg.events
+    if enabled:
+        events.physics_material.params["static_friction_range"] = FULL_FRICTION
+        events.physics_material.params["dynamic_friction_range"] = FULL_FRICTION
+        events.base_mass.params["mass_distribution_params"] = FULL_MASS
+        events.base_com.params["com_range"] = dict(FULL_COM)
+        dr.set_level(1.0)
+    else:
+        # Back to nominal. Nothing to undo for the startup terms in a fresh
+        # process, but this keeps the function honest if it is called twice.
+        events.physics_material.params["static_friction_range"] = (1.0, 1.0)
+        events.physics_material.params["dynamic_friction_range"] = (1.0, 1.0)
+        events.base_mass.params["mass_distribution_params"] = (0.0, 0.0)
+        events.base_com.params["com_range"] = {
+            "x": (0.0, 0.0), "y": (0.0, 0.0), "z": (0.0, 0.0)}
+        dr.set_level(0.0)
+    return enabled
+
+
+@configclass
+class M20WheeledVelocityEnvCfg(ManagerBasedRLEnvCfg):
+    scene: M20SceneCfg = M20SceneCfg(num_envs=512, env_spacing=2.5)
     commands: VelocityCommandsCfg = VelocityCommandsCfg()
+    observations: ObservationsCfg = ObservationsCfg()
+    actions: ActionsCfg = ActionsCfg()
+    rewards: RewardsCfg = RewardsCfg()
+    terminations: TerminationsCfg = TerminationsCfg()
+    events: EventCfg = EventCfg()
 
     def __post_init__(self) -> None:
-        super().__post_init__()
-        # Five command segments per episode instead of one.
+        # 200 Hz physics, 50 Hz policy.
+        self.decimation = 4
         self.episode_length_s = 20.0
-        # Wheel target range: w* = a * scale, and ground speed = w * 0.09 m
-        # radius, so 45 rad/s is a 4.05 m/s ceiling. The top command (3.0 m/s)
-        # uses ~74% of that. Set here rather than as an actions subclass so the
-        # standing task's 20 rad/s (1.8 m/s) is provably untouched.
-        self.actions.wheel_velocities.scale = 45.0
+        self.sim.dt = 0.005
+        self.sim.render_interval = self.decimation
+
+        self.sim.physx.bounce_threshold_velocity = 0.2
+        # See m20_env_cfg.py: the PhysX GPU contact buffers have to be sized for
+        # the environment count or the tensor API fails with an unrelated-looking
+        # "Failed to get DOF velocities" error on the next read.
+        self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
+        self.sim.physx.gpu_total_aggregate_pairs_capacity = 1024 * 1024
+        self.sim.physx.gpu_max_rigid_patch_count = 10 * 2 ** 15
+        self.sim.physx.gpu_max_rigid_contact_count = 2 ** 23
+        self.sim.physx.gpu_collision_stack_size = 64 * 2 ** 20
+
+        self.viewer.origin_type = "env"
+        self.viewer.env_index = 0
+        self.viewer.eye = (2.5, -2.5, 1.6)
+        self.viewer.lookat = (0.0, 0.0, 0.4)
+        self.viewer.resolution = (1280, 720)
+
+
+__all__ = [
+    "BASE_HEIGHT",
+    "EventCfg",
+    "M20WheeledVelocityEnvCfg",
+    "ObservationsCfg",
+    "RewardsCfg",
+    "TerminationsCfg",
+    "VelocityCommandsCfg",
+    "fit_viewer_to_grid",
+    "set_domain_randomization",
+]
