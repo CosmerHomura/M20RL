@@ -41,6 +41,7 @@ import torch
 from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
 
+from isaaclab_m20.tasks import observations
 from isaaclab_m20.tasks.observations import LEG_JOINT_NAMES, WHEEL_JOINT_NAMES
 
 # Every ``*_wheel`` link in model/urdf/M20.urdf is
@@ -117,7 +118,7 @@ def track_lin_vel_xy_cmd(env, sigma: float = 0.25, command_name: str = "base_vel
     """
     robot = _robot(env, asset_cfg)
     velocity = robot.data.root_lin_vel_b[:, :2]
-    command = env.command_manager.get_command(command_name)[:, :2]
+    command = observations.velocity_command(env, command_name)[:, :2]
     error = torch.sum(torch.square(velocity - command), dim=1)
     return torch.exp(-error / (sigma * sigma))
 
@@ -126,7 +127,7 @@ def track_ang_vel_z_cmd(env, sigma: float = 0.3, command_name: str = "base_veloc
                         asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     """exp(-(w_z - cmd_wz)^2 / sigma^2), in [0, 1]: yaw-rate tracking."""
     ang_vel_z = _robot(env, asset_cfg).data.root_ang_vel_b[:, 2]
-    cmd = env.command_manager.get_command(command_name)[:, 2]
+    cmd = observations.velocity_command(env, command_name)[:, 2]
     return torch.exp(-torch.square(ang_vel_z - cmd) / (sigma * sigma))
 
 

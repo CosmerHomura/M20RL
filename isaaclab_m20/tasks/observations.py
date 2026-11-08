@@ -48,6 +48,15 @@ def velocity_command(env, command_name: str = "base_velocity") -> torch.Tensor:
     buffer is what keeps the observation exactly 56 wide -- with the heading
     column it would be 57 and every downstream shape (actor input, checkpoint,
     deployment) would be off by one.
+
+    The reward terms read the command through this function too, so the
+    observation and the reward can never disagree about which columns the
+    command occupies.
     """
-    command = env.command_manager.get_command(command_name)
-    return command[:, :3]
+    term = env.command_manager.get_term(command_name)
+    # ``vel_command_b`` is the 2.x name; older releases called the same buffer
+    # ``command``, so fall back rather than break on a minor-version bump.
+    buffer = getattr(term, "vel_command_b", None)
+    if buffer is None:
+        buffer = term.command
+    return buffer[:, :3]

@@ -7,9 +7,9 @@ Two runners:
   training plan's hyper-parameters.
 
 The stager that actually uses the velocity runner is ``scripts/train.py``: it
-runs the four course stages back to back, loading the previous stage's
+runs the five course stages back to back, loading the previous stage's
 checkpoint each time, so ``max_iterations`` here is only the sum of the stage
-budgets (700 + 700 + 1000 + 1250) used as the fallback total.
+budgets (300 + 700 + 1000 + 700 + 1250) used as the fallback total.
 """
 from isaaclab.utils import configclass
 from isaaclab_rl.rsl_rl import (

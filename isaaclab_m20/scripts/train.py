@@ -84,7 +84,7 @@ parser.add_argument("--iterations", type=int, default=None,
                     help="Override the per-stage iteration budget for the selected stages.")
 parser.add_argument("--resume_from", type=str, default=None,
                     help="Checkpoint for the first selected stage. Without it, stage 1 starts "
-                         "from scratch and stages 2-4 continue from the previous stage.")
+                         "from scratch and stages 2-5 continue from the previous stage.")
 parser.add_argument("--run_name", type=str, default=None,
                     help="Sub-directory inside logs/rsl_rl/<experiment>; stages get their own "
                          "sub-sub-directory inside it.")

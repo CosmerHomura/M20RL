@@ -74,6 +74,14 @@ def wheel_obs_cfg() -> SceneEntityCfg:
 
 @configclass
 class VelocityCommandsCfg:
+    """Command sampling term.
+
+    ``ranges`` has to be given explicitly: ``UniformVelocityCommandCfg``
+    declares it as ``MISSING`` (every task that uses the term passes its own),
+    and leaving it out fails ``cfg.validate()`` at ``gym.make`` with
+    "Missing values detected ... commands.base_velocity.ranges".
+    """
+
     base_velocity = commands.MixedVelocityCommandCfg(
         asset_name="robot",
         # Held 2-4 s per the plan: long enough that the policy has to *hold* a
@@ -86,18 +94,17 @@ class VelocityCommandsCfg:
         rel_standing_envs=0.0,     # standing is the 10% zero share instead
         rel_heading_envs=0.0,
         debug_vis=False,
-    )
-
-    def __post_init__(self) -> None:
-        # Stage 1 of the course: zero command, i.e. "stand still". The config
+        # Stage 1 of the course: a zero command, i.e. "stand still". The config
         # carries the *first* stage rather than the widest one so that a bare
         # ``gym.make`` cannot ask an untrained policy for 0.5 m/s on the first
         # step. ``scripts/train.py`` widens these per stage at runtime.
-        ranges = self.base_velocity.ranges
-        ranges.lin_vel_x = (0.0, 0.0)
-        ranges.lin_vel_y = (0.0, 0.0)
-        ranges.ang_vel_z = (0.0, 0.0)
-        ranges.heading = (0.0, 0.0)
+        ranges=commands.MixedVelocityCommandCfg.Ranges(
+            lin_vel_x=(0.0, 0.0),
+            lin_vel_y=(0.0, 0.0),
+            ang_vel_z=(0.0, 0.0),
+            heading=(0.0, 0.0),
+        ),
+    )
 
 
 @configclass
@@ -346,7 +353,7 @@ FULL_COM = {"x": (-0.03, 0.03), "y": (-0.03, 0.03), "z": (-0.02, 0.02)}
 def set_domain_randomization(env_cfg: ManagerBasedRLEnvCfg, enabled: bool) -> bool:
     """Turn the dynamics randomization and the shoves on or off, before gym.make.
 
-    Returns the state actually applied., so the caller can log it. Must be called
+    Returns the state actually applied, so the caller can log it. Must be called
     after the config is built and before the environment exists: the event
     manager deep-copies the term configs at construction.
     """
