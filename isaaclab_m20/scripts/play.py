@@ -34,12 +34,25 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+# Stage directory suffixes, in course order: <run>/stage3_lateral/ ...
+# Kept here as plain data so play.py never imports train.py (which builds an
+# argparse parser and starts the Isaac app at import time).
+STAGE_SLUGS = ("stand", "forward_backward", "lateral", "yaw", "mixed", "static_dynamic")
+
 parser = argparse.ArgumentParser(description="Play a trained M20 policy.")
-parser.add_argument("--task", type=str, default="Isaac-M20-Wheeled-v0")
+parser.add_argument("--task", type=str, default=None,
+                    help="Gym task id. Defaults to the velocity task when --stage is given "
+                         "(stages only exist there), otherwise the standing task.")
 parser.add_argument("--num_envs", type=int, default=16)
 parser.add_argument("--checkpoint", type=str, default=None,
-                    help="Path to model_*.pt. Defaults to the newest checkpoint under "
+                    help="Path to model_*.pt, a stage directory, or a run directory. "
+                         "Defaults to the newest checkpoint under "
                          "<log_root>/<experiment>, where <experiment> is the task's log dir.")
+parser.add_argument("--stage", type=int, default=None,
+                    choices=range(1, len(STAGE_SLUGS) + 1), metavar="{1..6}",
+                    help="Play one curriculum stage instead of the newest model: takes the "
+                         "highest model_*.pt in <log_root>/<experiment>/<newest run>/stageN_*. "
+                         "e.g. --stage 3 to look at the lateral stage.")
 parser.add_argument("--log_root", type=str, default=str(REPO_ROOT / "logs" / "rsl_rl"))
 parser.add_argument("--video", action="store_true", help="Record a video instead of opening the viewer.")
 parser.add_argument("--video_length", type=int, default=500, help="Video length in policy steps.")
@@ -63,6 +76,11 @@ parser.add_argument(
     help="Amount W/S, A/D, Q/E add to the command per key press.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
+if args_cli.task is None:
+    # --stage only exists in the velocity task's curriculum, so it selects the
+    # task too instead of failing on a missing m20_velocity/ stage directory.
+    args_cli.task = ("Isaac-M20-Wheeled-Velocity-v0" if args_cli.stage is not None
+                     else "Isaac-M20-Wheeled-v0")
 if args_cli.video:
     args_cli.enable_cameras = True
 
@@ -82,8 +100,50 @@ import isaaclab_m20.tasks  # noqa: F401 - registers both M20 task ids
 from isaaclab_m20.tasks.m20_env_cfg import fit_viewer_to_grid
 
 
+def iterations(path: Path) -> int:
+    """Iteration number encoded in a model_<n>.pt name (-1 if it has none)."""
+    try:
+        return int(path.stem.split("_")[-1])
+    except ValueError:
+        return -1
+
+
+def newest_run(experiment_dir: Path) -> Path:
+    """Most recently written run directory under <log_root>/<experiment>."""
+    runs = [path for path in experiment_dir.iterdir() if path.is_dir()] \
+        if experiment_dir.is_dir() else []
+    if not runs:
+        raise FileNotFoundError(f"No run directories under {experiment_dir}")
+    return max(runs, key=lambda path: path.stat().st_mtime)
+
+
+def resolve_stage_checkpoint(experiment_name: str, stage: int) -> Path:
+    """Checkpoint of one curriculum stage of the newest run.
+
+    ``--stage 3`` means "<newest run>/stage3_lateral/model_<highest>.pt", which is
+    the model that stage ended on -- the loop is "train a stage, look at it,
+    decide", and looking at it should not require reading the directory listing
+    to find out which iteration number the stage stopped at.
+    """
+    experiment_dir = Path(args_cli.log_root) / experiment_name
+    run_dir = newest_run(experiment_dir)
+    if stage < 1 or stage > len(STAGE_SLUGS):
+        raise ValueError(f"--stage must be 1..{len(STAGE_SLUGS)}, got {stage}")
+    stage_dir = run_dir / f"stage{stage}_{STAGE_SLUGS[stage - 1]}"
+    if not stage_dir.is_dir():
+        present = sorted(path.name for path in run_dir.iterdir() if path.is_dir())
+        raise FileNotFoundError(
+            f"No stage {stage} ({stage_dir.name}) in {run_dir}. Present: "
+            f"{', '.join(present) or 'none'}. --stage only applies to the velocity "
+            f"task's curriculum; train that stage first or pass --checkpoint.")
+    candidates = list(stage_dir.rglob("model_*.pt"))
+    if not candidates:
+        raise FileNotFoundError(f"No model_*.pt in {stage_dir}; train that stage first.")
+    return max(candidates, key=iterations)
+
+
 def resolve_checkpoint(experiment_name: str) -> Path:
-    """Return --checkpoint, else the newest model under <log_root>/<experiment_name>.
+    """Return --checkpoint, else --stage, else the newest model of the task.
 
     The search is scoped to the task's experiment directory: standing and
     velocity log to ``m20_wheeled/`` and ``m20_velocity/`` respectively, and
@@ -92,14 +152,26 @@ def resolve_checkpoint(experiment_name: str) -> Path:
     to the velocity env and crash on a shape mismatch.
 
     The velocity run nests its checkpoints one level deeper, one directory per
-    curriculum stage (``<run>/stage6_static_dynamic/model_1000.pt``), so the
+    curriculum stage (``<run>/stage6_static_dynamic/model_4950.pt``), so the
     search is recursive and ordered by modification time: the newest stage wins.
+    The iteration number in those names is cumulative over the whole run, not
+    the stage's own budget -- stage 6 ends around 4950, not 1000.
+
+    ``--checkpoint`` may also be a directory (a stage directory or the run
+    directory), in which case its highest iteration number is used.
     """
     if args_cli.checkpoint:
         path = Path(args_cli.checkpoint).expanduser()
+        if path.is_dir():
+            candidates = list(path.rglob("model_*.pt"))
+            if not candidates:
+                raise FileNotFoundError(f"No model_*.pt under {path}")
+            return max(candidates, key=iterations)
         if not path.is_file():
             raise FileNotFoundError(f"Checkpoint not found: {path}")
         return path
+    if args_cli.stage is not None:
+        return resolve_stage_checkpoint(experiment_name, args_cli.stage)
     run_dir = Path(args_cli.log_root) / experiment_name
     candidates = sorted(run_dir.rglob("model_*.pt"), key=lambda p: p.stat().st_mtime)
     if not candidates:
@@ -200,6 +272,8 @@ def main() -> None:
 
     checkpoint = resolve_checkpoint(agent_cfg.experiment_name)
     print(f"[INFO] Task={args_cli.task}  experiment={agent_cfg.experiment_name}")
+    if args_cli.stage is not None:
+        print(f"[INFO] Stage {args_cli.stage} ({STAGE_SLUGS[args_cli.stage - 1]}) of the newest run")
     print(f"[INFO] Loading {checkpoint}")
 
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)

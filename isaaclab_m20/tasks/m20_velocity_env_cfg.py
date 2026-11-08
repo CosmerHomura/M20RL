@@ -175,31 +175,30 @@ class ObservationsCfg:
 
 @configclass
 class RewardsCfg:
-    """Task terms, attitude, and the static-hold terms.
+    """Task terms, attitude, the hold-still quadratics, then regularisers.
 
     Weights are the plan's; every penalty term returns a positive magnitude and
-    carries its sign here (see the module docstring of ``rewards.py``). The
-    ordering below groups task terms, attitude, static hold, then penalties.
+    carries its sign here (see the module docstring of ``rewards.py``).
 
-    The three masked channels (``lin_vel_xy_standing``, ``yaw_rate_standing``,
-    ``wheel_speed_standing``) are multiplied by ``rewards.standing_mask`` inside
-    the reward functions: they are active for envs whose command is exactly zero
-    (and for every env in stage 1, where the whole range is zero), and contribute
-    nothing to an env that was told to drive. That is what makes "wheel speed must
-    be low" safe here -- unmasked it would be a reward for refusing the command,
-    which is the plan's objection.
+    Three channels are *command-relative quadratics* (``lin_vel_xy_error``,
+    ``yaw_rate_error``, ``wheel_roll_error``): they measure "what the base and
+    wheels are doing minus what was asked", so with a zero command they are a
+    hard brake and with a non-zero command they are a tracking penalty that is
+    zero when the command is followed. They are deliberately **not** masked by
+    ``is_standing_env``: a mask that silently evaluates to zero disables the
+    channel and lets a "stand still" robot creep, which is exactly the failure
+    that showed up in stage 1.
 
-    Their scales are deliberately tight (0.15 m/s, 0.2 rad/s, 2 rad/s): the
-    tracking terms are exp kernels, which are *flat at zero error*, so a
-    zero-command policy that creeps at 0.05 m/s loses only 0.08 of the 2.0
-    tracking channel. Without the quadratics, "stand still" is a task the reward
-    never actually asks for -- which is why stage 1 used to wander.
+    Why quadratics at all when the tracking terms are already there: the exp
+    kernels are flat at zero error (zero gradient), so on their own they never
+    ask for the last 0.1 m/s to go away. ``scale`` is the error that costs 1.0
+    (before the weight): 0.15 m/s, 0.2 rad/s, 0.3 m/s of wheel rolling.
 
-    NOT present, on purpose: an unmasked wheel absolute-speed penalty, a
-    four-wheel-contact term (the trot lifts two legs), and a lateral tyre-slip
+    NOT present, on purpose: an absolute (command-independent) wheel-speed or
+    base-speed penalty -- that is a reward for refusing the command; a
+    four-wheel-contact term (the trot lifts two legs); and a lateral tyre-slip
     penalty (the scrub is how lateral motion happens). There is also no separate
-    ``is_alive`` bonus -- a constant per-step bonus is already implicit in the
-    terms below.
+    ``is_alive`` bonus -- a constant per-step bonus is already implicit below.
     """
 
     # -- task ---------------------------------------------------------------
@@ -217,18 +216,16 @@ class RewardsCfg:
         func=rewards.base_height_exp, weight=0.5,
         params={"target_height": BASE_HEIGHT, "sigma": 0.05})
 
-    # -- static hold (masked to zero-command envs) ---------------------------
-    # These three are what make "command == 0" mean "stay here", not merely
-    # "do not accelerate": the exp tracking kernels are flat at zero error, so
-    # without quadratic terms a standing policy can creep at 0.05-0.1 m/s for
-    # free (2 m per episode) and slowly rotate. The scale is the error that
-    # costs 1.0: 0.15 m/s, 0.2 rad/s, 2 rad/s.
-    lin_vel_xy_standing = RewardTermCfg(
-        func=rewards.lin_vel_xy_l2_standing, weight=-1.0, params={"scale": 0.15})
-    yaw_rate_standing = RewardTermCfg(
-        func=rewards.yaw_rate_standing, weight=-1.0, params={"scale": 0.2})
-    wheel_speed_standing = RewardTermCfg(
-        func=rewards.wheel_speed_l2_standing, weight=-0.5, params={"scale": 2.0})
+    # -- hold still: command-relative quadratics -----------------------------
+    # These are what make "command == 0" mean "stay here", not merely "do not
+    # accelerate". No mask, so they also hold when the command term never flags
+    # an env as standing.
+    lin_vel_xy_error = RewardTermCfg(
+        func=rewards.lin_vel_xy_l2_error, weight=-1.0, params={"scale": 0.15})
+    yaw_rate_error = RewardTermCfg(
+        func=rewards.yaw_rate_l2_error, weight=-0.5, params={"scale": 0.2})
+    wheel_roll_error = RewardTermCfg(
+        func=rewards.wheel_roll_l2_error, weight=-0.5, params={"scale": 0.3})
 
     # -- posture and smoothness ----------------------------------------------
     joint_deviation = RewardTermCfg(
@@ -411,7 +408,7 @@ def set_domain_randomization(env_cfg: ManagerBasedRLEnvCfg, enabled: bool) -> bo
 
 @configclass
 class M20WheeledVelocityEnvCfg(ManagerBasedRLEnvCfg):
-    scene: M20SceneCfg = M20SceneCfg(num_envs=512, env_spacing=2.5)
+    scene: M20SceneCfg = M20SceneCfg(num_envs=4096, env_spacing=2.5)
     commands: VelocityCommandsCfg = VelocityCommandsCfg()
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()

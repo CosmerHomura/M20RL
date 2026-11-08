@@ -70,8 +70,8 @@ class M20VelocityRslRlPpoRunnerCfg(M20RslRlPpoRunnerCfg):
     * lr 3e-4 instead of 1e-3 -- 1e-3 is a fine rate for a single static pose and
       a fast way to blow up a 6-stage course, where each stage starts from the
       previous stage's weights.
-    * 8 mini-batches instead of 4 -- with 1024 envs x 24 steps = 24576 transitions
-      per iteration, 8 batches is 3072 samples per update, which keeps each PPO
+    * 8 mini-batches instead of 4 -- with 4096 envs x 24 steps = 98304 transitions
+      per iteration, 8 batches is 12288 samples per update, which keeps each PPO
       update small enough for ``desired_kl = 0.01`` to actually bind.
     * entropy 0.005 instead of 0.01 -- halved with the lower learning rate; the
       standing task needs exploration around one pose, the velocity task needs to

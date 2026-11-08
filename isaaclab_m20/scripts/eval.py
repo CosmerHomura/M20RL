@@ -36,9 +36,16 @@ same threshold.
 
 Usage::
 
-    python -m isaaclab_m20.scripts.eval --checkpoint logs/rsl_rl/m20_velocity/<run>/stage6_static_dynamic/model_1000.pt
+    python -m isaaclab_m20.scripts.eval --stage 6        # that stage of the newest run
+    python -m isaaclab_m20.scripts.eval --stage 3        # look at one stage on its own
+    python -m isaaclab_m20.scripts.eval --checkpoint logs/rsl_rl/m20_velocity/<run>/stage6_static_dynamic
     python -m isaaclab_m20.scripts.eval            # newest checkpoint of the newest run
     python -m isaaclab_m20.scripts.eval --seconds 10 --num_envs 32 --strict
+
+``--checkpoint`` takes a ``model_*.pt`` file or a directory (stage or run); the
+file names carry the cumulative iteration count, so stage 6 ends around 4950.
+``--stage N`` picks the highest checkpoint of ``<newest run>/stageN_*`` instead,
+which is the "check this stage before spending the next one" entry point.
 """
 from __future__ import annotations
 
@@ -58,11 +65,18 @@ if str(REPO_ROOT) not in sys.path:
 VELOCITY_TASK = "Isaac-M20-Wheeled-Velocity-v0"
 POLICY_DT = 0.02          # 50 Hz
 
+# Course order of the stage directory suffixes: <run>/stage3_lateral/ ...
+STAGE_SLUGS = ("stand", "forward_backward", "lateral", "yaw", "mixed", "static_dynamic")
+
 parser = argparse.ArgumentParser(description="Fixed-command acceptance test for M20.")
 parser.add_argument("--task", type=str, default=VELOCITY_TASK)
 parser.add_argument("--checkpoint", type=str, default=None,
-                    help="Path to a model_*.pt. Default: newest checkpoint of the newest run "
-                         "under logs/rsl_rl/m20_velocity.")
+                    help="Path to a model_*.pt, a stage directory, or a run directory. Default: "
+                         "newest checkpoint of the newest run under logs/rsl_rl/m20_velocity.")
+parser.add_argument("--stage", type=int, default=None,
+                    choices=range(1, len(STAGE_SLUGS) + 1), metavar="{1..6}",
+                    help="Evaluate one curriculum stage (highest model_*.pt in "
+                         "<newest run>/stageN_*) instead of the newest model overall.")
 parser.add_argument("--num_envs", type=int, default=16)
 parser.add_argument("--seconds", type=float, default=8.0,
                     help="Duration of each test, after the settle time.")
@@ -128,19 +142,47 @@ MAX_SWITCH_GO_RMSE = 0.12   # m/s, speed error in the measured part of a "go" ph
 MAX_SWITCH_STOP_SPEED = 0.08  # m/s, residual speed once a "stop" phase has settled
 
 
+def resolve_stage_dir(experiment_dir: Path, stage: int) -> Path:
+    """``<newest run>/stageN_*`` of the experiment, for ``--stage``."""
+    runs = [path for path in experiment_dir.iterdir() if path.is_dir()] \
+        if experiment_dir.is_dir() else []
+    if not runs:
+        raise FileNotFoundError(f"No run directories under {experiment_dir}")
+    run_dir = max(runs, key=lambda path: path.stat().st_mtime)
+    stage_dir = run_dir / f"stage{stage}_{STAGE_SLUGS[stage - 1]}"
+    if not stage_dir.is_dir():
+        present = sorted(path.name for path in run_dir.iterdir() if path.is_dir())
+        raise FileNotFoundError(
+            f"No stage {stage} ({stage_dir.name}) in {run_dir}. Present: "
+            f"{', '.join(present) or 'none'}")
+    return stage_dir
+
+
 def resolve_checkpoint(log_root: Path, explicit: str | None) -> Path:
-    """Newest checkpoint of the newest run, unless one is given explicitly."""
-    if explicit:
-        path = Path(explicit)
-        if not path.exists():
-            raise FileNotFoundError(f"Checkpoint not found: {path}")
-        return path
+    """Newest checkpoint of the newest run, unless one is given explicitly.
+
+    ``explicit`` may be a ``model_*.pt`` file, a stage directory, or the whole
+    run directory: pointing at a directory takes its highest iteration number,
+    so ``--checkpoint logs/rsl_rl/m20_velocity/m20_v1/stage6_static_dynamic``
+    works without spelling out which ``model_<n>.pt`` that stage ended on.
+    """
 
     def iterations(path: Path) -> int:
         try:
             return int(path.stem.split("_")[-1])
         except ValueError:
             return -1
+
+    if explicit:
+        path = Path(explicit)
+        if path.is_dir():
+            candidates = list(path.rglob("model_*.pt"))
+            if not candidates:
+                raise FileNotFoundError(f"No model_*.pt under {path}")
+            return max(candidates, key=iterations)
+        if not path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {path}")
+        return path
 
     runs = [p for p in log_root.glob("*") if p.is_dir()]
     if not runs:
@@ -388,8 +430,12 @@ def main() -> None:
     agent_cfg.seed = args_cli.seed
     agent_cfg.device = args_cli.device
 
+    explicit = args_cli.checkpoint
+    if explicit is None and args_cli.stage is not None:
+        explicit = str(resolve_stage_dir(Path(args_cli.log_root) / agent_cfg.experiment_name,
+                                         args_cli.stage))
     checkpoint = resolve_checkpoint(Path(args_cli.log_root) / agent_cfg.experiment_name,
-                                    args_cli.checkpoint)
+                                    explicit)
     print(f"[INFO] Checkpoint: {checkpoint}")
 
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode=None)

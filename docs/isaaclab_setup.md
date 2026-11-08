@@ -1,6 +1,6 @@
 # Isaac Lab 训练（云端 4090）
 
-训练在 Isaac Lab + rsl_rl 上跑，重点利用**并行环境数**：站立任务在 4090 上可以开 4096 个环境；速度指令任务因为观测/网络更大、还要留显存给 PPO 更新，从 512 起步、稳定后 1024。
+训练在 Isaac Lab + rsl_rl 上跑，重点利用**并行环境数**：两个任务默认都是 **4096 环境**，4090 24 GB 直接跑满，一般不需要传 `--num_envs`。
 
 资产来自 Deep Robotics 官方仓库 [DeepRoboticsLab/deep_robotics_model](https://github.com/DeepRoboticsLab/deep_robotics_model/tree/main/M20)：
 
@@ -36,7 +36,7 @@ isaaclab_m20/
 | 系统 | Ubuntu 22.04（推荐）/ 24.04 |
 | 驱动 | 580.65 以上（Isaac Sim 5.x）；`nvidia-smi` 确认 |
 | Python | 3.11（IsaacLab 2.3.2 对应 Isaac Sim 5.x） |
-| 显存 | ≥ 16 GB（4090 24 GB：站立任务 4096 环境没问题，速度指令任务建议 512–1024） |
+| 显存 | ≥ 16 GB（4090 24 GB：两个任务都用默认 4096 环境没问题；16 GB 降到 2048） |
 | 内存 | ≥ 32 GB |
 | 磁盘 | ≥ 20 GB（Isaac Sim wheels 本身就有十几 GB） |
 
@@ -120,26 +120,27 @@ python -m isaaclab_m20.scripts.check_m20 --headless
 
 ```bash
 tmux new -s m20
-# 站立任务（4096 环境，模型很小，24 GB 卡放得下）
-python -m isaaclab_m20.scripts.train --headless --num_envs 4096
+# 站立任务（默认 4096 环境，模型很小，24 GB 卡放得下）
+python -m isaaclab_m20.scripts.train --headless
 
-# 速度指令任务：6 阶段课程 + 阶段间续训（512 起步，稳定后改 1024）
-python -m isaaclab_m20.scripts.train --headless --num_envs 512 --run_name m20_v1
+# 速度指令任务：6 阶段课程 + 阶段间续训（同样默认 4096 环境）
+python -m isaaclab_m20.scripts.train --headless --run_name m20_v1
 
 # 推荐：一次一个阶段，跑完进模拟器看完再决定下一步
-python -m isaaclab_m20.scripts.train --headless --num_envs 512 --stage 1 --run_name m20_v1
+python -m isaaclab_m20.scripts.train --headless --stage 1 --run_name m20_v1
 ```
 
 - 站立任务每个 iteration 采集 4096 × 24 = 98,304 步；默认跑 3000 iterations。
-- 速度指令任务每个 iteration 采集 512 × 24 = 12,288 步（1024 环境翻倍），6 阶段合计 4950 iterations。
+- 速度指令任务每个 iteration 也是 4096 × 24 = 98,304 步，6 阶段合计 4950 iterations（≈4.87 亿条转移）。
 - 日志：`logs/rsl_rl/m20_wheeled/<时间戳>/`（站立，每 100 iterations 存一个 checkpoint）；速度指令任务按阶段分目录，`logs/rsl_rl/m20_velocity/<run_name>/stage{N}_<name>/`，每阶段每 50 iterations 存一个 `model_*.pt`。
 - 想给这次实验起名：`--run_name v1`，日志就落在 `logs/rsl_rl/m20_velocity/v1/`。
-- 显存不够就降 `--num_envs`。**训练期间只跑一个 Isaac Lab 进程**——两个进程抢同一张卡的表现是帧率崩到个位数，而不是干脆的 OOM。
-- 断点续训：站立任务 `--resume --run_name v1`（加载该目录下最新 checkpoint）；速度指令任务默认每阶段自动从上一阶段最新 checkpoint 续训，也可 `--stage 3 --resume_from <path>` 手指定。`--stage N` 不给 `--run_name` 时会自动沿用最新 run 目录。
-- 每阶段轮数都是参数：`--iters_stage1 … --iters_stage6`；`--iterations` 给所有选中阶段同一个值；`--stage_scale` 按比例整体缩。
-- 只想确认流程能通：`--stage 1 --iters_stage1 20 --num_envs 128`（约一分钟）。
+- 显存不够就降 `--num_envs`（16 GB 用 2048）。**训练期间只跑一个 Isaac Lab 进程**——两个进程抢同一张卡的表现是帧率崩到个位数，而不是干脆的 OOM。
+- 断点续训：站立任务 `--resume --run_name v1`（加载该目录下最新 checkpoint）；速度指令任务默认每阶段自动从上一阶段**最新的** checkpoint 续训，也可 `--stage 3 --resume_from <path>` 手指定。`--stage N` 不给 `--run_name` 时会自动沿用最新 run 目录。
+- 同一阶段重训默认**覆盖**：开训前清空该阶段目录（否则上一次更高迭代号的 `model_*.pt` 会被当成这次的结果）。要保留旧结果对比加 `--new_run`（另开时间戳目录），要原地追加加 `--keep_logs`。
+- 每阶段轮数都是参数：单阶段训练直接写 `--stage 2 --iterations 1200`（`--stage` 已选定一个阶段，`--iters_stageN` 是同一件事，多余）；`--iters_stage1 … --iters_stage6` 只在 `--stage all` 跑整套课程时才用；`--stage_scale` 按比例整体缩。
+- 只想确认流程能通：`--stage 1 --iterations 20 --num_envs 128`（约一分钟）。
 
-粗略预期（4090，单场景，无相机）：站立任务 3000 iterations 几小时量级；速度指令任务 1024 环境下约 20–30 min / 1000 iterations，整条 6 阶段课程通常 3–5 小时。
+粗略预期（4090，单场景，无相机）：4096 环境下每 1000 iterations 是小时以内量级，整条 6 阶段课程通常几小时；具体耗时看 tensorboard 的 `fps` 和每阶段结束打印的 `finished in ... min`，基本随 `--num_envs` 线性变化。
 
 ### 看曲线
 
@@ -160,10 +161,15 @@ tensorboard --logdir logs/rsl_rl --bind_all --port 6006
 # 最新 checkpoint，16 个环境（默认站立任务，自动找 m20_wheeled/ 下最新）
 python -m isaaclab_m20.scripts.play --num_envs 16
 
-# 指定 checkpoint
+# 指定 checkpoint（文件、阶段目录、run 目录都可以）
 python -m isaaclab_m20.scripts.play \
     --checkpoint logs/rsl_rl/m20_wheeled/v1/checkpoints/model_2000.pt \
     --num_envs 16
+
+# 速度指令任务：看某一阶段的模型（--stage N 取最新 run 里 stageN_* 的最新 checkpoint；
+# 给了 --stage 就自动选速度任务，不用再写 --task）
+python -m isaaclab_m20.scripts.play --stage 3
+# 阶段编号：1 站稳 / 2 前后 / 3 左右 / 4 偏航 / 5 混合 / 6 静止↔运动切换
 
 # 无界面录制视频
 python -m isaaclab_m20.scripts.play --headless --video
@@ -171,7 +177,7 @@ python -m isaaclab_m20.scripts.play --headless --video
 
 `play.py` 加载 checkpoint 后就地站立推演，视频写到 `videos/`，`--video_length` 是策略步数（50 Hz，500 步 = 10 s）。
 
-`--task` 决定加载哪个任务的模型：不传 `--checkpoint` 时，脚本在 `logs/rsl_rl/<experiment>/` 下自动找最新 checkpoint——站立是 `m20_wheeled/`、速度指令是 `m20_velocity/`，两个目录的 checkpoint 维度不同（57 vs 56），按目录隔离就不会串。速度指令任务的 checkpoint 按阶段多一层目录（`.../stage6_static_dynamic/model_1000.pt`），脚本递归查找、按修改时间取最新，所以默认拿到的就是最后一阶段的最新模型。
+`--task` 决定加载哪个任务的模型：不传 `--checkpoint` 时，脚本在 `logs/rsl_rl/<experiment>/` 下自动找最新 checkpoint——站立是 `m20_wheeled/`、速度指令是 `m20_velocity/`，两个目录的 checkpoint 维度不同（57 vs 56），按目录隔离就不会串。速度指令任务的 checkpoint 按阶段多一层目录（`.../stage6_static_dynamic/model_4950.pt`），给 `--stage N` 就直接定位到第 N 阶段、取其中迭代号最大的那个，不用去目录里翻这一阶段停在哪一轮；不给则递归查找、按修改时间取最新，拿到的是最后一阶段的最新模型。文件名里的数字是**累计**迭代数（rsl_rl 原有的 -1 已修正），所以阶段 6 的文件不叫 1000 而叫 4950 左右。
 
 ### 推一把试试
 
@@ -213,8 +219,9 @@ python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0 \
 python -m isaaclab_m20.scripts.eval
 
 # 指定 checkpoint，结果同时写 JSON，任一项不过就返回非零退出码
+#（文件名 = 累计迭代数，阶段 6 结束时约 4950；也可以只给目录，脚本自己取最新）
 python -m isaaclab_m20.scripts.eval \
-    --checkpoint logs/rsl_rl/m20_velocity/m20_v1/stage6_static_dynamic/model_1000.pt \
+    --checkpoint logs/rsl_rl/m20_velocity/m20_v1/stage6_static_dynamic/model_4950.pt \
     --json_out eval.json --strict
 ```
 
@@ -248,7 +255,7 @@ eval 会强制**关掉域随机化、关掉指令重采样**，机器人是标�
 | PD 伺服 | 腿 kp=80 / kd=2，轮 kp=0 / kd=2，200 Hz |
 | 力矩上限 | 腿 76.4 N·m，轮 21.6 N·m |
 | 指令（速度指令任务） | 机体系 `(vx, vy, ωz)`，每 2–4 s 重采样；50% 单轴 / 30% 双轴 / 10% 三轴 / 10% 零指令；6 阶段课程，满幅 vx ±0.5、vy ±0.2、ωz ±0.8；最后阶段零指令 35%、保持 1.5–3 s |
-| 奖励 | 站立 14 项 / 速度指令 **13 项 + 摔倒 −200**（其中 3 项只在零指令时生效；不做无掩码的轮速惩罚、不强制四轮着地、不惩罚横向滑移），完整权重表见 [docs/algorithm.md](algorithm.md) §1 与 §6.3 |
+| 奖励 | 站立 14 项 / 速度指令 **13 项 + 摔倒 −200**（其中 3 项是指令相对的二次项：零指令即驻车刹车，非零指令只惩罚跟踪误差；不做与指令无关的绝对速度惩罚、不强制四轮着地、不惩罚横向滑移），完整权重表见 [docs/algorithm.md](algorithm.md) §1 与 §6.3 |
 | 终止 | 站立：高度 < 0.25、倾角 > 0.7、超时；速度指令：高度 < 0.28、倾角 > 0.8、超时 |
 | 域随机化 | 站立全开（带 `--dr_ramp` 课程）；速度指令第一版**默认关闭**，`--dr full` 打开 |
 

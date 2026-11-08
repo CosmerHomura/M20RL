@@ -52,39 +52,50 @@ isaaclab_m20/
 # 1. 从官方 URDF 导入一次训练 USD，然后验证（16 个关节、总质量 ≈38.5 kg）
 python -m isaaclab_m20.scripts.check_m20 --headless --convert urdf
 
-# 2. 训练静态站立（4096 环境，模型很小）
-python -m isaaclab_m20.scripts.train --headless --num_envs 4096
+# 2. 训练静态站立（默认 4096 环境，模型很小）
+python -m isaaclab_m20.scripts.train --headless
 
 # 3. 播放站立策略（加载最新 checkpoint，16 个环境）。视口里 P 推一下，R 重置
 python -m isaaclab_m20.scripts.play --num_envs 16
 
-# 4. 训练速度指令任务：6 阶段课程，512 环境起步，阶段间自动续训
-python -m isaaclab_m20.scripts.train --headless --num_envs 512 --run_name m20_v1
+# 4. 训练速度指令任务：6 阶段课程，阶段间自动续训（默认 4096 环境，不用传 --num_envs）
+python -m isaaclab_m20.scripts.train --headless --run_name m20_v1
 
 # 5. 推荐流程：一次只跑一个阶段，跑完进模拟器看，再决定下一步。
-#    --stage N 会自动从同一次 run 里第 N-1 阶段的最新 checkpoint 续训。
-python -m isaaclab_m20.scripts.train --headless --num_envs 512 --stage 1 --run_name m20_v1
-#（看完 play/eval 之后）
-python -m isaaclab_m20.scripts.train --headless --num_envs 512 --stage 2 --run_name m20_v1
+#    --stage N 自动接上一阶段：从同一次 run 里第 N-1 阶段的最新 checkpoint 续训。
+#    重新训练同一阶段＝覆盖该阶段目录（旧的 model_*.pt 先清掉，避免更高迭代号被当成
+#    本阶段结果）。想保留上一次的对比就加 --new_run 另开一个时间戳目录；
+#    --keep_logs 则原地保留旧文件。
+#    checkpoint 文件名 = 训练结束时已完成的累计迭代数（rsl_rl 原本会少 1，这里改掉了）。
+python -m isaaclab_m20.scripts.train --headless --stage 1 --run_name m20_v1
 
-# 6. 每个阶段的轮数都是参数：--iters_stage1 … --iters_stage6
-python -m isaaclab_m20.scripts.train --headless --num_envs 512 --stage 2 \
-    --run_name m20_v1 --iters_stage2 1200
+# 6. 只看某个阶段的模型：play 加 --stage N，取最新 run 里 stageN_* 的最新 checkpoint。
+#    阶段编号：1 站稳 / 2 前后 / 3 左右 / 4 偏航 / 5 混合 / 6 静止↔运动切换
+#    （--stage 只在速度任务里有，所以给了它就自动选速度任务，不用再写 --task）
+python -m isaaclab_m20.scripts.play --stage 1
+# 看完再训下一段（这段从上面 stage 1 的最新模型继续）
+python -m isaaclab_m20.scripts.train --headless --stage 2 --run_name m20_v1
+python -m isaaclab_m20.scripts.play --stage 2
 
-# 7. 冒烟测试：第 1 阶段只跑 20 轮（约 1 分钟）
-python -m isaaclab_m20.scripts.train --headless --num_envs 128 --stage 1 --iters_stage1 20
+# 7. 每个阶段的轮数都是参数：单阶段直接给 --iterations
+python -m isaaclab_m20.scripts.train --headless --stage 2 \
+    --run_name m20_v1 --iterations 1200
+#    （--iters_stage1 … --iters_stage6 只在 --stage all 跑整套课程时才用）
 
-# 8. 播放速度指令策略。W/S = vx，A/D = vy，Q/E = 偏航角速度，空格清零
+# 8. 冒烟测试：第 1 阶段只跑 20 轮（约 1 分钟）
+python -m isaaclab_m20.scripts.train --headless --num_envs 128 --stage 1 --iterations 20
+
+# 9. 播放速度指令策略。W/S = vx，A/D = vy，Q/E = 偏航角速度，空格清零
 python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0
 
-# 9. 固定指令 + 无界面出视频
-python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0 \
-    --cmd_vx 0.3 --cmd_wz 0.3 --headless --video
+# 10. 固定指令 + 无界面出视频（--stage 也能和它们一起用，给了 --stage 就不用写 --task）
+python -m isaaclab_m20.scripts.play --stage 5 --cmd_vx 0.3 --cmd_wz 0.3 \
+    --headless --video
 
-# 10. 验收：9 组固定指令 + 1 组起步/停下切换，输出 RMSE / 倾角 / 摔倒率 / PASS-FAIL
-python -m isaaclab_m20.scripts.eval
+# 11. 验收：9 组固定指令 + 1 组起步/停下切换，输出 RMSE / 倾角 / 摔倒率 / PASS-FAIL
+python -m isaaclab_m20.scripts.eval --stage 6
 
-# 11. 曲线
+# 12. 曲线
 tensorboard --logdir logs/rsl_rl --bind_all --port 6006
 ```
 
@@ -99,7 +110,7 @@ tensorboard --logdir logs/rsl_rl --bind_all --port 6006
 - **观测 56 维**：`base_ang_vel(3) + projected_gravity(3) + base_lin_vel(3) + 腿关节位置偏差(12) + 腿关节速度(12) + 车轮角速度(4) + 指令(3) + last_action(16)`。线速度和指令都在**机体系**，训练/播放/部署必须同一个坐标系。
 - **动作 16 维** ∈ [-1, 1]，都是**目标值**：腿 12 维 `q* = q_default + 0.25·a`（rad），轮 4 维 `ω* = 8.0·a`（rad/s，轮半径 0.09 m → 0.72 m/s 上限）。
 - **指令**：机体系 `(vx, vy, ωz)`，每 2–4 s 重采样，混合采样 50% 单轴 / 30% 双轴 / 10% 三轴 / 10% 零指令。
-- **奖励 13 项**：任务项 `track_lin_vel_xy +2.0`（σ 0.25）、`track_ang_vel_z +1.0`（σ 0.3）、`base_height +0.5`（0.50 m，σ 0.05）、`flat_orientation −0.5`（姿态**平方**惩罚，σ 0.2）；**零指令掩码项**（只在指令为 0 的环境生效）`lin_vel_xy_standing −1.0`（0.15 m/s）、`yaw_rate_standing −1.0`（0.2 rad/s）、`wheel_speed_standing −0.5`（2 rad/s）；正则项 `joint_deviation −0.2`、`joint_vel_legs −0.02`、`wheel_slip −0.1`、`action_rate −0.01`、`joint_torques −0.005`、`ang_vel_xy −0.05`；摔倒终止 −200。**不做无掩码的车轮转速惩罚、不强制四轮着地、不惩罚横向滑移。** 掩码项尺度紧是有原因的：`exp` 跟踪核在误差为零处梯度为零，没有这组二次项，零指令时 0.05 m/s 的蠕动只花 0.02/步，机器人会自己溜达出去。
+- **奖励 13 项**：任务项 `track_lin_vel_xy +2.0`（σ 0.25，exp）、`track_ang_vel_z +1.0`（σ 0.3，exp）、`base_height +0.5`（0.50 m，σ 0.05）、`flat_orientation −0.5`（姿态**平方**惩罚，σ 0.2）；**指令相对的二次项**（零指令时就是驻车刹车，非零指令时只惩罚跟踪误差）`lin_vel_xy_error −1.0`（0.15 m/s）、`yaw_rate_error −0.5`（0.2 rad/s）、`wheel_roll_error −0.5`（0.3 m/s 滚动速度）；正则项 `joint_deviation −0.2`、`joint_vel_legs −0.02`、`wheel_slip −0.1`、`action_rate −0.01`、`joint_torques −0.005`、`ang_vel_xy −0.05`；摔倒终止 −200。**不做与指令无关的绝对速度惩罚、不强制四轮着地、不惩罚横向滑移。** 那三个二次项是必需的：`exp` 跟踪核在误差为零处梯度为零，没有它们，零指令时 0.05 m/s 的蠕动几乎不花钱，机器人会自己溜达出去。
 - **终止**：高度 < 0.28 m、倾角 > 0.8 rad、超时 20 s。
 - **课程 6 阶段**（合计 4950 iterations，每阶段内有线性 warmup）：零指令站稳（300）→ 前进/后退 `vx ±0.4`（700）→ 加横移 `vy ±0.2`（1000）→ 加偏航 `ωz ±0.6`（700）→ 三维混合 `vx ±0.5 / vy ±0.2 / ωz ±0.8`（1250）→ **静止↔运动切换**（1000，同样的指令范围，但零指令占 35%、每条指令只保持 1.5–3 s）。每个轴先单独学会，再与其它轴叠加，最后练"起步—停下—换向"。
 - **域随机化默认关闭**（摩擦 1.0、质量/质心固定、无推力），`--dr full` 打开。
@@ -108,12 +119,16 @@ tensorboard --logdir logs/rsl_rl --bind_all --port 6006
 
 ## 显存与环境数
 
-| 显存 | 速度指令任务起步 | 可试 |
-| --- | --- | --- |
-| 16 GB | 128 | 256 |
-| 24 GB | 512 | 1024 |
-| 48 GB | 1024 | 2048–4096 |
-| 80 GB | 2048 | 4096+ |
+两个任务默认都是 **4096 环境**（`--num_envs` 不传就用这个值），4090 24 GB 跑满没问题：
+
+| 显存 | 建议环境数 |
+| --- | --- |
+| 16 GB | 2048 |
+| 24 GB | **4096（默认）** |
+| 48 GB | 4096–8192 |
+| 80 GB | 8192+ |
+
+只有在显存更小或只是冒烟测试时才需要传 `--num_envs`。
 
 **训练期间只跑一个 Isaac Lab 进程。** 两个进程抢同一张卡的表现是帧率崩到个位数，而不是干脆的 OOM。
 
@@ -127,6 +142,7 @@ tensorboard --logdir logs/rsl_rl --bind_all --port 6006
 | 观测拆分项（腿/轮/指令） | `isaaclab_m20/tasks/observations.py` |
 | 指令混合采样比例 | `isaaclab_m20/tasks/commands.py` |
 | 课程阶段、轮数、warmup、续训逻辑（含最后一阶段的零指令占比/保持时间） | `isaaclab_m20/scripts/train.py`（`STAGES`） |
+| 重训同一阶段时覆盖还是另开目录 | `--new_run` 另开时间戳目录、`--keep_logs` 原地保留旧文件；**默认覆盖该阶段目录** |
 | 验收阈值与测试指令 | `isaaclab_m20/scripts/eval.py` |
 | PPO 超参 | `isaaclab_m20/tasks/agents/rsl_rl_ppo_cfg.py` |
 | PD 增益、力矩上限、默认姿态 | `isaaclab_m20/assets/m20.py` |

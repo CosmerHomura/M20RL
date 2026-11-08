@@ -40,28 +40,44 @@ that axis is interpolated from zero up to its target width over 150-250
 iterations, instead of appearing at full width on the first step. Stage 6 has no
 warmup: its ranges are stage 5's, only the sampling distribution changes.
 
+Two log-directory rules, both about the "train a stage, look at it, decide"
+loop:
+
+* Retraining a stage overwrites it. A single ``--stage N`` reuses the newest run
+  of the experiment and clears that stage's directory first, so a second
+  attempt at stage 2 replaces the first instead of leaving two sets of
+  checkpoints whose iteration numbers disagree. ``--new_run`` keeps the earlier
+  attempt as a separate timestamped run instead, and ``--keep_logs`` appends to
+  the existing stage directory.
+* A stage starts from the previous stage's newest checkpoint in the same run.
+  That is what makes the loop safe to interrupt: stage N+1 picks up whatever
+  stage N actually produced, and ``--resume_from`` overrides it for one run.
+
 Example runs::
 
-    # the whole course in one process, 512 envs
+    # the whole course in one process, 4096 envs (the default)
     python -m isaaclab_m20.scripts.train
 
     # one stage at a time -- the recommended loop: train, look at the result in
     # the simulator (play / eval), decide, then spend the next stage's budget.
-    # --stage N automatically continues from stage N-1's latest checkpoint.
+    # --stage N automatically continues from stage N-1's latest checkpoint, and
+    # --iterations is how long to train it (--iters_stageN means the same thing
+    # here, so don't pass both).
     python -m isaaclab_m20.scripts.train --stage 1
     python -m isaaclab_m20.scripts.train --stage 2
-    python -m isaaclab_m20.scripts.train --stage 2 --iters_stage2 1200
+    python -m isaaclab_m20.scripts.train --stage 2 --iterations 1200
 
-    # every stage length is a parameter: --iters_stage1 ... --iters_stage6
+    # --stage all runs the six stages back to back; only then do per-stage
+    # budgets differ, and that is what --iters_stageN is for
     python -m isaaclab_m20.scripts.train --stage all --iters_stage1 200 \
         --iters_stage2 600 --iters_stage3 900 --iters_stage4 600 \
         --iters_stage5 1000 --iters_stage6 800
 
-    # 1024 envs once 512 is stable
-    python -m isaaclab_m20.scripts.train --num_envs 1024
+    # fewer envs only when the GPU is smaller than 24 GB, or for a smoke test
+    python -m isaaclab_m20.scripts.train --num_envs 128
 
     # smoke test: 20 iterations of the standing stage, about a minute
-    python -m isaaclab_m20.scripts.train --stage 1 --iters_stage1 20
+    python -m isaaclab_m20.scripts.train --stage 1 --iterations 20 --num_envs 128
 
 The legacy standing task (``Isaac-M20-Wheeled-v0``) has no command term, so for
 it this script runs a single plain run, as before.
@@ -71,6 +87,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import os
+import shutil
 import sys
 import time
 from dataclasses import dataclass
@@ -140,11 +157,25 @@ def stage_by_number(number: int) -> Stage:
     return STAGES[number - 1]
 
 
+def stage_label(number: int, stage: Stage) -> str:
+    """Checkpoint directory for a stage, e.g. ``stage3_lateral``.
+
+    The number is part of the directory name because the course order is what
+    makes the checkpoints comparable, and it is spelled out here (one place)
+    because the log tree, the resume lookup, and the docs must agree -- they did
+    not, and "find the checkpoint under stage1_stand" pointed at a directory
+    that was written as ``1_stand``.
+    """
+    _, _, slug = stage.name.partition("_")
+    return f"stage{number}_{slug or stage.name}"
+
+
 parser = argparse.ArgumentParser(description="Train M20 wheeled locomotion with rsl_rl.")
 parser.add_argument("--task", type=str, default=VELOCITY_TASK)
 parser.add_argument("--num_envs", type=int, default=None,
-                    help="Override the number of environments (velocity task: 512 to start, "
-                         "1024 once that is stable).")
+                    help="Override the number of environments. Both tasks default to 4096, "
+                         "which a 24 GB card runs comfortably; drop it (e.g. 128) only for a "
+                         "smoke test.")
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--stage", type=str, default="all",
                     help=f"Velocity task: which course stage to run "
@@ -154,19 +185,32 @@ parser.add_argument("--stage", type=str, default="all",
 parser.add_argument("--stage_scale", type=float, default=1.0,
                     help="Multiply every stage's iteration budget (e.g. 0.05 for a smoke test).")
 parser.add_argument("--iterations", type=int, default=None,
-                    help="Override the iteration budget of every selected stage. "
-                         "Prefer --iters_stageN when you want different lengths per stage.")
+                    help="Iteration budget for the stage(s) being run. With a single "
+                         "--stage this is the normal way to say how long to train it "
+                         "(--stage 2 --iterations 1200). --iters_stageN is for --stage all, "
+                         "where several stages run back to back with different budgets.")
 for _number, _course_stage in enumerate(STAGES, start=1):
     parser.add_argument(
         f"--iters_stage{_number}", type=int, default=None,
-        help=f"Iterations for stage {_number} ({_course_stage.name}); "
-             f"default {_course_stage.iterations} x --stage_scale.")
+        help=f"Iterations for stage {_number} ({_course_stage.name}) inside a --stage all "
+             f"run; default {_course_stage.iterations} x --stage_scale. When you run that "
+             f"stage alone, --iterations does the same job more directly.")
 parser.add_argument("--resume_from", type=str, default=None,
                     help="Checkpoint for the first selected stage. Without it, stage 1 starts "
-                         "from scratch and stages 2-5 continue from the previous stage.")
+                         "from scratch and stages 2-6 continue from the previous stage.")
 parser.add_argument("--run_name", type=str, default=None,
                     help="Sub-directory inside logs/rsl_rl/<experiment>; stages get their own "
-                         "sub-sub-directory inside it.")
+                         "sub-sub-directory inside it. Without it a single --stage reuses the "
+                         "newest run of that experiment, so re-running a stage retrains (and "
+                         "overwrites) that stage in place.")
+parser.add_argument("--new_run", action="store_true",
+                    help="Start a new timestamped run directory instead of reusing the newest "
+                         "one. Use this to keep an earlier attempt of the same stage for "
+                         "comparison; without it, the same --stage overwrites that stage.")
+parser.add_argument("--keep_logs", action="store_true",
+                    help="Keep an existing stage directory when retraining it. Off by default: "
+                         "stale model_<iter>.pt files from the previous attempt would otherwise "
+                         "be picked up as this stage's result and as stage N+1's starting point.")
 parser.add_argument("--log_root", type=str, default=str(REPO_ROOT / "logs" / "rsl_rl"))
 parser.add_argument("--video", action="store_true", help="Record a video of the first iteration.")
 parser.add_argument("--video_length", type=int, default=200, help="Video length in policy steps.")
@@ -496,6 +540,40 @@ def latest_run_dir(experiment_dir: Path) -> Path | None:
     return max(runs, key=lambda path: path.stat().st_mtime) if runs else None
 
 
+def rename_final_checkpoint(stage_dir: Path, last_iteration: int | None) -> Path | None:
+    """Rename the stage's final checkpoint to the number of iterations it completed.
+
+    rsl_rl names the checkpoints after the loop *index*, and its final save uses
+    that index too, so ``--iterations 300`` ends with ``model_299.pt``: the file
+    name is one less than the number of iterations that were actually run. The
+    loader does not care (the counter lives inside the checkpoint), but the
+    directory listing then lies about the budget, and reading
+    ``model_999.pt`` after asking for 1000 iterations looks like a truncated run.
+
+    Only the exact off-by-one is corrected. If the newest file is some other
+    number -- a mid-training save, because the harness saved nothing at the end
+    -- it is left untouched rather than relabelled with an iteration count it
+    does not contain.
+    """
+    newest = latest_checkpoint(stage_dir)
+    if newest is None or last_iteration is None:
+        return newest
+    completed = last_iteration + 1
+    try:
+        number = int(newest.stem.split("_")[-1])
+    except ValueError:
+        return newest
+    if number + 1 != completed:
+        return newest
+    target = newest.with_name(f"model_{completed}.pt")
+    if target.exists():
+        return newest
+    newest.rename(target)
+    print(f"[INFO] final checkpoint renamed to {target.name} "
+          f"({completed} iterations completed)")
+    return target
+
+
 def main() -> None:
     spec = gym.spec(args_cli.task)
     module_name, class_name = spec.kwargs["env_cfg_entry_point"].split(":")
@@ -521,6 +599,16 @@ def main() -> None:
         enabled = set_domain_randomization(env_cfg, args_cli.dr == "full")
         print(f"[INFO] Domain randomization: "
               f"{'full' if enabled else 'off (nominal robot, no pushes)'}")
+        # One stage per invocation: --iterations is the way to set its length;
+        # --iters_stageN only matters for --stage all.
+        if args_cli.stage != "all" and len(stages) == 1:
+            running = stages[0][0] + 1
+            ignored = [n for n, value in per_stage.items()
+                       if value is not None and n + 1 != running]
+            if ignored:
+                flags = ", ".join(f"--iters_stage{n + 1}" for n in sorted(ignored))
+                print(f"[WARN] --stage {running} ignores {flags} (other stages are not "
+                      f"running); use --iterations for the length of this stage.")
         # The commands drawn on the very first reset use whatever range the
         # config carries, and that happens during gym.make -- before the stage
         # schedule can intervene. Point the config at the first selected stage
@@ -544,13 +632,18 @@ def main() -> None:
             if stage.resampling is not None:
                 sampling.append(f"hold {stage.resampling[0]:.1f}-{stage.resampling[1]:.1f}s")
             extra = f"  [{', '.join(sampling)}]" if sampling else ""
-            print(f"    stage {number + 1} {stage.name:<18} {stage.iterations:5d} it  "
+            print(f"    {stage_label(number + 1, stage):<24} {stage.iterations:5d} it  "
                   f"vx=+-{stage.ranges_to[0]:.2f} vy=+-{stage.ranges_to[1]:.2f} "
                   f"wz=+-{stage.ranges_to[2]:.2f}  warmup {stage.warmup}{extra}")
 
     experiment_dir = Path(args_cli.log_root, agent_cfg.experiment_name)
     if args_cli.run_name:
         run_name = args_cli.run_name
+    elif args_cli.new_run:
+        # Explicit opt-in to a second directory: the earlier attempt of the same
+        # stage stays on disk for comparison instead of being overwritten.
+        run_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        print("[INFO] --new_run: starting a fresh run directory")
     elif is_velocity_task and args_cli.stage != "all":
         # One stage per invocation: stay inside the run the previous stage
         # wrote to. A fresh timestamped directory would make "--stage 2" search
@@ -558,7 +651,9 @@ def main() -> None:
         previous_run = latest_run_dir(experiment_dir)
         run_name = previous_run.name if previous_run else datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         if previous_run is not None:
-            print(f"[INFO] Continuing run {previous_run}")
+            print(f"[INFO] Continuing run {previous_run} "
+                  f"(a stage that is retrained overwrites its own directory; "
+                  f"--new_run starts a separate one instead)")
     else:
         run_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     log_root_path = experiment_dir / run_name
@@ -598,12 +693,22 @@ def main() -> None:
     planned: list[tuple[str, int, Stage | None]] = []
     if stages:
         for stage_index, stage in stages:
-            planned.append((stage.name, stage.iterations, stage))
+            planned.append((stage_label(stage_index + 1, stage), stage.iterations, stage))
     else:
         planned.append(("standing", agent_cfg.max_iterations, None))
 
     for position, (label, iterations, stage) in enumerate(planned):
         stage_dir = log_root_path if stage is None else log_root_path / label
+        if stage is not None and not args_cli.keep_logs and stage_dir.exists() \
+                and any(stage_dir.iterdir()):
+            # Retraining a stage overwrites it by default. The old checkpoints
+            # have to go: latest_checkpoint() would otherwise hand a higher
+            # iteration number from the previous attempt to stage N+1 as if it
+            # were this attempt's final model.
+            old = sorted(stage_dir.rglob("model_*.pt"))
+            print(f"[INFO] {label}: overwriting the previous attempt "
+                  f"({len(old)} checkpoint(s) removed from {stage_dir})")
+            shutil.rmtree(stage_dir)
         stage_dir.mkdir(parents=True, exist_ok=True)
         with open(stage_dir / "env.yaml", "w") as f:
             yaml.dump(env_cfg.to_dict(), f, Dumper=_LogDumper, sort_keys=False)
@@ -616,7 +721,7 @@ def main() -> None:
             # does continue rather than start from a random policy.
             stage_index = next(i for i, s in enumerate(STAGES) if s.name == stage.name)
             if stage_index > 0:
-                previous = log_root_path / STAGES[stage_index - 1].name
+                previous = log_root_path / stage_label(stage_index, STAGES[stage_index - 1])
                 resume_path = latest_checkpoint(previous)
                 if resume_path is not None:
                     print(f"[INFO] Stage {stage.name}: continuing from the previous "
@@ -624,7 +729,9 @@ def main() -> None:
                 else:
                     print(f"[WARN] Stage {stage.name}: no checkpoint from "
                           f"{previous} -- starting from a fresh policy. Run "
-                          f"--stage {stage_index} first, or pass --resume_from.")
+                          f"--stage {stage_index} first, or pass --resume_from "
+                          f"(a --new_run directory starts empty, so it has to be "
+                          f"filled from stage 1).")
 
         if resume_path is not None and not resume_path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {resume_path}")
@@ -644,8 +751,11 @@ def main() -> None:
         runner.learn(num_learning_iterations=iterations, init_at_random_ep_len=True)
         print(f"[INFO] stage {label} finished in {(time.time() - start) / 60:.1f} min")
 
-        # Stage N+1 continues from the checkpoint this stage ended on.
-        found = latest_checkpoint(stage_dir)
+        # Stage N+1 continues from the checkpoint this stage ended on. rsl_rl
+        # names its last save after the loop index, one below the iteration
+        # count, so fix the name before it becomes anything's starting point.
+        found = rename_final_checkpoint(
+            stage_dir, getattr(runner, "current_learning_iteration", None))
         if found is None:
             raise RuntimeError(f"stage {label} produced no checkpoint in {stage_dir}")
         resume_path = found
@@ -654,9 +764,9 @@ def main() -> None:
             number = next(i for i, s in enumerate(STAGES) if s.name == stage.name) + 1
             print(f"\n[INFO] Stage {label} done -- checkpoint {found}")
             print("[INFO] Look at it in the simulator before spending the next stage:")
-            print(f"    python -m isaaclab_m20.scripts.play --task {args_cli.task} "
-                  f"--checkpoint '{found}'")
-            print(f"    python -m isaaclab_m20.scripts.eval --checkpoint '{found}'")
+            print(f"    python -m isaaclab_m20.scripts.play --stage {number}"
+                  f"    # = --checkpoint '{found}'")
+            print(f"    python -m isaaclab_m20.scripts.eval --stage {number}")
             if number < _LAST_STAGE:
                 print(f"    then: python -m isaaclab_m20.scripts.train --stage {number + 1}"
                       f"   (continues from this checkpoint)")

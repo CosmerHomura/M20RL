@@ -92,7 +92,7 @@ rsl_rl 的 Actor-Critic，两个 MLP 共享同一份观测输入（`obs_groups` 
 
 **一次 PPO 迭代**：
 
-1. **采集**：N 个并行环境各推 `num_steps_per_env=24` 步，得到 N × 24 条 (oₜ, aₜ, rₜ, oₜ₊₁, done) 样本（站立 N=4096 → 98,304；速度指令 N=512 → 12,288，N=1024 → 24,576）。
+1. **采集**：N 个并行环境各推 `num_steps_per_env=24` 步，得到 N × 24 条 (oₜ, aₜ, rₜ, oₜ₊₁, done) 样本（两个任务默认都是 N=4096 → 98,304）。
 2. **算优势**：Critic 给出每步 `V(o)`，用 GAE（γ=0.99、λ=0.95）沿时间反向算优势 `Âₜ`，回报 `Rₜ = Âₜ + V(oₜ)` 作为价值回归目标。
 3. **多轮更新**：把样本打乱分成 minibatch，循环 `num_learning_epochs` 遍，每遍对 Actor 和 Critic 各做一次梯度下降：
    - **Critic**：`loss_V = 0.5·(V − R)²`（价值损失系数 1.0）；
@@ -196,7 +196,7 @@ level = clamp(iteration / (max_iterations × --dr_ramp), 0, 1)
 
 腿部仍用 PD：`τ = K_p(q_des − q) − K_d q̇`。**车轮控制保持现有实现（速度目标接口）**，不与腿部一起改——同时动动作空间和控制接口，出问题无法归因。
 
-### 6.3 奖励（任务项 + 静态保持项）
+### 6.3 奖励（任务项 + 指令相对的保持项）
 
 σ 是误差尺度。跟踪项和高度项用 `exp(-e²/σ²)`（注意分母是 σ²，不是 σ）；姿态项改成**平方惩罚**，因为平地上机身本来就该是平的，需要的是零附近的刚度，而 exp 核在零附近被压平、恰好丢了梯度。惩罚项函数返回正值，符号由权重携带。
 
@@ -209,13 +209,13 @@ level = clamp(iteration / (max_iterations × --dr_ramp), 0, 1)
 | 3 | 机身高度 | `exp(-(h−0.50)²/0.05²)` | **+0.5** |
 | 4 | Roll、Pitch | `(gx²+gy²)/0.2²` | **−0.5** |
 
-静态保持项（**乘零指令掩码**，只对指令为 0 的环境生效；阶段 1 全零指令时对所有环境生效）：
+保持/跟踪二次项（**指令相对、不带掩码**：零指令时就是驻车刹车，非零指令时只惩罚跟踪误差，跟住了不花钱）：
 
 | # | 奖励项 | 函数 | 权重 |
 | --- | --- | --- | --- |
-| 5 | 机身水平速度 | `mask · Σ(v_xy/0.15)²` | **−1.0** |
-| 6 | 偏航角速度 | `mask · (ω_z/0.2)²` | **−1.0** |
-| 7 | 车轮角速度 | `mask · mean_4((ω_w/2)²)` | **−0.5** |
+| 5 | 机身水平速度 | `Σ((v_xy − v_xy*)/0.15)²` | **−1.0** |
+| 6 | 偏航角速度 | `((ω_z − ω_z*)/0.2)²` | **−0.5** |
+| 7 | 车轮滚动速度 | `mean_4(((−0.09·θ̇_w − v_x*)/0.3)²)` | **−0.5** |
 
 姿态/平滑/滑移正则：
 
@@ -231,22 +231,22 @@ level = clamp(iteration / (max_iterations × --dr_ramp), 0, 1)
 
 ```text
 r = 2·r_v + 1·r_ω + 0.5·r_h − 0.5·p_ori
-    − mask·(1.0·p_v_xy + 1.0·p_yaw + 0.5·p_wheel)
+    − 1.0·p_v − 0.5·p_yaw − 0.5·p_wheel
     − 0.2·p_pose − 0.02·p_qdot − 0.1·p_slip
     − 0.01·p_action − 0.005·p_torque − 0.05·p_ang
 ```
 
-**为什么 5–7 要带掩码、而且尺度这么紧。** 跟踪项是 exp 核，零指令下 0.05 m/s 的漂移还能拿 `2·exp(−0.04) ≈ 1.92`，只丢 0.08，梯度太浅——**exp 核在误差为零处梯度为零**，它不会把机器人"按"在原地。平方项才有刚度。第一版把这三项给成 −0.5/0.25²、−0.1/4²，结果 0.05 m/s 的蠕动只花 0.02/步，20 s 的回合能走出去两米，而策略没有任何动力去建立"驻车"行为；偏航通道更是只有 exp 项，连二次项都没有，于是"站着慢慢转"成了最便宜的动作。现在的尺度是"记 1.0 的误差"：0.15 m/s、0.2 rad/s、2 rad/s——0.1 m/s 蠕动花 0.44，0.1 rad/s 慢转花 0.25，2 rad/s 轮子空转花 0.5。车轮同理——`kp=0` 的速度伺服在腿抬起、没有地反力时会把轮子驱动到指令值上空转，零指令下它本来就不该转，所以惩罚是安全的；但**一旦指令非零就必须关掉**，否则等于给"按要求运动"收税。掩码就是 `MixedVelocityCommand.is_standing_env`（`rewards.standing_mask()`），不用额外判断。
+**为什么 5–7 是指令相对的二次项，而不是"零指令才生效的掩码项"。** 跟踪项是 exp 核，零指令下 0.05 m/s 的漂移还能拿 `2·exp(−0.04) ≈ 1.92`，只丢 0.08，梯度太浅——**exp 核在误差为零处梯度为零**，它不会把机器人"按"在原地，平方项才有刚度。第一版把这三项做成 `mask·‖v‖²` 的形式，尺度 −0.5/0.25²、−0.1/4²，结果 0.05 m/s 的蠕动只花 0.02/步，20 s 能溜达两米；偏航通道更是只有 exp 项，连二次项都没有，于是"站着慢慢转"成了最便宜的动作。更糟的是掩码本身是个**静默失败模式**：只要 `is_standing_env` 没被置位（指令项没打标、任务没有指令项、或者采样分支不进零指令），通道就整条失效，日志里只看到它恒为 0，而机器人照样往前滑。现在的写法把"要什么"直接减进去：零指令时 `v* = 0`，它就是驻车刹车；非零指令时它变成跟踪误差惩罚，跟住了为 0，所以**不会**给"按要求运动"收税。尺度是"记 1.0 的误差"：0.15 m/s、0.2 rad/s、0.3 m/s 滚动速度——0.1 m/s 蠕动花 0.44，0.1 rad/s 慢转花 0.125，指令停下而轮子还以 0.1 m/s 滚动花 0.055。车轮同理：`kp=0` 的速度伺服在腿抬起、没有地反力时会把轮子驱动到指令值上空转，第 7 项要求"轮子滚出来的速度等于指令 x 速度"，零指令下就是不许滚。
 
-**为什么 7 只对腿、且权重不能大。** 腿的姿态项防止策略用奇怪折叠姿态维持平衡；轮子不能进——轮关节绝对角无界。注意它拉的是 `default_joint_pos`：如果标称站姿本身带俯仰（同侧前后腿 hip 偏置不等），这一项会把俯仰**强化**而不是纠正，机身水平靠第 4 项。所以权重给 −0.2 就够，不要把姿态项当水平仪用。
+**为什么 8 只对腿、且权重不能大。** 腿的姿态项防止策略用奇怪折叠姿态维持平衡；轮子不能进——轮关节绝对角无界。注意它拉的是 `default_joint_pos`：如果标称站姿本身带俯仰（同侧前后腿 hip 偏置不等），这一项会把俯仰**强化**而不是纠正，机身水平靠第 4 项。所以权重给 −0.2 就够，不要把姿态项当水平仪用。
 
 三条**刻意不做**的事：
 
-- **不做无掩码的车轮转速惩罚**。前进和后退本来就要求轮子转，无掩码的绝对转速惩罚是在给"按要求运动"收税。第 6 项只在零指令下生效。
+- **不做与指令无关的绝对速度惩罚**。前进和后退本来就要求轮子和机身动，绝对量的惩罚是在给"按要求运动"收税。第 5–7 项都减了指令，所以只在"该停没停"或"没跟住"时才有量。
 - **不强制四个轮子始终接触地面**。四轮着地的约束会破坏 Trot 步态。
 - **不惩罚横向滑移**。车轮不是全向轮，侧移时横向轮胎滑动是物理必然；惩罚它等于禁止侧移。`p_slip` 只算**纵向**：`v_roll = −0.09·θ̇` 与机身 `v_x` 的差。
 
-`p_torque` 的 `/40` 归一：腿力矩量级 76 N·m，`(τ/40)²` 让单项落在 0–1 附近，否则 −0.005 的权重对 `τ²` 完全无感。`p_slip` 的 `/0.5` 同理：0.5 m/s 的滑移记 1.0。`p_wheel` 的 `/2`（rad/s）对应 `2 × 0.09 = 0.18 m/s` 的滚动速度，是轮动作上限 0.72 m/s 的四分之一。
+`p_torque` 的 `/40` 归一：腿力矩量级 76 N·m，`(τ/40)²` 让单项落在 0–1 附近，否则 −0.005 的权重对 `τ²` 完全无感。`p_slip` 的 `/0.5` 同理：0.5 m/s 的滑移记 1.0。`p_wheel` 的 `/0.3` 是 m/s 的滚动速度（约 3.3 rad/s），0.3 m/s 的"该停还在滚"记 1.0。
 
 **`wheel_sign` 符号必须按 URDF 推**。`hipx` 轴 `(-1,0,0)`，`hipy`/`knee`/`wheel` 轴 `(0,-1,0)`，关节 origin `rpy` 全 0。绕 `−y` 以 `θ̇>0` 转时轮底接触点速度为 `+θ̇R x̂`，无滑动要求机身速度 `−θ̇R x̂`，所以 `v_roll = −0.09·θ̇`（`rewards.py` 里 `wheel_sign=-1.0`）。若 `Episode_Reward/wheel_slip` 一直贴着 0 而机器人明明在直行，说明 USD 导入翻了关节速度符号，把 `wheel_sign` 改成 `+1.0`。
 
@@ -267,7 +267,7 @@ r = 2·r_v + 1·r_ω + 0.5·r_h − 0.5·p_ori
 
 零指令占 10% 是刻意的：没有它，策略从没学过"站着别动"，而真机上松手就是要停。10% 也不会让它退化成"躺平最省事"——零指令只值 10% 的样本，而跟踪奖励在非零指令上仍是主项。
 
-**最后一个阶段把这两个数改掉**：`zero_prob` 0.10 → 0.35，保持时间 2–4 s → 1.5–3 s（`Stage` 的 `zero_prob` / `resampling` 字段，由 `CommandSchedule.apply_sampling()` 写回 `term.cfg`）。`MixedVelocityCommand` 每次重采样都现读这两个值，所以下一拍就生效。目的不是换范围，而是换**切换频率**：同一个策略必须在一回合里数次起步、停下、换向，带掩码的静态项也才有足够样本去压住残余速度。
+**最后一个阶段把这两个数改掉**：`zero_prob` 0.10 → 0.35，保持时间 2–4 s → 1.5–3 s（`Stage` 的 `zero_prob` / `resampling` 字段，由 `CommandSchedule.apply_sampling()` 写回 `term.cfg`）。`MixedVelocityCommand` 每次重采样都现读这两个值，所以下一拍就生效。目的不是换范围，而是换**切换频率**：同一个策略必须在一回合里数次起步、停下、换向，指令相对的静态项也才有足够样本去压住残余速度。
 
 ### 6.5 PPO 超参（速度指令任务）
 
@@ -282,7 +282,7 @@ r = 2·r_v + 1·r_ω + 0.5·r_h − 0.5·p_ori
 | Max Grad Norm | 1.0 | 梯度裁剪 |
 | Desired KL | 0.01 | KL 目标 |
 | Learning Epochs | 5 | 每轮更新遍数 |
-| Mini Batches | 8 | 1024 环境时 |
+| Mini Batches | 8 | 4096 环境时 |
 | Clipped Value Loss | True | 价值裁剪 |
 | Init Action Std | 0.5 | 初始动作标准差（16 维共用同一个 σ，轮维度上 0.5 → ±0.36 m/s，0.9 会到 ±0.65 m/s，见下） |
 | Actor / Critic Hidden | [256, 256] | 两层 MLP |
@@ -290,25 +290,25 @@ r = 2·r_v + 1·r_ω + 0.5·r_h − 0.5·p_ori
 
 | 采样参数 | 值 |
 | --- | --- |
-| `num_envs` | 512，稳定后 1024 |
+| `num_envs` | 4096（默认值，一般不用改） |
 | `num_steps_per_env` | 24 |
 | `episode_length_s` | 20 |
 | `policy_dt` / `physics_dt` / `decimation` | 0.02 s / 0.005 s / 4 |
 | `save_interval` | 50 |
 | `max_iterations` | 4950（6 阶段合计） |
 
-样本量：`1024 × 24 = 24,576` 条/轮；4950 轮 ≈ 1.22 亿条环境转移。512 环境时约为一半（6080 万）。注意 RSL-RL 每轮还对这批 rollout 做 5 遍 × 8 个 minibatch 的更新，所以不能把 1.22 亿理解成"网络只训练了 1.22 亿次"。
+样本量：`4096 × 24 = 98,304` 条/轮；4950 轮 ≈ 4.87 亿条环境转移。注意 RSL-RL 每轮还对这批 rollout 做 5 遍 × 8 个 minibatch 的更新，所以不能把 4.87 亿理解成"网络只训练了 4.87 亿次"。
 
 **关于 `Init Action Std` 从 0.9 改成 0.5。** 采样器给 16 个动作维度**同一个** σ，但这 16 维不是同一个量纲：一单位腿动作是 0.25 rad，一单位轮动作是 8 rad/s（0.72 m/s）。σ=0.9 意味着静止阶段的每一步都在给轮子下 ±7.2 rad/s（±0.65 m/s）的指令，比静止项想守的 0.15 m/s 大四倍——探索噪声本身就把"站住"变成了"乱走"。0.5 保留 ±7° 的腿抖动和 ±0.36 m/s 的轮噪声，随训练 RSL-RL 会自己收窄。
 
-环境数量按显存选（Isaac Sim 本身要吃掉一部分）：
+环境数量按显存选（Isaac Sim 本身要吃掉一部分）。**两个任务默认都是 4096，24 GB 的 4090 直接跑，不用传参数**：
 
-| 显存 | 起步 | 可试 |
-| --- | --- | --- |
-| 16 GB | 128 | 256 |
-| 24 GB | 512 | 1024 |
-| 48 GB | 1024 | 2048–4096 |
-| 80 GB | 2048 | 4096+ |
+| 显存 | 建议环境数 |
+| --- | --- |
+| 16 GB | 2048 |
+| 24 GB | **4096（默认）** |
+| 48 GB | 4096–8192 |
+| 80 GB | 8192+ |
 
 训练期间**只跑一个 Isaac Lab 训练进程**：PhysX GPU 缓冲、显存余量和 PPO 更新峰值是互相挤的，两个进程同时抢卡的表现是帧率崩到个位数，而不是 OOM——很难定位。
 
@@ -336,9 +336,9 @@ r = 2·r_v + 1·r_ω + 0.5·r_h − 0.5·p_ori
 1. 阶段 2 是第一次给非零指令，`vx` 直接给 ±0.4 会让策略一开局就满幅乱冲。从 `0` 起步，前 150 轮只是在阶段 1 的基线之上慢慢长出指令。
 2. 后三个阶段刚换 checkpoint 时策略对新维度（`vy` 或 `ωz`）完全没概念，瞬间换满幅等于把上一阶段的能力打断。lerp 让新维度从 0 长出来，旧维度不受冲击。
 
-**阶段 6 不改范围，只改分布。** 前五个阶段训练的是"给一个指令、保持 2–4 s、跟住它"，而实际使用中机器人要频繁起步和停下。阶段 6 把同一个满幅范围里的零指令比例从 10% 提到 35%，并把每条指令的保持时间缩短到 1.5–3 s：一个 20 s 回合里有五到八次指令切换，而不是两三次长保持。它考验的正是 §6.3 里那两个带掩码的项——同一个策略必须在一回合内既能在零指令下"卡住"不动，又能在非零指令下放开。warmup 给 0，因为范围与阶段 5 完全相同，没有新维度要长出来；变化的是采样分布，`zero_prob` 与 `resampling_time_range` 在 `CommandSchedule.apply_sampling()` 里写回 `term.cfg`，`MixedVelocityCommand` 每次重采样都现读这两个值，所以下一拍就生效，不需要重建 term。
+**阶段 6 不改范围，只改分布。** 前五个阶段训练的是"给一个指令、保持 2–4 s、跟住它"，而实际使用中机器人要频繁起步和停下。阶段 6 把同一个满幅范围里的零指令比例从 10% 提到 35%，并把每条指令的保持时间缩短到 1.5–3 s：一个 20 s 回合里有五到八次指令切换，而不是两三次长保持。它考验的正是 §6.3 里那三个指令相对的项——同一个策略必须在一回合内既能在零指令下"卡住"不动，又能在非零指令下放开。warmup 给 0，因为范围与阶段 5 完全相同，没有新维度要长出来；变化的是采样分布，`zero_prob` 与 `resampling_time_range` 在 `CommandSchedule.apply_sampling()` 里写回 `term.cfg`，`MixedVelocityCommand` 每次重采样都现读这两个值，所以下一拍就生效，不需要重建 term。
 
-如果阶段 6 的测试显示"起步慢、超调大、停下时还往前滑"，先加长这一阶段（`--iters_stage6 1500`），而不是回到阶段 5 调奖励权重——这是分布问题，不是能力问题。
+如果阶段 6 的测试显示"起步慢、超调大、停下时还往前滑"，先加长这一阶段（`--stage 6 --iterations 1500`），而不是回到阶段 5 调奖励权重——这是分布问题，不是能力问题。
 
 **旧站立模型怎么用**：它的观测是 57 维，速度指令任务是 56 维，**不能 `runner.load` 续训**。做法是把它的能力当作阶段 1（零指令站稳）要重新达到的目标——那个阶段本身就是"站稳 + 轮子不转"，策略会在几百轮内重新学到；不需要、也没法把权重搬过来。若要搬运，只能在 `assets`/`observations` 层面把两边对齐成同一维度，那是另一件事，第一版不做。
 
@@ -357,7 +357,13 @@ for stage in stages:
 
 `--stage N` 单独跑某一阶段时会自动去前一阶段目录找 checkpoint，找不到就打 `[WARN]` 从头开始——不会静默地用一个错维度的权重。不给 `--run_name` 时它会自动沿用 `<experiment>/` 下最新的 run 目录（否则每次 `--stage N` 都会新建一个空目录、每次都找不到上一阶段）。
 
-**每阶段的轮数是参数**：`--iters_stage1 … --iters_stage6` 分别覆盖对应阶段的预算，`--iterations` 是"给所有选中阶段同一个值"的简写，`--stage_scale` 才是按比例整体缩放。优先级：`--iters_stageN` > `--iterations` > 默认值 × `--stage_scale`。warmup 始终被裁到不超过该阶段预算的一半，所以缩到几次迭代也不会把整段吃光。
+**同一阶段重训＝覆盖**。不给 `--run_name` / `--new_run` 时，脚本沿用最新 run，并在开训前把该阶段目录清空（旧的 `model_<更高迭代号>.pt` 必须删掉，否则 `latest_checkpoint()` 会把上一次的 1200 轮当成这一次 700 轮的结果，还会把它交给阶段 N+1 当起点）。想保留上一次做对比就加 `--new_run`（另开一个时间戳 run 目录），想原地追加就加 `--keep_logs`（此时要自己确认目录里没有更高迭代号的旧文件）。
+
+**跨阶段默认用上一阶段最新的模型**：`latest_checkpoint(<run>/stage{N-1}_*)` 按迭代号取最大，不作任何"是不是这次练的"判断，所以上面的清空是它可靠的前提。`--resume_from` 只覆盖第一个被选中阶段的起点。
+
+**checkpoint 命名**：文件名里的数字＝这一刻**已完成的累计迭代数**。rsl_rl 原本按循环下标存盘，最后一次保存会比实际轮数少 1（`--iterations 300` 留下 `model_299.pt`），`train.py` 在每阶段结束后把它改名为 `model_300.pt`；只修正这一个 off-by-one，若最后一个文件是中途保存（数字对不上）则原样保留，不编造轮数。因为计数器跨阶段累计，阶段 6 结束时最后一个文件大约是 `model_4950.pt`，而不是 `model_1000.pt`——看"这个阶段跑了多少轮"请看同一目录里相邻文件的差值或阶段日志，不要直接读文件名的绝对值。
+
+**每阶段的轮数是参数**：单阶段训练直接写 `--stage N --iterations 1200`（`--stage` 已经选定了一个阶段，再写 `--iters_stageN` 是同一件事，多余）；`--iters_stage1 … --iters_stage6` 只在 `--stage all` 时才用得着——那时六个阶段连着跑、每个阶段的预算不同。`--stage_scale` 是按比例整体缩放。优先级：`--iters_stageN` > `--iterations` > 默认值 × `--stage_scale`。warmup 始终被裁到不超过该阶段预算的一半，所以缩到几次迭代也不会把整段吃光。
 
 **每阶段跑完，脚本会打印下一阶段的建议命令**（`play --checkpoint …` / `eval --checkpoint …` / `train --stage N+1`），这就是"跑完先进模拟器看，再决定是否训练下一步"的工作流。
 
@@ -384,8 +390,10 @@ for stage in stages:
 
 ```bash
 python -m isaaclab_m20.scripts.eval \
-    --checkpoint logs/rsl_rl/m20_velocity/<run>/stage6_static_dynamic/model_1000.pt
+    --checkpoint logs/rsl_rl/m20_velocity/<run>/stage6_static_dynamic/model_4950.pt
 ```
+
+（文件名是累计迭代数，阶段 6 结束时约 4950 而不是 1000；也可以只传目录让脚本取最新。）
 
 | 测试 | 指令 `(vx, vy, ωz)` | 运动 |
 | --- | --- | --- |
@@ -418,40 +426,44 @@ python -m isaaclab_m20.scripts.eval \
 1. 摔倒率超标 → 先看是不是 Stage 5 的 `ωz ±0.8` 配 `vx ±0.5` 太激进，回到 Stage 3 的验收再前进。
 2. 速度 RMSE 大但方向对 → 轮动作 scale 是否够（`8.0 × 0.09 = 0.72 m/s`），以及 `p_slip` 权重是否把轮子压得太死。
 3. 侧移差 → 检查 `vy` 的 exp 核 σ=0.25 是否对 0.2 m/s 的指令太大（σ 不随指令收缩，小指令下梯度偏平，必要时单独给 vy 一个 σ）。
-4. 零指令漂移 → 阶段 6 收紧到 35% 零指令后，这项才有足够样本；如果阶段 6 之后仍然漂，看 `lin_vel_xy_standing`（现 −1.0 / σ 0.15）与 `yaw_rate_standing`（−1.0 / 0.2）在 tensorboard 里是否真的有量：**两项都接近 0 而 eval 第 9 行 `mean_speed` 仍有 0.1 m/s 以上**，说明不是奖励问题，而是 `is_standing_env` 没生效或指令里混进了非零指令。这两项太紧会把动作逼成"急刹"，只在漂移确实超标时才继续加，或用 `--stage 1` 单独复训验证。
-5. 起步/停下迟钝（阶段 6 特有） → 加长 `--iters_stage6`，不要动跟踪权重。停下时前滑多，可以只加 `wheel_speed_standing` 的权重；起步时打滑多，看 `wheel_slip`。**刹车过猛、停下瞬间点头**则相反：把 `lin_vel_xy_standing` 的 `scale` 从 0.15 放宽到 0.25。
+4. 零指令漂移 → 阶段 6 收紧到 35% 零指令后，这项才有足够样本；如果阶段 6 之后仍然漂，看 `lin_vel_xy_error`（−1.0 / 0.15）与 `yaw_rate_error`（−0.5 / 0.2）在 tensorboard 里是否真的有量：**两项都接近 0 而 eval 第 9 行 `mean_speed` 仍有 0.1 m/s 以上**，那说明机器人并没在滑，而是指令里混进了非零指令（看 `[health]` 行的 `standing=` 是不是 1.00）。这三项是指令相对的、不带掩码，所以"通道被静默关掉"这条路已经堵上了。它们太紧会把动作逼成"急刹"，只在漂移确实超标时才继续加，或用 `--stage 1 --iterations 600` 单独复训验证。
+5. 起步/停下迟钝（阶段 6 特有） → 加长这一阶段（`--stage 6 --iterations 1500`），不要动跟踪权重。停下时前滑多，加 `wheel_roll_error` 的权重（现在是 −0.5）；起步时打滑多，看 `wheel_slip`。**刹车过猛、停下瞬间点头**则相反：把 `lin_vel_xy_error` 的 `scale` 从 0.15 放宽到 0.25。
 
 ### 6.9 训练与播放
 
 ```bash
-# 全课程一次跑完（不推荐首版）：512 环境起步，稳定后改 1024
-python -m isaaclab_m20.scripts.train --headless --num_envs 512 --run_name m20_v1
+# 全课程一次跑完（不推荐首版）：默认 4096 环境
+python -m isaaclab_m20.scripts.train --headless --run_name m20_v1
 
 # 推荐：一次只跑一个阶段，跑完 play/eval 看完再决定下一步
-python -m isaaclab_m20.scripts.train --headless --num_envs 512 --stage 1 --run_name m20_v1
-python -m isaaclab_m20.scripts.train --headless --num_envs 512 --stage 2 --run_name m20_v1
+python -m isaaclab_m20.scripts.train --headless --stage 1 --run_name m20_v1
+python -m isaaclab_m20.scripts.train --headless --stage 2 --run_name m20_v1
 
-# 每个阶段的轮数都是参数（--iters_stage1 … --iters_stage6）
-python -m isaaclab_m20.scripts.train --headless --num_envs 512 --stage 2 \
-    --run_name m20_v1 --iters_stage2 1200
+# 每个阶段的轮数都是参数；单阶段直接写 --iterations
+python -m isaaclab_m20.scripts.train --headless --stage 2 \
+    --run_name m20_v1 --iterations 1200
 
-# 一次指定全部阶段的长度
-python -m isaaclab_m20.scripts.train --headless --num_envs 512 --stage all \
+# 六个阶段连着跑、各自的预算不同时才用 --iters_stageN
+python -m isaaclab_m20.scripts.train --headless --stage all \
     --iters_stage1 200 --iters_stage2 600 --iters_stage3 900 \
     --iters_stage4 600 --iters_stage5 1000 --iters_stage6 800
 
 # 冒烟测试：第 1 阶段 20 轮
-python -m isaaclab_m20.scripts.train --headless --num_envs 128 --stage 1 --iters_stage1 20
+python -m isaaclab_m20.scripts.train --headless --num_envs 128 --stage 1 --iterations 20
+
+# 播放某一阶段的模型：--stage N 取最新 run 里 stageN_* 的最新 checkpoint
+# （--stage 只在速度任务里有，给了它就不用再写 --task）
+python -m isaaclab_m20.scripts.play --stage 3
 
 # 播放：W/S 改 vx，A/D 改 vy，Q/E 改 ωz，空格清零，P 推一把，R 重置
-python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0 --checkpoint <path>
+python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0
 
-# 固定指令 + 无窗口出视频
-python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0 \
-    --cmd_vx 0.3 --cmd_wz 0.3 --headless --video
+# 固定指令 + 无窗口出视频（可以和 --stage 一起用）
+python -m isaaclab_m20.scripts.play --stage 5 --cmd_vx 0.3 --cmd_wz 0.3 \
+    --headless --video
 
-# 验收
-python -m isaaclab_m20.scripts.eval --checkpoint <path>
+# 验收（同样支持 --stage，或直接给 --checkpoint 文件/目录）
+python -m isaaclab_m20.scripts.eval --stage 6
 
 # 曲线
 tensorboard --logdir logs/rsl_rl/m20_velocity
@@ -479,9 +491,9 @@ logs/rsl_rl/m20_velocity/<run_name>/
 | `Episode_Reward/track_ang_vel_z` | 往 1.0 爬（阶段 4 之后才有意义，前 3 阶段 ωz 指令恒为 0） |
 | `Episode_Reward/flat_orientation` | 负值，往 0 爬（现在是平方惩罚，越平越接近 0；阶段 1 就该接近 0） |
 | `Episode_Reward/base_height` | 往 0.5 爬 |
-| `Episode_Reward/lin_vel_xy_standing` | 负值，只在零指令环境上有量；阶段 1 全程参与，之后随零指令占比波动。**阶段 1 末应接近 0**——这是"没在溜达"的唯一硬指标 |
-| `Episode_Reward/yaw_rate_standing` | 负值，同上。**阶段 1 末应接近 0**；一直有量说明在原地慢慢转 |
-| `Episode_Reward/wheel_speed_standing` | 负值，同上。**恒为 0 有两种可能：`is_standing_env` 没生效，或指令里没有零指令段** |
+| `Episode_Reward/lin_vel_xy_error` | 负值，指令相对。阶段 1（全零指令）就是"驻车刹车"的量，**阶段 1 末应接近 0**——这是"没在溜达"的硬指标；之后只要跟得住指令就接近 0，跟不住才变大 |
+| `Episode_Reward/yaw_rate_error` | 负值，指令相对。阶段 1 末应接近 0；一直有量说明在原地慢慢转 |
+| `Episode_Reward/wheel_roll_error` | 负值，指令相对。**恒为 0 说明轮子确实在不打滑地跟着指令走**；零指令下一直有量说明轮子还在滚（`wheel_sign` 反了的话这项会一直很大，同时 `wheel_slip` 也大） |
 | `Episode_Reward/joint_deviation` | 负值，应在 0.2 量级；**突然变大一倍说明策略在靠折叠腿保持平衡** |
 | `Episode_Reward/wheel_slip` | 小幅负值。**恒为 0 说明 `wheel_sign` 反了** |
 | `Episode_Reward/joint_torques` | 小幅负值 |
@@ -490,4 +502,4 @@ logs/rsl_rl/m20_velocity/<run_name>/
 
 终端里每 50 轮打印 `[cmd] iter=... vx=... vy=... wz=...`（当前阶段与当前指令范围），退火期间能看到范围在长；每个阶段开始时还会打印一行 `[cmd] stage=... hold=...s zero_prob=...`，阶段 6 的 0.35/1.5–3 s 就在这一行里核对。**换阶段那一刻跟踪分会掉一下**（新维度从 0 长出来），看它能不能在 warmup 内爬回来；如果爬不回来，说明上一阶段的 checkpoint 没被正确加载（检查 `[INFO] Continuing from ...` 那行）。
 
-**训练总量参考**：`512 × 24 × 4950 ≈ 6080 万` 条转移（1024 环境翻倍，1.22 亿）。在 4090 上，1024 环境约 20–30 min / 1000 轮量级，整条课程通常在 3–5 小时；512 环境更快但样本效率略低。
+**训练总量参考**：`4096 × 24 × 4950 ≈ 4.87 亿` 条转移。4090 上 4096 环境的每轮耗时比 1024 环境高约 3–4 倍，但每轮见到的样本也多 4 倍；整条课程是数小时量级，具体看 tensorboard 的 `fps` 和每阶段的 `finished in ... min`。显存不够时降 `--num_envs`，别降 `num_steps_per_env`（24 步是 20 s 回合在上千环境下的抓取窗口）。
