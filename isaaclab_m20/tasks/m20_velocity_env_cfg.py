@@ -62,6 +62,16 @@ from isaaclab_m20.tasks.m20_env_cfg import M20SceneCfg, fit_viewer_to_grid
 # fall termination are both measured against this number.
 BASE_HEIGHT = 0.50
 
+# Fall definition, shared by TerminationsCfg and the fall-only penalty so that
+# the term that ends the episode is the term that pays it.
+# Height: 0.33 m is 17 cm below the ride height -- under anything the legs can
+# hold, but still above a folded robot's belly, which is the "sprawled but not
+# below 0.28 m" case that used to survive to the time-out. Tilt: 0.5 rad
+# (29 deg) against an acceptance target of 5 deg, so a real tip-over ends the
+# episode but leaning into an acceleration does not.
+MIN_BASE_HEIGHT = 0.33
+MAX_TILT_RAD = 0.5
+
 
 def leg_obs_cfg() -> SceneEntityCfg:
     """A fresh SceneEntityCfg over the 12 leg joints (see ``rewards.leg_asset_cfg``)."""
@@ -197,8 +207,14 @@ class RewardsCfg:
     NOT present, on purpose: an absolute (command-independent) wheel-speed or
     base-speed penalty -- that is a reward for refusing the command; a
     four-wheel-contact term (the trot lifts two legs); and a lateral tyre-slip
-    penalty (the scrub is how lateral motion happens). There is also no separate
-    ``is_alive`` bonus -- a constant per-step bonus is already implicit below.
+    penalty (the scrub is how lateral motion happens).
+
+    What *is* present and was missing in the first version: ``alive`` (+0.5 per
+    step) and a ``termination_penalty`` that only fires on a real fall. Without
+    the pair, a 20 s time-out and a head-first collapse cost exactly the same
+    -200, so surviving the episode was worth nothing and ending it early cost
+    nothing either -- which is why a policy that fell over still reported
+    full-length episodes.
     """
 
     # -- task ---------------------------------------------------------------
@@ -240,10 +256,16 @@ class RewardsCfg:
     ang_vel_xy = RewardTermCfg(
         func=rewards.ang_vel_xy_l2, weight=-0.05, params={"scale": 1.0})
 
-    # -- fall ---------------------------------------------------------------
-    # Without this the cheapest way out of a bad command is to fall over: the
-    # episode ends, and the remaining per-step penalties are never paid.
-    termination_penalty = RewardTermCfg(func=mdp.is_terminated, weight=-200.0)
+    # -- fall and survival ---------------------------------------------------
+    # Without the penalty the cheapest way out of a bad command is to fall over:
+    # the episode ends and the remaining per-step penalties are never paid.
+    # Without the survival bonus, standing to the time-out and collapsing at
+    # step 40 are worth the same, so nothing asks for staying upright.
+    # Per-step +0.5 against a per-step ceiling of ~3.5.
+    alive = RewardTermCfg(func=mdp.is_alive, weight=0.5)
+    termination_penalty = RewardTermCfg(
+        func=rewards.fall_terminated, weight=-200.0,
+        params={"minimum_height": MIN_BASE_HEIGHT, "max_tilt": MAX_TILT_RAD})
 
 
 @configclass
@@ -251,10 +273,17 @@ class TerminationsCfg:
     """Fall and timeout.
 
     Height, not attitude alone: a robot that has pitched onto its knees can
-    still project gravity near vertical, but its base has dropped. 0.28 m is
-    22 cm below the ride height -- below anything the legs can hold, above the
-    lowest body point of a folded robot. ``bad_orientation`` at 0.8 rad (46 deg)
-    catches the other failure mode, a slow tip-over that keeps some height.
+    still project gravity near vertical, but its base has dropped. ``0.33 m`` is
+    17 cm below the 0.50 m ride height -- below anything the legs can hold, above
+    the lowest body point of a folded robot. ``bad_orientation`` at ``0.5 rad``
+    (29 deg) catches the other failure mode, a slow tip-over that keeps some
+    height.
+
+    Both limits live in the module constants ``MIN_BASE_HEIGHT`` / ``MAX_TILT_RAD``
+    because ``RewardsCfg.termination_penalty`` re-tests the same two conditions:
+    the fall that ends the episode is the fall that is penalised. Keep them in
+    sync -- the reward function takes them as parameters precisely so that one
+    edit moves both.
 
     The plan also lists "unexpected contact". M20's articulation config carries
     no contact sensor, so there is nothing to test against; a collision is
@@ -264,9 +293,9 @@ class TerminationsCfg:
 
     time_out = TerminationTermCfg(func=mdp.time_out, time_out=True)
     base_height = TerminationTermCfg(
-        func=mdp.root_height_below_minimum, params={"minimum_height": 0.28})
+        func=mdp.root_height_below_minimum, params={"minimum_height": MIN_BASE_HEIGHT})
     bad_orientation = TerminationTermCfg(
-        func=mdp.bad_orientation, params={"limit_angle": 0.8})
+        func=mdp.bad_orientation, params={"limit_angle": MAX_TILT_RAD})
 
 
 @configclass

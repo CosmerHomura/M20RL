@@ -4,7 +4,8 @@
 set it has always used. ``Isaac-M20-Wheeled-Velocity-v0`` uses the plan's term
 set plus the static-hold and posture channels:
 
-    r = + 2.0   · r_vel                 speed tracking (exp, sigma 0.25 m/s)
+    r = + 0.5   · 1[alive]             per-step survival (not paid on the time-out step)
+      + 2.0   · r_vel                 speed tracking (exp, sigma 0.25 m/s)
       + 1.0   · r_yaw                 yaw-rate tracking (exp, sigma 0.3 rad/s)
       + 0.5   · r_height              ride height (exp, sigma 0.05 m)
       - 0.5   · p_ori                 (gx² + gy²) / 0.2²        roll/pitch
@@ -17,7 +18,14 @@ set plus the static-hold and posture channels:
       - 0.01  · p_action              action rate
       - 0.005 · p_torque              normalised joint torque
       - 0.05  · p_ang                 roll/pitch rate
-      - 200   · 1[terminated]         fall penalty
+      - 200   · 1[fallen]             fall penalty, NOT the time-out
+
+The survival term and the fall-only penalty are a pair. ``mdp.is_alive`` is 1
+until the terminating step and ``fall_terminated`` is 1 only when a *fall* ended
+the episode, so standing 20 s and paying the time-out is worth ~+500, while
+collapsing at step 40 is worth ~+20 - 200. A terminal penalty on
+``mdp.is_terminated`` scores both the same and, perversely, makes ending the
+episode early free.
 
 The exp kernels are ``exp(-e²/σ²)``: σ is the *error scale* of the channel, and
 the kernel is ~0 once the error is a few σ. Note the division by ``σ²``, not by
@@ -464,3 +472,27 @@ def orientation_sq(env, scale: float = 0.2,
     gravity = _robot(env, asset_cfg).data.projected_gravity_b
     tilt = torch.square(gravity[:, 0]) + torch.square(gravity[:, 1])
     return tilt / (scale * scale)
+
+
+def fall_terminated(env, minimum_height: float = 0.33, max_tilt: float = 0.5,
+                    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """1.0 for envs that ended in a *failure*, 0.0 otherwise (positive; weight is negative).
+
+    Deliberately not ``mdp.is_terminated``: that fires on the 20 s time-out too,
+    so a policy that stands perfectly for the whole episode would pay the same
+    -200 as one that collapses at step 40. With the terminal penalty costing the
+    same either way, nothing rewards *staying* upright -- it only rewards ending
+    fast. This is the fall-only version.
+
+    The two conditions mirror ``TerminationsCfg`` exactly (height below
+    ``minimum_height``, tilt from ``acos(-g_z)`` above ``max_tilt``) and must be
+    kept in sync with it: the term that ends the episode is the term that pays
+    the penalty. It is evaluated through the same projected-gravity reading
+    ``mdp.bad_orientation`` uses, so it does not depend on
+    ``TerminationManager.time_outs`` existing in this Isaac Lab version.
+    """
+    robot = _robot(env, asset_cfg)
+    height = robot.data.root_pos_w[:, 2]
+    tilt = torch.acos(torch.clamp(-robot.data.projected_gravity_b[:, 2], -1.0, 1.0))
+    fallen = (height < minimum_height) | (tilt > max_tilt)
+    return fallen.to(dtype=torch.float32)
