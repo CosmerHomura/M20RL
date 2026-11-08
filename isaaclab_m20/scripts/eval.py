@@ -285,25 +285,30 @@ def run_test(env, policy, test: Test, steps: int, settle_steps: int,
     mean_speed = float(sum_abs_speed) / counted
     mean_yaw = float(sum_abs_yaw) / counted
 
+    # The message shows the measured value next to the limit, not as an
+    # inequality.  "0.304 < 0.1" read as a statement of fact (and, being false,
+    # looked like a bug); "0.304 (limit 0.1)" cannot be misread.
     checks: list[tuple[str, bool, str]] = []
     if test.command[0] != 0.0:
         checks.append(("vx RMSE", rmse_vx < MAX_VX_RMSE,
-                       f"{rmse_vx:.3f} < {MAX_VX_RMSE}"))
+                       f"{rmse_vx:.3f} (limit {MAX_VX_RMSE:.2f})"))
     if test.command[1] != 0.0:
         checks.append(("vy RMSE", rmse_vy < MAX_VY_RMSE,
-                       f"{rmse_vy:.3f} < {MAX_VY_RMSE}"))
+                       f"{rmse_vy:.3f} (limit {MAX_VY_RMSE:.2f})"))
     if test.command[2] != 0.0:
         checks.append(("wz RMSE", rmse_wz < MAX_WZ_RMSE,
-                       f"{rmse_wz:.3f} < {MAX_WZ_RMSE}"))
+                       f"{rmse_wz:.3f} (limit {MAX_WZ_RMSE:.2f})"))
     if test.command == (0.0, 0.0, 0.0):
         checks.append(("still speed", mean_speed < MAX_STILL_SPEED,
-                       f"{mean_speed:.3f} < {MAX_STILL_SPEED}"))
+                       f"{mean_speed:.3f} (limit {MAX_STILL_SPEED:.2f})"))
         checks.append(("still yaw", mean_yaw < MAX_STILL_YAW,
-                       f"{mean_yaw:.3f} < {MAX_STILL_YAW}"))
-    checks.append(("roll RMS", roll_rms < MAX_TILT_RMS, f"{roll_rms:.1f} < {MAX_TILT_RMS}"))
-    checks.append(("pitch RMS", pitch_rms < MAX_TILT_RMS, f"{pitch_rms:.1f} < {MAX_TILT_RMS}"))
+                       f"{mean_yaw:.3f} (limit {MAX_STILL_YAW:.2f})"))
+    checks.append(("roll RMS", roll_rms < MAX_TILT_RMS,
+                   f"{roll_rms:.1f} (limit {MAX_TILT_RMS:.0f})"))
+    checks.append(("pitch RMS", pitch_rms < MAX_TILT_RMS,
+                   f"{pitch_rms:.1f} (limit {MAX_TILT_RMS:.0f})"))
     checks.append(("falls/1000", falls_per_1000 < MAX_FALLS_PER_1000,
-                   f"{falls_per_1000:.1f} < {MAX_FALLS_PER_1000}"))
+                   f"{falls_per_1000:.1f} (limit {MAX_FALLS_PER_1000:.0f})"))
 
     return Result(test.label, test.motion, test.command, rmse_vx, rmse_vy, rmse_wz,
                   roll_rms, pitch_rms, falls_per_1000, mean_speed, mean_yaw, checks)

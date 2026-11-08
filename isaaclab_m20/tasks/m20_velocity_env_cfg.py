@@ -14,7 +14,7 @@ observation         56 dims, body frame (see ``observations.py``)
 action              16 dims: 12 leg position targets + 4 wheel speed targets
 control rate        50 Hz (decimation 4 on 200 Hz physics)
 episode             20 s
-rewards             13 weighted terms + fall penalty (see ``rewards.py``)
+rewards             10 weighted terms + fall penalty (see ``rewards.py``)
 command mix         50% single axis / 30% two axes / 10% three / 10% zero,
                     held 2-4 s (last stage: 35% zero, held 1.5-3 s)
 domain random.      OFF: nominal friction, mass and CoM, no pushes
@@ -185,37 +185,32 @@ class ObservationsCfg:
 
 @configclass
 class RewardsCfg:
-    """Task terms, attitude, the hold-still quadratics, then regularisers.
+    """Ten terms: four task channels, four regularisers, survival and the fall.
 
     Weights are the plan's; every penalty term returns a positive magnitude and
     carries its sign here (see the module docstring of ``rewards.py``).
 
-    Three channels are *command-relative quadratics* (``lin_vel_xy_error``,
-    ``yaw_rate_error``, ``wheel_roll_error``): they measure "what the base and
-    wheels are doing minus what was asked", so with a zero command they are a
-    hard brake and with a non-zero command they are a tracking penalty that is
-    zero when the command is followed. ``stand_position`` adds the displacement
-    half of the same idea. The two base terms are **not** masked by
-    ``is_standing_env``: a mask that silently evaluates to zero disables the
-    channel and lets a "stand still" robot creep. Only the wheel term and the
-    position hold are gated, and their gate is read from the command buffer
-    (strictly zero, ``eps = 1e-3``), not from a flag -- because an ungated wheel
-    term taxes every skid-steer turn and an ungated position term forbids driving
-    away from the spawn point.
+    Ten, not sixteen. The previous revision had a matching pair of channels for
+    each axis group -- an exp kernel *and* a quadratic for linear velocity, again
+    for yaw, plus a gated wheel-speed term and three regularisers that measured
+    almost nothing -- which is two springs of different stiffness on the same
+    error: impossible to attribute, impossible to tune, and the reason the table
+    kept growing. The fix was to replace pairs, not to add a fourth one:
 
-    Why quadratics at all when the tracking terms are already there: the exp
-    kernels are flat at zero error (zero gradient), so on their own they never
-    ask for the last 0.1 m/s to go away. ``scale`` is the error that costs 1.0
-    (before the weight): 0.15 m/s, 0.2 rad/s, 0.3 m/s of wheel rolling.
+    * one bounded kernel per axis group (``track_lin_vel_xy``, ``track_ang_vel_z``,
+      Cauchy form ``1/(1+e^2/sigma^2)``) instead of exp + quadratic;
+    * ``stand_position`` alone carries "a zero command means zero motion": it
+      prices the *displacement* a drift produces, which is what the acceptance
+      test measures. At 0.05 m/s the drift costs 0.04/step after one second and
+      16/step after twenty -- the velocity channels never needed to be doubled;
+    * ``leg_joint_acc_l2`` replaces the velocity channel (too weak to price
+      chatter by an order of magnitude) and ``action_rate_l2`` is normalised, so
+      jitter is no longer free.
 
-    Why the quadratics, and why **no deadband**: a wheeled base with
-    ``stiffness = 0`` on the wheels has no parking brake -- it is a free-rolling
-    cart whose only brake is ``damping = 2``. That makes the last few cm/s
-    expensive to remove, but a zero command still has to mean zero motion, so the
-    residual is charged rather than excused. What actually stops the drift is
-    ``stand_position``: a velocity penalty charges the rate, a position penalty
-    charges the integral, and 0.05 m/s becomes 1 m of drift (cost 16 per step)
-    inside one 20 s episode. The same term pays for coming back after a push.
+    The base tracking terms are **not** masked by ``is_standing_env``; only
+    ``stand_position`` is gated, and its gate is read from the command buffer
+    (strictly zero, ``eps = 1e-3``), because an ungated position term would forbid
+    driving away from the anchor point.
 
     NOT present, on purpose: an absolute (command-independent) wheel-speed or
     base-speed penalty -- that is a reward for refusing the command; a
@@ -232,9 +227,9 @@ class RewardsCfg:
 
     # -- task ---------------------------------------------------------------
     track_lin_vel_xy = RewardTermCfg(
-        func=rewards.track_lin_vel_xy_cmd, weight=2.0, params={"sigma": 0.25})
+        func=rewards.track_lin_vel_xy, weight=2.0, params={"sigma": 0.25})
     track_ang_vel_z = RewardTermCfg(
-        func=rewards.track_ang_vel_z_cmd, weight=1.0, params={"sigma": 0.3})
+        func=rewards.track_ang_vel_z, weight=1.0, params={"sigma": 0.3})
 
     # -- attitude and height ------------------------------------------------
     # Quadratic, not exp: on flat ground the tilt should be near zero at all
@@ -245,38 +240,21 @@ class RewardsCfg:
         func=rewards.base_height_exp, weight=0.5,
         params={"target_height": BASE_HEIGHT, "sigma": 0.05})
 
-    # -- hold still: command-relative quadratics + position hold --------------
-    # These are what make "command == 0" mean "stay here", not merely "do not
-    # accelerate". The base terms are ungated (subtracting the command makes them
-    # free while driving); the wheel term and the position hold are gated on a
-    # strictly-zero command read from the command buffer. No deadband anywhere:
-    # within it the base would be free to creep, and the acceptance criteria say
-    # a zero command means a stopped robot.
-    lin_vel_xy_error = RewardTermCfg(
-        func=rewards.lin_vel_xy_l2_error, weight=-1.0,
-        params={"scale": 0.15})
-    yaw_rate_error = RewardTermCfg(
-        func=rewards.yaw_rate_l2_error, weight=-0.5,
-        params={"scale": 0.2})
+    # -- hold still ----------------------------------------------------------
+    # The only gated term, and it is gated on a strictly-zero command read from
+    # the command buffer. No deadband: within one the base would be free to creep,
+    # and 0.25 m of creep already costs 1.0 per step.
     stand_position = RewardTermCfg(
         func=rewards.stand_position_l2, weight=-1.0,
         params={"scale": 0.25})
-    wheel_roll_error = RewardTermCfg(
-        func=rewards.wheel_roll_l2_error, weight=-0.5,
-        params={"scale": 0.3})
 
     # -- posture and smoothness ----------------------------------------------
     joint_deviation = RewardTermCfg(
         func=rewards.joint_deviation_l2, weight=-0.2, params={"scale": 0.3})
-    joint_vel_legs = RewardTermCfg(
-        func=rewards.joint_vel_legs_l2, weight=-0.02, params={"scale": 20.0})
-    wheel_slip = RewardTermCfg(
-        func=rewards.wheel_slip_l2, weight=-0.1, params={"slip_scale": 0.5})
-    action_rate = RewardTermCfg(func=rewards.action_rate_l2, weight=-0.01)
-    joint_torques = RewardTermCfg(
-        func=rewards.joint_torques_l2, weight=-0.005, params={"torque_scale": 40.0})
-    ang_vel_xy = RewardTermCfg(
-        func=rewards.ang_vel_xy_l2, weight=-0.05, params={"scale": 1.0})
+    leg_joint_acc = RewardTermCfg(
+        func=rewards.leg_joint_acc_l2, weight=-0.02, params={"acc_scale": 200.0})
+    action_rate = RewardTermCfg(
+        func=rewards.action_rate_l2, weight=-0.01, params={"action_scale": 0.05})
 
     # -- fall and survival ---------------------------------------------------
     # Without the penalty the cheapest way out of a bad command is to fall over:
