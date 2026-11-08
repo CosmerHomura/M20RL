@@ -92,7 +92,7 @@ def resolve_checkpoint(experiment_name: str) -> Path:
     to the velocity env and crash on a shape mismatch.
 
     The velocity run nests its checkpoints one level deeper, one directory per
-    curriculum stage (``<run>/stage4_mixed/model_1250.pt``), so the search is
+    curriculum stage (``<run>/stage5_mixed/model_1250.pt``), so the search is
     recursive and ordered by modification time: the newest stage wins.
     """
     if args_cli.checkpoint:

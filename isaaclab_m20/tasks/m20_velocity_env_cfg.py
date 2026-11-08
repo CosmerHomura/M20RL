@@ -21,13 +21,14 @@ domain random.      OFF: nominal friction, mass and CoM, no pushes
 terrain             flat plane
 ==================  ==========================================================
 
-Why the command range defaults to +-0.4 / 0 / 0
------------------------------------------------
-The config carries the *first* course stage, not the final one, so a plain
-``train.py --task Isaac-M20-Wheeled-Velocity-v0`` run behaves conservatively: it
-cannot ask an untrained policy for 3 m/s on the first step. ``scripts/train.py``
-rewrites these ranges per stage through ``dr.set_command_ranges``; see
-``COMMAND_STAGES`` there for the four stages of the plan.
+Why the command range defaults to zero
+--------------------------------------
+The config carries the *first* course stage, which is a zero command ("stand
+still"), not the final one, so a plain
+``train.py --task Isaac-M20-Wheeled-Velocity-v0`` run cannot ask an untrained
+policy for 0.5 m/s on the first step. ``scripts/train.py`` rewrites these ranges
+per stage through ``dr.set_command_ranges``; see ``STAGES`` there for the five
+stages of the course.
 
 Wheel action scale
 ------------------
@@ -88,10 +89,12 @@ class VelocityCommandsCfg:
     )
 
     def __post_init__(self) -> None:
-        # Stage 1 of the course: forward and backward only. ``scripts/train.py``
-        # widens these per stage at runtime.
+        # Stage 1 of the course: zero command, i.e. "stand still". The config
+        # carries the *first* stage rather than the widest one so that a bare
+        # ``gym.make`` cannot ask an untrained policy for 0.5 m/s on the first
+        # step. ``scripts/train.py`` widens these per stage at runtime.
         ranges = self.base_velocity.ranges
-        ranges.lin_vel_x = (-0.4, 0.4)
+        ranges.lin_vel_x = (0.0, 0.0)
         ranges.lin_vel_y = (0.0, 0.0)
         ranges.ang_vel_z = (0.0, 0.0)
         ranges.heading = (0.0, 0.0)

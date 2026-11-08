@@ -1,25 +1,35 @@
 """Train M20 with rsl_rl PPO in Isaac Lab.
 
-The velocity task trains as a four-stage course, each stage continuing from the
+The velocity task trains as a five-stage course, each stage continuing from the
 previous stage's checkpoint:
 
 ======  ==================  ========  =========================================
 stage   name                iters     command range (half-widths)
 ======  ==================  ========  =========================================
-1       forward_backward    700       vx +-0.4,       vy 0,      wz 0
-2       yaw                 700       vx +-0.4,       vy 0,      wz +-0.6
-3       lateral             1000      vx +-0.4,       vy +-0.2,  wz +-0.6
-4       mixed               1250      vx +-0.5,       vy +-0.2,  wz +-0.8
+1       stand               300       vx 0,           vy 0,      wz 0
+2       forward_backward    700       vx +-0.4,       vy 0,      wz 0
+3       lateral             1000      vx +-0.4,       vy +-0.2,  wz 0
+4       yaw                 700       vx +-0.4,       vy +-0.2,  wz +-0.6
+5       mixed               1250      vx +-0.5,       vy +-0.2,  wz +-0.8
 ======  ==================  ========  =========================================
 
-3650 iterations total. Every stage opens with a short warmup during which the
-range is interpolated from the previous stage's values to the new ones, so a new
-axis is introduced at zero and grows in over 175-250 iterations instead of
-appearing at full width on the first step. That warmup is also the answer to the
-"we already have a standing policy" problem: that policy was trained on 57
-observations and cannot be loaded into a 56-observation actor, so stage 1 has to
-start from scratch -- but it starts with a *zero* command range, which is a
-standing task with the new observation layout, and grows the range from there.
+3950 iterations total, in the order "stand -> forward/back -> lateral -> yaw ->
+everything", each axis introduced on its own before it is combined with the
+others.
+
+Stage 1 is a zero-command stage: the tracking terms are then "be still", so it
+trains the baseline the later stages build on -- hold the ride height, keep the
+body level, do not spin the wheels, do not drift. That is the answer to the "we
+already have a standing policy" problem: that policy was trained on 57
+observations and cannot be loaded into a 56-observation actor, so the course has
+to re-establish standing under the new observation layout first. Keeping it as
+its own stage (rather than as a warmup inside stage 2) gives it its own
+checkpoint, which is what makes the later stages comparable: if forward/backward
+never improves on stage 1, the problem is the command, not the baseline.
+
+After stage 1 every stage opens with a short warmup during which the new axis is
+interpolated from zero up to its target width over 150-250 iterations, instead of
+appearing at full width on the first step.
 
 Example runs::
 
@@ -27,8 +37,8 @@ Example runs::
     python -m isaaclab_m20.scripts.train
 
     # one stage at a time (each continues from the previous stage's checkpoint)
-    python -m isaaclab_m20.scripts.train --stage 1
     python -m isaaclab_m20.scripts.train --stage 2
+    python -m isaaclab_m20.scripts.train --stage 3
 
     # 1024 envs once 512 is stable
     python -m isaaclab_m20.scripts.train --num_envs 1024
@@ -65,7 +75,7 @@ parser.add_argument("--num_envs", type=int, default=None,
                          "1024 once that is stable).")
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--stage", type=str, default="all",
-                    help="Velocity task: which course stage to run ('1'..'4' or 'all'). "
+                    help="Velocity task: which course stage to run ('1'..'5' or 'all'). "
                          "Each stage continues from the previous stage's latest checkpoint "
                          "unless --resume_from says otherwise.")
 parser.add_argument("--stage_scale", type=float, default=1.0,
@@ -157,10 +167,13 @@ class Stage:
 
 
 STAGES: tuple[Stage, ...] = (
-    Stage("1_forward_backward", 700, (0.00, 0.0, 0.0), (0.40, 0.0, 0.0), 175),
-    Stage("2_yaw", 700, (0.40, 0.0, 0.0), (0.40, 0.0, 0.6), 175),
-    Stage("3_lateral", 1000, (0.40, 0.0, 0.6), (0.40, 0.2, 0.6), 250),
-    Stage("4_mixed", 1250, (0.40, 0.2, 0.6), (0.50, 0.2, 0.8), 250),
+    # Zero command: the standing baseline under the new 56-dim observation
+    # layout. Every term still runs; the tracking terms just mean "be still".
+    Stage("1_stand", 300, (0.00, 0.0, 0.0), (0.00, 0.0, 0.0), 0),
+    Stage("2_forward_backward", 700, (0.00, 0.0, 0.0), (0.40, 0.0, 0.0), 150),
+    Stage("3_lateral", 1000, (0.40, 0.0, 0.0), (0.40, 0.2, 0.0), 250),
+    Stage("4_yaw", 700, (0.40, 0.2, 0.0), (0.40, 0.2, 0.6), 250),
+    Stage("5_mixed", 1250, (0.40, 0.2, 0.6), (0.50, 0.2, 0.8), 250),
 )
 
 
@@ -188,9 +201,10 @@ def select_stages(selector: str, scale: float, iterations: int | None) -> list[t
         if budget <= 0:
             raise SystemExit(f"stage {stage.name} would run {budget} iterations")
         # Never spend more than half of a trimmed stage on the warmup: with
-        # --stage_scale 0.05 the budget is 35 iterations for stage 1 and a
-        # 175-iteration warmup would hold the range at zero the whole run.
-        warmup = min(stage.warmup, max(budget // 2, 1))
+        # --stage_scale 0.05 the budget is 35 iterations for stage 2 and a
+        # 150-iteration warmup would hold the new axis near zero the whole run.
+        # ``max(..., 1)`` keeps a 0-iteration warmup (stage 1) at 0 rather than 1.
+        warmup = min(stage.warmup, budget // 2) if stage.warmup else 0
         out.append((index, Stage(stage.name, budget, stage.ranges_from, stage.ranges_to, warmup)))
     return out
 

@@ -83,9 +83,10 @@ class ActionsCfg:
         joint_names=[".*_wheel_joint"],
         scale=20.0,
         use_default_offset=False,
-    )@configclass
+    )
 
 
+@configclass
 class RewardsCfg:
     """Standard legged-locomotion reward set with a zero velocity command.
 

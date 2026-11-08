@@ -9,7 +9,7 @@
 | `Isaac-M20-Wheeled-v0` | 静态站立 | 57 维（无指令） | 10 s | `logs/rsl_rl/m20_wheeled/` |
 | `Isaac-M20-Wheeled-Velocity-v0` | `(vx, vy, ωz)` 速度指令跟踪 | 56 维 | 20 s | `logs/rsl_rl/m20_velocity/<run>/stage{N}_*/` |
 
-两者的 checkpoint **不能互换**（观测维度不同）。速度指令任务是第一版正式训练配置：4 阶段课程、8 项奖励、域随机化默认关闭、阶段间自动续训。
+两者的 checkpoint **不能互换**（观测维度不同）。速度指令任务是第一版正式训练配置：5 阶段课程、8 项奖励、域随机化默认关闭、阶段间自动续训。
 
 详细安装与排错见 [docs/isaaclab_setup.md](docs/isaaclab_setup.md)，奖励函数/网络结构/PPO 流程/课程与验收见 [docs/algorithm.md](docs/algorithm.md)。
 
@@ -31,7 +31,7 @@ isaaclab_m20/
 ├── assets/m20.py      # ArticulationCfg：USD、初始姿态、PD 增益
 ├── tasks/
 │   ├── m20_env_cfg.py            # 站立任务：场景/观测/动作/奖励/域随机化
-│   ├── m20_velocity_env_cfg.py   # 速度指令任务：56 维观测、8 项奖励、4 阶段
+│   ├── m20_velocity_env_cfg.py   # 速度指令任务：56 维观测、8 项奖励、5 阶段
 │   ├── observations.py           # 56 维观测的拆分项（腿/轮/指令）
 │   ├── commands.py               # MixedVelocityCommand：50/30/10/10 混合采样
 │   ├── rewards.py                # 奖励函数（站立 14 项 + 速度 8 项）
@@ -39,7 +39,7 @@ isaaclab_m20/
 │   └── agents/rsl_rl_ppo_cfg.py  # PPO 超参（两个任务各一套）
 └── scripts/
     ├── check_m20.py   # 加载 USD，打印关节/质量，验证资产
-    ├── train.py       # 训练（速度任务含 4 阶段课程与续训）
+    ├── train.py       # 训练（速度任务含 5 阶段课程与续训）
     ├── play.py        # 播放 / 键盘给指令 / 录视频
     └── eval.py        # 固定指令验收测试（RMSE、倾角、摔倒率）
 ```
@@ -58,7 +58,7 @@ python -m isaaclab_m20.scripts.train --headless --num_envs 4096
 # 3. 播放站立策略（加载最新 checkpoint，16 个环境）。视口里 P 推一下，R 重置
 python -m isaaclab_m20.scripts.play --num_envs 16
 
-# 4. 训练速度指令任务：4 阶段课程，512 环境起步，阶段间自动续训
+# 4. 训练速度指令任务：5 阶段课程，512 环境起步，阶段间自动续训
 python -m isaaclab_m20.scripts.train --headless --num_envs 512 --run_name m20_v1
 
 # 5. 只跑某个阶段（自动从上一阶段最新 checkpoint 续）
@@ -94,7 +94,7 @@ tensorboard --logdir logs/rsl_rl --bind_all --port 6006
 - **指令**：机体系 `(vx, vy, ωz)`，每 2–4 s 重采样，混合采样 50% 单轴 / 30% 双轴 / 10% 三轴 / 10% 零指令。
 - **奖励 8 项**：线速度跟踪 +2.0、偏航跟踪 +1.0、姿态 +0.5、高度 +0.5、纵向滑移 −0.1、动作变化率 −0.01、力矩 −0.005、横滚俯仰角速度 −0.05，摔倒终止 −200。**不惩罚车轮绝对转速、不强制四轮着地、不惩罚横向滑移。**
 - **终止**：高度 < 0.28 m、倾角 > 0.8 rad、超时 20 s。
-- **课程 4 阶段**（合计 3650 iterations，每阶段内有线性 warmup）：前进/后退 `vx ±0.4` → 加偏航 `ωz ±0.6` → 加横移 `vy ±0.2` → 三维混合 `vx ±0.5 / vy ±0.2 / ωz ±0.8`。
+- **课程 5 阶段**（合计 3950 iterations，每阶段内有线性 warmup）：零指令站稳（300）→ 前进/后退 `vx ±0.4`（700）→ 加横移 `vy ±0.2`（1000）→ 加偏航 `ωz ±0.6`（700）→ 三维混合 `vx ±0.5 / vy ±0.2 / ωz ±0.8`（1250）。每个轴先单独学会，再与其它轴叠加。
 - **域随机化默认关闭**（摩擦 1.0、质量/质心固定、无推力），`--dr full` 打开。
 
 **PD 伺服环**（`ImplicitActuatorCfg`，200 Hz）：腿 kp=80 / kd=2，轮 kp=0 / kd=2，力矩上限 76.4 / 21.6 N·m。

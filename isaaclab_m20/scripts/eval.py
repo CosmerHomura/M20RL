@@ -33,7 +33,7 @@ same threshold.
 
 Usage::
 
-    python -m isaaclab_m20.scripts.eval --checkpoint logs/rsl_rl/m20_velocity/<run>/stage4_mixed/model_3600.pt
+    python -m isaaclab_m20.scripts.eval --checkpoint logs/rsl_rl/m20_velocity/<run>/stage5_mixed/model_1250.pt
     python -m isaaclab_m20.scripts.eval            # newest checkpoint of the newest run
     python -m isaaclab_m20.scripts.eval --seconds 10 --num_envs 32 --strict
 """

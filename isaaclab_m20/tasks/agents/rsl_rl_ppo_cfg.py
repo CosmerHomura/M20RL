@@ -68,7 +68,7 @@ class M20VelocityRslRlPpoRunnerCfg(M20RslRlPpoRunnerCfg):
       but the plan fixes the architecture and comparing runs is only meaningful
       if the architecture does not also move.
     * lr 3e-4 instead of 1e-3 -- 1e-3 is a fine rate for a single static pose and
-      a fast way to blow up a 4-stage course, where each stage starts from the
+      a fast way to blow up a 5-stage course, where each stage starts from the
       previous stage's weights.
     * 8 mini-batches instead of 4 -- with 1024 envs x 24 steps = 24576 transitions
       per iteration, 8 batches is 3072 samples per update, which keeps each PPO
@@ -80,13 +80,13 @@ class M20VelocityRslRlPpoRunnerCfg(M20RslRlPpoRunnerCfg):
       (14 deg), so std 1.0 puts the initial stance noise at +-14 deg on every
       joint. 0.9 is the plan's "0.8-1.0", chosen at the exploration-friendly end
       because stage 1 begins with a zero command range.
-    * save_interval 50 -- the stages are 700-1250 iterations long, so 100 would
+    * save_interval 50 -- the stages are 300-1250 iterations long, so 100 would
       leave 7 checkpoints per stage and no way to bisect a stage that goes bad
       halfway.
     """
 
     experiment_name = "m20_velocity"
-    max_iterations = 3650        # 700 + 700 + 1000 + 1250, see scripts/train.py
+    max_iterations = 3950    # 300 + 700 + 1000 + 700 + 1250, see scripts/train.py
     save_interval = 50
 
     policy = RslRlPpoActorCriticCfg(
