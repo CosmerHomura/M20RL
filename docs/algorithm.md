@@ -298,17 +298,18 @@ r = 2·r_v + 1·r_ω
 
 | 参数 | 值 | 说明 |
 | --- | --- | --- |
-| Learning Rate | 3e-4 | `schedule="adaptive"` |
+| Learning Rate | 3e-4 | `schedule="fixed"`（见下：为什么不再自适应） |
 | Gamma | 0.99 | 折扣因子 |
 | GAE Lambda | 0.95 | GAE 参数 |
 | Clip Parameter | 0.2 | PPO 裁剪范围 |
 | Entropy Coef | 0.005 | 熵系数 |
 | Value Loss Coef | 1.0 | 价值损失系数 |
 | Max Grad Norm | 1.0 | 梯度裁剪 |
-| Desired KL | 0.01 | KL 目标 |
+| Desired KL | 0.01 | 保留字段，`fixed` 模式下不生效 |
 | Learning Epochs | 5 | 每轮更新遍数 |
 | Mini Batches | 8 | 4096 环境时 |
 | Clipped Value Loss | True | 价值裁剪 |
+| Optimizer | Adam（betas 0.9/0.999） | Actor 与 Critic 两个参数组、同一 Adam，无 weight decay、无 warmup |
 | Init Action Std | 0.5 | 初始动作标准差（16 维共用同一个 σ，轮维度上 0.5 → ±0.36 m/s，0.9 会到 ±0.65 m/s，见下） |
 | Actor / Critic Hidden | [256, 256] | 两层 MLP |
 | Activation | ELU | 统一 |
@@ -323,6 +324,12 @@ r = 2·r_v + 1·r_ω
 | `max_iterations` | 3250（4 阶段合计） |
 
 样本量：`4096 × 24 = 98,304` 条/轮；3250 轮 ≈ 3.2 亿条环境转移。注意 RSL-RL 每轮还对这批 rollout 做 5 遍 × 8 个 minibatch 的更新，所以不能把 3.2 亿理解成"网络只训练了 3.2 亿次"。
+
+**关于 `schedule` 从 `adaptive` 改成 `fixed`（2026-11 的 `m20_v5` 之后）。** RSL-RL 的优化器是 Adam，Actor 和 Critic 各一个参数组。自适应调度每轮按实测 KL 把 lr 乘或除 1.5，并直接写进 `optimizer.param_groups[*]["lr"]`。问题是 Adam 的更新步长 `η·m̂/(√v̂+ε)` 里 `m̂/√v̂` 是尺度归一化的、近似 O(1)，**所以实际步长几乎正比于 η**；调度器一换 η，`v̂` 还停在旧尺度上，下一轮就是同样倍数的步长跳变。`max_grad_norm=1.0` 只防单次梯度爆炸，防不了"梯度正常、lr 被放大"。
+
+`m20_v5` 的阶段 1 把这件事演示了一遍：`Loss/learning_rate` 在 0 和 2e-3 之间来回锯（一半迭代在 lr≈0 上空转），`mean_episode_length` 在第 40 轮就满 1000 并稳到第 200 轮，然后在 lr 尖峰处掉到 380、`Loss/value_function` 冒出 0.24 的尖峰。`Loss/entropy` 反而是单调下降的（11.5 → 4.27，即 σ 0.5 → 0.32），说明不是探索噪声把机器人撞倒的。固定 lr 之后步长尺度不再变，这才是 Adam 被设计出来时假设的工作条件；`desired_kl` 字段留着但不再生效。
+
+对应地，阶段 1 的合理轮数是 **180–200**，不是 300：平台期在 40–200 之间，之后继续跑只是让它去撞不稳定的边界。
 
 **关于 `Init Action Std` 从 0.9 改成 0.5。** 采样器给 16 个动作维度**同一个** σ，但这 16 维不是同一个量纲：一单位腿动作是 0.25 rad，一单位轮动作是 8 rad/s（0.72 m/s）。σ=0.9 意味着静止阶段的每一步都在给轮子下 ±7.2 rad/s（±0.65 m/s）的指令，比静止项想守的 0.15 m/s 大四倍——探索噪声本身就把"站住"变成了"乱走"。0.5 保留 ±7° 的腿抖动和 ±0.36 m/s 的轮噪声，随训练 RSL-RL 会自己收窄。
 

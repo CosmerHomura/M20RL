@@ -88,6 +88,16 @@ class M20VelocityRslRlPpoRunnerCfg(M20RslRlPpoRunnerCfg):
     * save_interval 50 -- the stages are 300-1250 iterations long, so 100 would
       leave 7 checkpoints per stage and no way to bisect a stage that goes bad
       halfway.
+    * ``schedule="fixed"`` instead of ``"adaptive"`` -- the adaptive schedule
+      writes a new learning rate into Adam's param groups every iteration
+      (x1.5 / /1.5 on the measured KL). Adam's step is ~``lr * m_hat / sqrt(v_hat)``,
+      i.e. very nearly *proportional to lr*, so a schedule that swings between
+      ~0 and ~2e-3 swings the step size by the same factor. The stage-1 run
+      (``m20_v5``) did exactly that: lr sat near 0 for stretches, then spiked to
+      1.5-2e-3, and the policy -- which had been standing for 160 iterations --
+      fell over at iteration ~200 and never recovered. With a fixed rate the
+      step scale never changes under the optimiser, which is the assumption
+      Adam is designed around. ``desired_kl`` is therefore unused here.
     """
 
     experiment_name = "m20_velocity"
@@ -111,7 +121,10 @@ class M20VelocityRslRlPpoRunnerCfg(M20RslRlPpoRunnerCfg):
         num_learning_epochs=5,
         num_mini_batches=8,
         learning_rate=3.0e-4,
-        schedule="adaptive",
+        # Fixed, not adaptive: see the class docstring. The adaptive schedule
+        # moved lr between ~0 and ~2e-3, which is a ~2e3x change in Adam's step
+        # and knocked the stage-1 policy over after it had learned to stand.
+        schedule="fixed",
         gamma=0.99,
         lam=0.95,
         desired_kl=0.01,
