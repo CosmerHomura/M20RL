@@ -73,9 +73,9 @@ python -m isaaclab_m20.scripts.train --headless --run_name m20_v1
 
 # 5. 推荐流程：一次只跑一个阶段，跑完进模拟器看，再决定下一步。
 #    --stage N 自动接上一阶段：从同一次 run 里第 N-1 阶段的最新 checkpoint 续训。
-#    重新训练同一阶段＝覆盖该阶段目录（旧的 model_*.pt 先清掉，避免更高迭代号被当成
-#    本阶段结果）。想保留上一次的对比就加 --new_run 另开一个时间戳目录；
-#    --keep_logs 则原地保留旧文件。
+#    重新训练同一阶段必须显式确认：该阶段目录里已有内容时，脚本会在启动模拟器前停下，
+#    让你选 --overwrite（旧目录改名为 stageN_xxx.bak-<时间戳>，不删）、--keep_logs
+#    （原地追加）或 --new_run（另开时间戳 run，旧目录不动）。
 #    checkpoint 文件名 = 训练结束时已完成的累计迭代数（rsl_rl 原本会少 1，这里改掉了）。
 python -m isaaclab_m20.scripts.train --headless --stage 1 --run_name m20_v1
 
@@ -155,7 +155,7 @@ tensorboard --logdir logs/rsl_rl --bind_all --port 6006
 | 观测拆分项（腿/轮/指令） | `isaaclab_m20/tasks/observations.py` |
 | 指令混合采样比例 | `isaaclab_m20/tasks/commands.py` |
 | 课程阶段、轮数、warmup、续训逻辑（含每阶段的零指令占比与最后一阶段的保持时间） | `isaaclab_m20/scripts/train.py`（`STAGES`） |
-| 重训同一阶段时覆盖还是另开目录 | `--new_run` 另开时间戳目录、`--keep_logs` 原地保留旧文件；**默认覆盖该阶段目录** |
+| 重训同一阶段时覆盖还是另开目录 | **默认什么都不做**：目标阶段目录非空时拒绝启动，要求显式 `--overwrite`（旧目录改名为 `.bak-<时间戳>`，不删）/ `--keep_logs`（原地追加）/ `--new_run`（另开时间戳 run） |
 | 验收阈值与测试指令 | `isaaclab_m20/scripts/eval.py` |
 | PPO 超参 | `isaaclab_m20/tasks/agents/rsl_rl_ppo_cfg.py` |
 | PD 增益、力矩上限、默认姿态 | `isaaclab_m20/assets/m20.py` |

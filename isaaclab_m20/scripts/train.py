@@ -51,12 +51,13 @@ warmup for the new width: only the sampling distribution and the hold time chang
 Two log-directory rules, both about the "train a stage, look at it, decide"
 loop:
 
-* Retraining a stage overwrites it. A single ``--stage N`` reuses the newest run
-  of the experiment and clears that stage's directory first, so a second
-  attempt at stage 2 replaces the first instead of leaving two sets of
-  checkpoints whose iteration numbers disagree. ``--new_run`` keeps the earlier
-  attempt as a separate timestamped run instead, and ``--keep_logs`` appends to
-  the existing stage directory.
+* Retraining a stage is an explicit choice, and it never deletes anything. If the
+  plan touches a stage directory that already holds a run, training stops before
+  the simulator starts and asks you to pick: ``--overwrite`` moves the old
+  attempt to ``<stage>.bak-<timestamp>`` and retrains into a clean directory,
+  ``--keep_logs`` appends into the existing one, ``--new_run`` starts a separate
+  timestamped run and leaves the old one alone. (Silently clearing the directory
+  was the earlier behaviour; one ``--stage 1`` was enough to lose a run.)
 * A stage starts from the previous stage's newest checkpoint in the same run.
   That is what makes the loop safe to interrupt: stage N+1 picks up whatever
   stage N actually produced, and ``--resume_from`` overrides it for one run.
@@ -94,7 +95,6 @@ from __future__ import annotations
 import argparse
 import importlib
 import os
-import shutil
 import sys
 import time
 from dataclasses import dataclass
@@ -212,16 +212,21 @@ parser.add_argument("--resume_from", type=str, default=None,
 parser.add_argument("--run_name", type=str, default=None,
                     help="Sub-directory inside logs/rsl_rl/<experiment>; stages get their own "
                          "sub-sub-directory inside it. Without it a single --stage reuses the "
-                         "newest run of that experiment, so re-running a stage retrains (and "
-                         "overwrites) that stage in place.")
+                         "newest run of that experiment.")
 parser.add_argument("--new_run", action="store_true",
                     help="Start a new timestamped run directory instead of reusing the newest "
                          "one. Use this to keep an earlier attempt of the same stage for "
-                         "comparison; without it, the same --stage overwrites that stage.")
+                         "comparison.")
+parser.add_argument("--overwrite", action="store_true",
+                    help="Retrain a stage whose directory already has a run in it. The previous "
+                         "attempt is RENAMED to <stage>.bak-<timestamp>, never deleted, so a "
+                         "mistaken retrain can be undone. Without this flag (and without "
+                         "--keep_logs) training refuses to start rather than touch the folder.")
 parser.add_argument("--keep_logs", action="store_true",
-                    help="Keep an existing stage directory when retraining it. Off by default: "
-                         "stale model_<iter>.pt files from the previous attempt would otherwise "
-                         "be picked up as this stage's result and as stage N+1's starting point.")
+                    help="Append into an existing stage directory instead of moving it aside. "
+                         "Only sensible when the old checkpoints are older than the new ones; "
+                         "otherwise latest_checkpoint() will report the stale file as this "
+                         "stage's result.")
 parser.add_argument("--log_root", type=str, default=str(REPO_ROOT / "logs" / "rsl_rl"))
 parser.add_argument("--video", action="store_true", help="Record a video of the first iteration.")
 parser.add_argument("--video_length", type=int, default=200, help="Video length in policy steps.")
@@ -831,12 +836,32 @@ def main() -> None:
         run_name = previous_run.name if previous_run else datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         if previous_run is not None:
             print(f"[INFO] Continuing run {previous_run} "
-                  f"(a stage that is retrained overwrites its own directory; "
-                  f"--new_run starts a separate one instead)")
+                  f"(a stage that already has a run refuses to be retrained unless you "
+                  f"pass --overwrite or --keep_logs; --new_run starts a separate one)")
     else:
         run_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     log_root_path = experiment_dir / run_name
     print(f"[INFO] Logging to {log_root_path}")
+
+    # Pre-flight, before the simulator starts: never touch a previous attempt
+    # without being asked to. The checkpoints in those directories are the only
+    # copy of that experiment, so retraining a stage is an explicit decision.
+    planned_labels = [stage_label(number + 1, stage) for number, stage in stages] or ["standing"]
+    occupied = [
+        log_root_path / label for label in planned_labels
+        if (log_root_path / label).exists() and any((log_root_path / label).iterdir())
+    ]
+    if occupied and not (args_cli.overwrite or args_cli.keep_logs):
+        listed = "\n".join(f"    {path}" for path in occupied)
+        raise SystemExit(
+            f"[ERROR] These stage directories already contain a run:\n{listed}\n"
+            f"        Nothing was touched. Pick one:\n"
+            f"          --overwrite   retrain them; the previous attempt is renamed to\n"
+            f"                        <stage>.bak-<timestamp> and nothing is deleted\n"
+            f"          --keep_logs   append into the existing directories\n"
+            f"          --new_run     start a separate timestamped run, leave these alone"
+        )
+
     print(f"[INFO] Environment: {args_cli.task}  num_envs={env_cfg.scene.num_envs}")
     print_dict(agent_cfg.to_dict(), nesting=0)
 
@@ -879,16 +904,16 @@ def main() -> None:
 
     for position, (label, iterations, stage) in enumerate(planned):
         stage_dir = log_root_path if stage is None else log_root_path / label
-        if stage is not None and not args_cli.keep_logs and stage_dir.exists() \
-                and any(stage_dir.iterdir()):
-            # Retraining a stage overwrites it by default. The old checkpoints
-            # have to go: latest_checkpoint() would otherwise hand a higher
-            # iteration number from the previous attempt to stage N+1 as if it
-            # were this attempt's final model.
-            old = sorted(stage_dir.rglob("model_*.pt"))
-            print(f"[INFO] {label}: overwriting the previous attempt "
-                  f"({len(old)} checkpoint(s) removed from {stage_dir})")
-            shutil.rmtree(stage_dir)
+        if stage is not None and stage_dir.exists() and any(stage_dir.iterdir()):
+            if args_cli.keep_logs:
+                print(f"[INFO] {label}: --keep_logs, appending into {stage_dir}")
+            elif args_cli.overwrite:
+                # Moved, not deleted: a mistaken retrain stays recoverable.
+                stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                backup = stage_dir.with_name(f"{stage_dir.name}.bak-{stamp}")
+                stage_dir.rename(backup)
+                print(f"[INFO] {label}: previous attempt moved to {backup.name} "
+                      f"(nothing was deleted)")
         stage_dir.mkdir(parents=True, exist_ok=True)
         with open(stage_dir / "env.yaml", "w") as f:
             yaml.dump(env_cfg.to_dict(), f, Dumper=_LogDumper, sort_keys=False)

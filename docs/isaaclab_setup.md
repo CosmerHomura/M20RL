@@ -137,7 +137,7 @@ python -m isaaclab_m20.scripts.train --headless --stage 1 --run_name m20_v1
 - 想给这次实验起名：`--run_name v1`，日志就落在 `logs/rsl_rl/m20_velocity/v1/`。
 - 显存不够就降 `--num_envs`（16 GB 用 2048）。**训练期间只跑一个 Isaac Lab 进程**——两个进程抢同一张卡的表现是帧率崩到个位数，而不是干脆的 OOM。
 - 断点续训：站立任务 `--resume --run_name v1`（加载该目录下最新 checkpoint）；速度指令任务默认每阶段自动从上一阶段**最新的** checkpoint 续训（Actor 与 Critic 全部参数一起继承），也可 `--stage 3 --resume_from <path>` 手指定。`--stage N` 不给 `--run_name` 时会自动沿用最新 run 目录。
-- 同一阶段重训默认**覆盖**：开训前清空该阶段目录（否则上一次更高迭代号的 `model_*.pt` 会被当成这次的结果）。要保留旧结果对比加 `--new_run`（另开时间戳目录），要原地追加加 `--keep_logs`。
+- 同一阶段重训要显式确认，且**不删任何文件**：目标阶段目录非空时脚本会在启动模拟器前停下，让你选 `--overwrite`（旧目录改名为 `stageN_xxx.bak-<时间戳>` 再重训）、`--keep_logs`（原地追加）或 `--new_run`（另开时间戳 run、旧目录不动）。
 - 每阶段轮数都是参数：单阶段训练直接写 `--stage 2 --iterations 1200`（`--stage` 已选定一个阶段，`--iters_stageN` 是同一件事，多余）；`--iters_stage1 … --iters_stage4` 只在 `--stage all` 跑整套课程时才用；`--stage_scale` 按比例整体缩。
 - 只想确认流程能通：`--stage 1 --iterations 20 --num_envs 128`（约一分钟）。
 
