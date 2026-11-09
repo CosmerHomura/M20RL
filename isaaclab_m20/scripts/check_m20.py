@@ -112,7 +112,7 @@ def check(usd_path: str) -> None:
     print(
         "\n[CHECK] Expect 16 joints: 4 x hipx/hipy/knee/wheel per leg; 17 bodies "
         "(base + 16 leg links; the empty camera/lidar links are merged away); "
-        "total mass ~38.5 kg; root height 0.50 above the ground plane."
+        "total mass ~34.5 kg; root height 0.50 above the ground plane."
     )
     print("[CHECK] If the joint order or names differ, fix the regexes in "
           "isaaclab_m20/assets/m20.py and isaaclab_m20/tasks/m20_env_cfg.py.")

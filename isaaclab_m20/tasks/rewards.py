@@ -407,8 +407,9 @@ def joint_deviation_l2(env, scale: float = 1.0,
     (``(2.0 + 1.0) * dt``): one folded knee was worth more than perfect tracking,
     so the policy's gradient was almost entirely "unfold the legs" and the
     tracking channels never got to speak. With a mean over the twelve joints and
-    a 1 rad scale the same numbers read: nominal ``kp = 80`` sag (0.27 rad) costs
-    ``-0.0015``, a seriously folded leg (1.65 rad) costs ``-0.054`` -- the same
+    a 1 rad scale the same numbers read: nominal ``kp = 80`` sag (0.15 rad, from
+    84.6 N per leg and a 0.143 m knee-to-wheel arm) costs ``-0.0005``, a seriously
+    folded leg (1.65 rad) costs ``-0.054`` -- the same
     order as the reward the policy can earn, which is what a shaping term has to
     be for PPO to trade it off against tracking.
 

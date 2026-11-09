@@ -101,7 +101,7 @@ M20_USD=urdf python -m isaaclab_m20.scripts.check_m20 --headless
 - 16 个 joint，名字为 `fl_hipx_joint` … `hr_wheel_joint`（每条腿 hipx / hipy / knee / wheel）；
 - **17 个 body**（base + 16 个腿部链接）；
 - 默认关节角：hipx = 0.0，hipy = 0.61，knee = -1.22，wheel = 0.0；
-- 总质量 ≈ 38.5 kg；
+- 总质量 ≈ **34.5 kg**（base 15.88 + 髋横滚 4×0.26 + 髋俯仰 4×2.49 + 小腿 4×1.26 + 轮 4×0.64）；
 - 根高度 0.50 m。
 
 官方 URDF 里 `front_camera_link` / `rear_camera_link` / `front_lidar_link` / `rear_lidar_link` 都是**空标签**（`<link name="x"/>`，没有 inertial / visual / collision）。保留它们会生成 4 个**零质量零惯量**的刚体，在 PhysX GPU 求解器里构成奇异质量矩阵，并在组合后的 stage 里留下 `/visuals/<link>` 的悬空引用——表现为运行时偶发的 `CUDA error: an illegal memory access`。所以 URDF 导入用 `merge_fixed_joints=True` 把它们并入 `base_link`。这也是 `M20_USD=urdf` 这条路唯一比官方 USD 更"干净"的地方：如果官方 USD 打印出 **21 个 body**（4 个传感器 link 独立成刚体），就切回 URDF 版。

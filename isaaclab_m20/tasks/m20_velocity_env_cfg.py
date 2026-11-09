@@ -276,8 +276,8 @@ class RewardsCfg:
         func=rewards.wheel_speed_l2, weight=-0.2, params={"scale": 2.0})
 
     # -- posture and smoothness ----------------------------------------------
-    # mean over the twelve leg joints, 1 rad scale: -0.0015/step at the nominal
-    # sag (0.27 rad) and -0.054/step with a leg folded 1.65 rad, i.e. the same
+    # mean over the twelve leg joints, 1 rad scale: -0.0005/step at the nominal
+    # sag (0.15 rad) and -0.054/step with a leg folded 1.65 rad, i.e. the same
     # order as the +0.06/step the tracking channels can pay. The first version
     # summed 12 terms over 0.3 rad and charged -0.367/step for the same pose,
     # which made "unfold the legs" the only gradient the policy could see.
