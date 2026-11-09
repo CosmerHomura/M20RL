@@ -152,10 +152,10 @@ def resolve_checkpoint(experiment_name: str) -> Path:
     to the velocity env and crash on a shape mismatch.
 
     The velocity run nests its checkpoints one level deeper, one directory per
-    curriculum stage (``<run>/stage4_agile/model_3850.pt``), so the search is
+    curriculum stage (``<run>/stage4_agile/model_4200.pt``), so the search is
     recursive and ordered by modification time: the newest stage wins. The
     iteration number in those names is cumulative over the whole run, not the
-    stage's own budget -- stage 4 ends around 3850, not 1250.
+    stage's own budget -- stage 4 ends around 4200, not 1400.
 
     ``--checkpoint`` may also be a directory (a stage directory or the run
     directory), in which case its highest iteration number is used.

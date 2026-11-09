@@ -35,12 +35,14 @@ the course.
 
 Wheel action scale
 ------------------
-8.0 rad/s per unit action against a 0.09 m wheel radius is 0.72 m/s at full
-action, i.e. 69% of the +-0.5 m/s final forward command and ~2.9x the +-0.25 m/s
-forward acceptance target. The old 20.0 (~1.8 m/s) is faster than anything this
-task commands, and every rad/s of unusable range is a rad/s the policy has to
-search through. Speed is worth revisiting only after the tracking numbers in
-``scripts/eval.py`` are met.
+22.2 rad/s per unit action against a 0.09 m wheel radius is **2.0 m/s at full
+action**, which is the top speed the last stage commands (+-2.0 m/s forward). That
+is the speed envelope the whole course is built around. It is a policy choice, not
+a hardware one: the wheel actuator allows 200 rad/s (18 m/s at the contact) and
+its 21.6 N*m is 240 N per wheel against a 338 N friction ceiling for the 34.5 kg
+robot. The earlier 8.0 (0.72 m/s) was picked to leave exploration headroom and
+instead capped the robot below walking speed; changing the scale changes the
+meaning of the four wheel actions, so the course restarts from stage 1.
 """
 from __future__ import annotations
 
@@ -144,7 +146,13 @@ class ActionsCfg:
     wheel_velocities = mdp.JointVelocityActionCfg(
         asset_name="robot",
         joint_names=observations.WHEEL_JOINT_NAMES,
-        scale=8.0,
+        # |a| = 1 asks for 22.2 rad/s. With the 0.09 m wheel that is 2.0 m/s, the
+        # speed the top stage commands. The motor itself allows far more (the
+        # actuator velocity limit is 200 rad/s = 18 m/s, and 21.6 N*m / 0.09 m =
+        # 240 N per wheel against a 338 N friction ceiling for the whole robot),
+        # so the scale -- not the hardware -- sets the envelope. 8.0 was the old
+        # value and capped the robot at 0.72 m/s, slower than walking.
+        scale=22.2,
         use_default_offset=False,
     )
 

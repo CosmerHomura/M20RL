@@ -7,13 +7,20 @@ previous stage's checkpoint:
 stage   name                iters     command range (half-widths)       zero cmd
 ======  ==================  ========  ================================  =========
 1       stand               900       vx 0,        vy 0,     wz 0        100%
-2       forward_backward    700       vx +-0.4,    vy 0,     wz 0        50%
-3       multi_direction     1000      vx +-0.5,    vy +-0.2, wz +-0.6    30%
-4       agile               1250      vx +-0.5,    vy +-0.2, wz +-0.8    20%
+2       forward_backward    700       vx +-0.8,    vy 0,     wz 0        50%
+3       multi_direction     1200      vx +-1.4,    vy +-0.4, wz +-0.8    30%
+4       agile               1400      vx +-2.0,    vy +-0.5, wz +-1.0    20%
 ======  ==================  ========  ================================  =========
 
-3850 iterations total, in the order "stand -> forward/back -> everything ->
+4200 iterations total, in the order "stand -> forward/back -> everything ->
 faster and stop/go", one axis group introduced per stage.
+
+The speed envelope is 2.0 m/s, set by the wheel action scale: ``scale=22.2``
+rad/s times the 0.09 m wheel. It is a policy choice, not a hardware limit (the
+actuator allows 200 rad/s and 240 N per wheel against a 338 N friction ceiling);
+the earlier ``scale=8.0`` capped the robot at 0.72 m/s, slower than walking, and
+that cap was the reason the whole course looked slow. Changing it changes the
+meaning of the four wheel actions, so the course restarts from stage 1.
 
 Stage 1 is budgeted at 900 to cover the *fixed*-rate mode (``--fixed_lr``), where
 the standing curve only flattens out around iteration 700-900; with the default
@@ -43,10 +50,12 @@ its own stage (rather than as a warmup inside stage 2) gives it its own
 checkpoint, which is what makes the later stages comparable: if forward/backward
 never improves on stage 1, the problem is the command, not the baseline.
 
-Every stage that introduces a new axis opens with a short warmup during which
-that axis is interpolated from zero up to its target width over 150-300
-iterations, instead of appearing at full width on the first step. Stage 4 has no
-warmup for the new width: only the sampling distribution and the hold time change.
+Every stage that introduces a new axis or widens an existing one opens with a
+warmup during which the range is interpolated linearly over 300-400 iterations,
+instead of appearing at full width on the first step. ``--warmup_frac`` turns that
+into a share of the stage's budget, which is what a stage given a much larger
+budget than planned needs (``--stage 2 --iterations 4000 --warmup_frac 0.5``
+spends its first 2000 iterations growing vx to +-0.8).
 
 Two log-directory rules, both about the "train a stage, look at it, decide"
 loop:
@@ -152,16 +161,18 @@ STAGES: tuple[Stage, ...] = (
     # layout. Every term still runs; the tracking terms just mean "be still".
     Stage("1_stand", 900, (0.00, 0.0, 0.0), (0.00, 0.0, 0.0), 0, zero_prob=1.0),
     # Half the commands stay zero, so standing is rehearsed while the first
-    # moving axis is learned.
-    Stage("2_forward_backward", 700, (0.00, 0.0, 0.0), (0.40, 0.0, 0.0), 150,
+    # moving axis is learned. 0.8 m/s is 40% of the 2.0 m/s envelope: enough to
+    # force a real gait, slow enough that falling is not the first lesson.
+    Stage("2_forward_backward", 700, (0.00, 0.0, 0.0), (0.80, 0.0, 0.0), 300,
           zero_prob=0.5),
     # Lateral and yaw arrive together: they are the two axes the wheels cannot
     # produce on their own and the ones that break the standing skill first.
-    Stage("3_multi_direction", 1000, (0.40, 0.0, 0.0), (0.50, 0.2, 0.6), 300,
+    # vx is already at 0.8 and grows to 1.4 while vy/wz grow in from 0.
+    Stage("3_multi_direction", 1200, (0.80, 0.0, 0.0), (1.40, 0.40, 0.80), 400,
           zero_prob=0.3),
-    # Full range, 20% stops and shorter holds: accelerate, stop, turn and side-step
-    # several times per episode.
-    Stage("4_agile", 1250, (0.50, 0.2, 0.6), (0.50, 0.2, 0.8), 0,
+    # The last 0.6 m/s of vx plus 20% stops and shorter holds: accelerate, stop,
+    # turn and side-step several times per episode, at the top of the envelope.
+    Stage("4_agile", 1400, (1.40, 0.40, 0.80), (2.00, 0.50, 1.00), 300,
           zero_prob=0.2, resampling=(1.5, 3.0)),
 )
 
@@ -208,6 +219,11 @@ parser.add_argument("--iterations", type=int, default=None,
                          "the script never decides on its own that a stage has had enough. "
                          "--iters_stageN is only for --stage all, "
                          "where several stages run back to back with different budgets.")
+parser.add_argument("--warmup_frac", type=float, default=None,
+                    help="Length of the command ramp as a fraction of this stage's budget "
+                         "(0.5 = the first half grows linearly, the rest samples across the "
+                         "full range). Default: the stage's own warmup, capped at half the "
+                         "budget. Only stages that declare a warmup are affected.")
 for _number, _course_stage in enumerate(STAGES, start=1):
     parser.add_argument(
         f"--iters_stage{_number}", type=int, default=None,
@@ -302,12 +318,18 @@ def select_stages(
     scale: float,
     iterations: int | None,
     per_stage: dict[int, int | None] | None = None,
+    warmup_frac: float | None = None,
 ) -> list[tuple[int, Stage]]:
     """Which stages this run executes, with the iteration budget applied.
 
     The budget of stage ``N`` comes from, in order of precedence: ``per_stage[N]``
     (``--iters_stageN``), then ``iterations`` (``--iterations`` for every selected
     stage), then the stage's default budget times ``--stage_scale``.
+
+    ``warmup_frac`` (``--warmup_frac``) turns the ramp into a fraction of that
+    budget, which is what a stage that is given a much bigger budget than planned
+    needs: stage 2 over 4000 iterations should spend the first 2000 growing the
+    range instead of reaching +-0.4 after 150 and sampling there for 39 minutes.
 
     Returns ``(index_in_STAGES, stage)`` pairs so the caller can find the
     preceding stage's checkpoint for the first selected stage.
@@ -337,9 +359,14 @@ def select_stages(
             raise SystemExit(f"stage {stage.name} would run {budget} iterations")
         # Never spend more than half of a trimmed stage on the warmup: with
         # --stage_scale 0.05 the budget is 35 iterations for stage 2 and a
-        # 150-iteration warmup would hold the new axis near zero the whole run.
+        # 300-iteration warmup would hold the new axis near zero the whole run.
         # A stage with no warmup (stage 1) keeps 0, so it never steals iterations.
-        warmup = min(stage.warmup, budget // 2) if stage.warmup else 0
+        # --warmup_frac replaces the absolute number with a share of the budget;
+        # it still cannot exceed the budget, and stages without a ramp stay flat.
+        if warmup_frac is not None and stage.warmup:
+            warmup = min(int(round(budget * warmup_frac)), budget)
+        else:
+            warmup = min(stage.warmup, budget // 2) if stage.warmup else 0
         out.append((index, Stage(stage.name, budget, stage.ranges_from, stage.ranges_to,
                                  warmup, stage.zero_prob, stage.resampling)))
     return out
@@ -924,7 +951,8 @@ def main() -> None:
     # The velocity task carries a command term; the standing task does not.
     is_velocity_task = hasattr(env_cfg, "commands")
     per_stage = {index: getattr(args_cli, f"iters_stage{index + 1}") for index in range(len(STAGES))}
-    stages = select_stages(args_cli.stage, args_cli.stage_scale, args_cli.iterations, per_stage) \
+    stages = select_stages(args_cli.stage, args_cli.stage_scale, args_cli.iterations, per_stage,
+                           args_cli.warmup_frac) \
         if is_velocity_task else []
 
     if is_velocity_task:
@@ -1002,7 +1030,7 @@ def main() -> None:
                 first_done = stage_relative_iteration(
                     candidate, log_root_path, first_number)
         first_vx, first_vy, first_wz = interpolate_ranges(
-            first_stage, first_done, STAGES[first_number].warmup)
+            first_stage, first_done, first_stage.warmup)
         env_cfg.commands.base_velocity.ranges.lin_vel_x = (-first_vx, first_vx)
         env_cfg.commands.base_velocity.ranges.lin_vel_y = (-first_vy, first_vy)
         env_cfg.commands.base_velocity.ranges.ang_vel_z = (-first_wz, first_wz)
@@ -1165,12 +1193,13 @@ def main() -> None:
         if schedule is not None and stage is not None:
             # Continuing a stage resumes its ramp where it stopped (same command
             # range as the last iteration it trained), so the env looks exactly
-            # like it did at the end of the previous attempt. The untrimmed warmup
-            # is used on purpose: --stage_scale trims a *fresh* stage's ramp, but a
-            # resumed one has to stay on the same ramp it was already climbing.
+            # like it did at the end of the previous attempt. The ramp length is
+            # this stage's effective one (--warmup_frac / --stage_scale applied),
+            # and ``resumed_iterations`` is measured on the same ramp, so a stage
+            # interrupted at 900 of a 2000-iteration ramp picks up at 45%.
             schedule.start_stage(
                 stage,
-                warmup=STAGES[stage_index].warmup if resuming_own_stage else None,
+                warmup=stage.warmup,
                 resume_iteration=resumed_iterations)
 
         start = time.time()

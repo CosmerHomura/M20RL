@@ -9,7 +9,7 @@ Two runners:
 The stager that actually uses the velocity runner is ``scripts/train.py``: it
 runs the four course stages back to back, loading the previous stage's
 checkpoint each time, so ``max_iterations`` here is only the sum of the stage
-budgets (900 + 700 + 1000 + 1250) used as the fallback total.
+budgets (900 + 700 + 1200 + 1400) used as the fallback total.
 """
 from isaaclab.utils import configclass
 from isaaclab_rl.rsl_rl import (
@@ -73,19 +73,23 @@ class M20VelocityRslRlPpoRunnerCfg(M20RslRlPpoRunnerCfg):
     * 8 mini-batches instead of 4 -- with 4096 envs x 24 steps = 98304 transitions
       per iteration, 8 batches is 12288 samples per update, which keeps each PPO
       update small enough for ``desired_kl = 0.01`` to actually bind.
-    * entropy 0.005 instead of 0.01 -- halved with the lower learning rate; the
-      standing task needs exploration around one pose, the velocity task needs to
-      *keep* the gait it finds rather than keep jittering.
-    * action std 0.5 rather than 1.0 -- the sampler puts the *same* sigma on all
+    * entropy 0.001 instead of 0.01 -- a tenth of the plan's value. The entropy
+      bonus is a constant push that *grows* log_std; it is only balanced by the
+      gradient of the policy loss, which is tiny when the reward is capped (stage
+      1 lives at ~0.05/step because the tracking kernels are already saturated).
+      At 0.005 the actor drifted its std up with the reward flat, which is
+      exploration paid for by nothing.
+    * action std 0.3 rather than 1.0 -- the sampler puts the *same* sigma on all
       16 action dims, but the dims do not mean the same thing: one unit of leg
-      action is 0.25 rad (14 deg), while one unit of wheel action is 8 rad/s
-      (0.72 m/s at the contact). A std of 0.9 therefore commanded the wheels to
-      +-7.2 rad/s (+-0.65 m/s) on every step of the "stand still" stage, which is
-      far larger than the 0.15 m/s the standing terms are trying to hold -- the
-      exploration noise alone recreated the wandering the reward was meant to
-      remove. 0.5 still gives +-7 deg of leg jitter and +-0.36 m/s of wheel
-      noise at the start, and rsl_rl shrinks the std as the policy improves.
-    * save_interval 50 -- the stages are 700-1250 iterations long, so 100 would
+      action is 0.25 rad (14 deg), one unit of wheel action is 22.2 rad/s
+      (2.0 m/s at the contact). A std of 0.9 commanded the wheels to +-20 rad/s
+      (+-1.8 m/s) on every step of the "stand still" stage, which is more than the
+      whole speed envelope; even 0.5 gives +-1.0 m/s, far above the 0.15 m/s the
+      standing terms try to hold. With the 2.0 m/s envelope the compromise is
+      0.3: +-6.7 rad/s of wheel noise (+-0.6 m/s, enough to break the standstill
+      deadlock) and +-0.075 rad of leg noise (enough to find a gait), and rsl_rl
+      shrinks the std as the policy improves.
+    * save_interval 50 -- the stages are 700-1400 iterations long, so 100 would
       leave 7 checkpoints per stage and no way to bisect a stage that goes bad
       halfway.
     * ``schedule="adaptive"`` -- the plan's original setting, kept as the
@@ -103,12 +107,12 @@ class M20VelocityRslRlPpoRunnerCfg(M20RslRlPpoRunnerCfg):
     """
 
     experiment_name = "m20_velocity"
-    # 900 + 700 + 1000 + 1250, see scripts/train.py
-    max_iterations = 3850
+    # 900 + 700 + 1200 + 1400, see scripts/train.py
+    max_iterations = 4200
     save_interval = 50
 
     policy = RslRlPpoActorCriticCfg(
-        init_noise_std=0.5,
+        init_noise_std=0.3,
         actor_hidden_dims=[256, 256],
         critic_hidden_dims=[256, 256],
         activation="elu",
@@ -119,7 +123,14 @@ class M20VelocityRslRlPpoRunnerCfg(M20RslRlPpoRunnerCfg):
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.005,
+        # 0.001 rather than the plan's 0.005: on stage 1 the reward is capped at
+        # ~0.05/step (the tracking kernels are already saturated while the robot
+        # holds still), so the policy-gradient term that shrinks log_std has
+        # almost nothing to push against while the entropy bonus keeps paying.
+        # The observed symptom was entropy creeping up with mean_reward flat --
+        # i.e. the actor relaxing its std instead of improving. Fifth of the
+        # plan's value, still non-zero so the std does not collapse early.
+        entropy_coef=0.001,
         num_learning_epochs=5,
         num_mini_batches=8,
         learning_rate=3.0e-4,

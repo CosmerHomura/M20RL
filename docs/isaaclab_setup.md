@@ -132,7 +132,7 @@ python -m isaaclab_m20.scripts.train --headless --stage 1 --run_name m20_v1
 ```
 
 - 站立任务每个 iteration 采集 4096 × 24 = 98,304 步；默认跑 3000 iterations。
-- 速度指令任务每个 iteration 也是 4096 × 24 = 98,304 步，4 阶段合计 3850 iterations（≈3.8 亿条转移）。
+- 速度指令任务每个 iteration 也是 4096 × 24 = 98,304 步，4 阶段合计 4200 iterations（≈4.1 亿条转移）。
 - 日志：`logs/rsl_rl/m20_wheeled/<时间戳>/`（站立，每 100 iterations 存一个 checkpoint）；速度指令任务按阶段分目录，`logs/rsl_rl/m20_velocity/<run_name>/stage{N}_<name>/`，每阶段每 50 iterations 存一个 `model_*.pt`。
 - 想给这次实验起名：`--run_name v1`，日志就落在 `logs/rsl_rl/m20_velocity/v1/`。
 - 显存不够就降 `--num_envs`（16 GB 用 2048）。**训练期间只跑一个 Isaac Lab 进程**——两个进程抢同一张卡的表现是帧率崩到个位数，而不是干脆的 OOM。
@@ -178,7 +178,7 @@ python -m isaaclab_m20.scripts.play --headless --video
 
 `play.py` 加载 checkpoint 后就地站立推演，视频写到 `videos/`，`--video_length` 是策略步数（50 Hz，500 步 = 10 s）。
 
-`--task` 决定加载哪个任务的模型：不传 `--checkpoint` 时，脚本在 `logs/rsl_rl/<experiment>/` 下自动找最新 checkpoint——站立是 `m20_wheeled/`、速度指令是 `m20_velocity/`，两个目录的 checkpoint 维度不同（57 vs 56），按目录隔离就不会串。速度指令任务的 checkpoint 按阶段多一层目录（`.../stage4_agile/model_3850.pt`），给 `--stage N` 就直接定位到第 N 阶段、取其中迭代号最大的那个，不用去目录里翻这一阶段停在哪一轮；不给则递归查找、按修改时间取最新，拿到的是最后一阶段的最新模型。文件名里的数字是**累计**迭代数（rsl_rl 原有的 -1 已修正），所以阶段 4 的文件不叫 1250 而叫 3850 左右。
+`--task` 决定加载哪个任务的模型：不传 `--checkpoint` 时，脚本在 `logs/rsl_rl/<experiment>/` 下自动找最新 checkpoint——站立是 `m20_wheeled/`、速度指令是 `m20_velocity/`，两个目录的 checkpoint 维度不同（57 vs 56），按目录隔离就不会串。速度指令任务的 checkpoint 按阶段多一层目录（`.../stage4_agile/model_4200.pt`），给 `--stage N` 就直接定位到第 N 阶段、取其中迭代号最大的那个，不用去目录里翻这一阶段停在哪一轮；不给则递归查找、按修改时间取最新，拿到的是最后一阶段的最新模型。文件名里的数字是**累计**迭代数（rsl_rl 原有的 -1 已修正），所以阶段 4 的文件不叫 1400 而叫 4200 左右。
 
 ### 推一把试试
 
@@ -220,9 +220,9 @@ python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0 \
 python -m isaaclab_m20.scripts.eval
 
 # 指定 checkpoint，结果同时写 JSON，任一项不过就返回非零退出码
-#（文件名 = 累计迭代数，阶段 4 结束时约 3850；也可以只给目录或 --stage 4，脚本自己取最新）
+#（文件名 = 累计迭代数，阶段 4 结束时约 4200；也可以只给目录或 --stage 4，脚本自己取最新）
 python -m isaaclab_m20.scripts.eval \
-    --checkpoint logs/rsl_rl/m20_velocity/m20_v1/stage4_agile/model_3850.pt \
+    --checkpoint logs/rsl_rl/m20_velocity/m20_v1/stage4_agile/model_4200.pt \
     --json_out eval.json --strict
 ```
 
@@ -252,10 +252,10 @@ eval 会强制**关掉域随机化、关掉指令重采样**，机器人是标�
 | --- | --- |
 | 控制频率 | 50 Hz（`sim.dt=0.005` × `decimation=4`） |
 | 腿动作 | `JointPositionActionCfg(scale=0.25, use_default_offset=True)` |
-| 轮动作 | `JointVelocityActionCfg`，`use_default_offset=False`；站立 scale=20（1.8 m/s），速度指令任务 scale=8.0（0.72 m/s） |
+| 轮动作 | `JointVelocityActionCfg`，`use_default_offset=False`；站立 scale=20（1.8 m/s），速度指令任务 scale=22.2（**2.0 m/s**） |
 | PD 伺服 | 腿 kp=80 / kd=2，轮 kp=0 / kd=2，200 Hz |
 | 力矩上限 | 腿 76.4 N·m，轮 21.6 N·m |
-| 指令（速度指令任务） | 机体系 `(vx, vy, ωz)`，每 2–4 s 重采样；50% 单轴 / 30% 双轴 / 10% 三轴 / 10% 零指令（阶段 1 的零指令占比 100%，阶段 2/3/4 固定为 50/30/20%）；4 阶段课程，满幅 vx ±0.5、vy ±0.2、ωz ±0.8；阶段 4 保持时间缩短到 1.5–3 s |
+| 指令（速度指令任务） | 机体系 `(vx, vy, ωz)`，每 2–4 s 重采样；50% 单轴 / 30% 双轴 / 10% 三轴 / 10% 零指令（阶段 1 的零指令占比 100%，阶段 2/3/4 固定为 50/30/20%）；4 阶段课程，满幅 **vx ±2.0、vy ±0.5、ωz ±1.0**（包线由轮动作 `scale=22.2 × 0.09 m` 决定）；阶段 4 保持时间缩短到 1.5–3 s |
 | 奖励 | 站立 14 项 / 速度指令 **10 项每步 + 摔倒 −10**（`track_lin_vel_xy`/`track_ang_vel_z` 用有界柯西核；高度、姿态、垂直速度都是平方惩罚；`wheel_speed` 是**唯一带门控**的一项，只在严格零指令时生效；**没有存活加成、没有位置保持、没有死区**；−10 只罚真摔倒、不罚超时，且由 `M20VelocityEnv` 在终止标志上加而不是奖励项；动作变化率按 1.0、腿关节加速度按 2000 归一——**别为"可读"把它们收紧**，那会把探索噪声放大成 −40/步；不做与指令无关的绝对速度惩罚、不强制四轮着地、不惩罚横向滑移），完整权重表见 [docs/algorithm.md](algorithm.md) §1 与 §6.3 |
 | 终止 | 站立：高度 < 0.25、倾角 > 0.7、超时；速度指令：高度 < 0.33、倾角 > 0.5、超时 |
 | 奖励裁剪 | **没有**。速度指令任务不把每步奖励压到 0（`only_positive_rewards` 试过又删了：策略早期每步为负会被 clip 成常数 0、梯度消失）；`Train/mean_reward` 与 `Episode_Reward/*` 是同一套数字，为负是正常的 |

@@ -55,10 +55,10 @@ advantage.
 **Normalisation scales are anti-noise, not readability.** ``action_scale = 0.05``
 and ``acc_scale = 200`` read nicely ("a 0.05 action step counts as 1") but they
 multiply the *exploration* noise by the same factor: actions are resampled every
-control step from N(0, sigma), so at ``init_noise_std = 0.5`` the step-to-step
-difference has std 0.7 and ``sum((da/0.05)²)`` is ~3200 -- -32 per step at weight
+control step from N(0, sigma), so at ``init_noise_std = 0.3`` the step-to-step
+difference has std 0.42 and ``sum((da/0.05)²)`` is ~1150 -- -11 per step at weight
 -0.01, dwarfing the +3 the tracking terms can pay. At ``action_scale = 1.0`` /
-``acc_scale = 2000`` the same noise costs 0.08 / 0.17. The honest cost: a quadratic
+``acc_scale = 2000`` the same noise costs 0.03 / 0.06. The honest cost: a quadratic
 cannot tell noise from chatter, so these two terms are mild on real vibration
 until the noise floor drops -- vibration is mostly priced by the return it loses.
 
@@ -290,11 +290,11 @@ def action_rate_l2(env, action_scale: float = 1.0) -> torch.Tensor:
     the smallest step that "should" be free (0.05 action units), but the same
     normalisation multiplies the *exploration noise* by the same factor: actions
     are resampled every control step from N(0, sigma), so with ``init_noise_std =
-    0.5`` the step-to-step difference has std 0.7 and ``sum((da / 0.05)^2)`` is
-    about 3200 -- i.e. -32 reward per step at weight -0.01, dwarfing the +3 the
+    0.3`` the step-to-step difference has std 0.42 and ``sum((da / 0.05)^2)`` is
+    about 1150 -- i.e. -11 reward per step at weight -0.01, dwarfing the +3 the
     tracking terms can pay, so the noise (not the policy) would set the cost.
 
-    At ``action_scale = 1.0`` the same noise costs ``8 * 0.01 = 0.08``, and a
+    At ``action_scale = 1.0`` the same noise costs ``2.9 * 0.01 = 0.03``, and a
     policy that has learned to move smoothly pays almost nothing -- which is the
     honest way round: the term prices *unnecessary* motion, not exploration.
     """
@@ -313,12 +313,12 @@ def leg_joint_acc_l2(env, acc_scale: float = 2000.0,
 
     The catch, and why ``acc_scale`` is 2000 rather than 200: the exploration
     noise lands in this term too. Actions are resampled every control step from
-    N(0, sigma), so with ``init_noise_std = 0.5`` the joints see accelerations
-    around 1700 rad/s^2 before the policy has learned anything. At ``acc_scale =
-    200`` that is ``12 * 72 = 870`` per step, i.e. two orders of magnitude more
-    than the whole positive side of the reward, so the noise alone would decide
+    N(0, sigma), so with ``init_noise_std = 0.3`` the joints see accelerations
+    around 1000 rad/s^2 before the policy has learned anything. At ``acc_scale =
+    200`` that is ``12 * 25 = 300`` per step, i.e. orders of magnitude more than
+    the whole positive side of the reward, so the noise alone would decide
     whether the policy learns anything. At 2000 the same noise costs
-    ``12 * 0.72 * 0.02 = 0.17``.
+    ``12 * 0.25 * 0.02 = 0.06``.
 
     Consequence worth accepting: a quadratic term cannot tell noise from chatter
     (both are just qdd), so a weight that tolerates the noise is also mild on the
@@ -381,8 +381,10 @@ def wheel_speed_l2(env, scale: float = 2.0, command_name: str = "base_velocity",
 
     Gated, unlike the body terms, because when a command is present the wheels are
     supposed to spin: ungated, an in-place turn would pay for the differential
-    rolling that produces it. ``scale = 2 rad/s`` is 0.18 m/s of rolling, a fifth
-    of the 0.72 m/s the wheel action can reach.
+    rolling that produces it. ``scale = 2 rad/s`` is 0.18 m/s of rolling, ~9% of
+    the 2.0 m/s envelope, so a robot that has just been asked to stop from top
+    speed pays heavily for the first control steps -- that is the brake, and it is
+    why the term is a *brake* rather than a tax.
 
     Mean over the four wheels, not sum: a single noisy wheel should not outweigh
     the whole posture channel.

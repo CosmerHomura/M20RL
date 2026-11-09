@@ -17,7 +17,14 @@ robot is the nominal one, and the numbers are what deployment would see.
 8                  (-0.30, 0.20, -0.30) backward + strafe left + turn right
 9                  (0, 0, 0)        hold still
 10                 (0.30,0,0) <-> (0,0,0)   switch go/stop, 3 cycles
+11                 (1.00, 0, 0)     forward at half the 2.0 m/s envelope
+12                 (2.00, 0, 0)     forward at the top speed
 =================  ===============  ===============
+
+Rows 1-8 are the plan's low-speed checks and stay absolute (0.10 m/s is 33% of a
+0.30 m/s command, but the policy should be far inside it on flat ground). Rows 11
+and 12 are the speed envelope: 0.10 m/s is 10% and 5% of those commands, which is
+where a policy that only learned to creep starts to fail.
 
 Acceptance (from the plan):
 
@@ -44,7 +51,7 @@ Usage::
     python -m isaaclab_m20.scripts.eval --seconds 10 --num_envs 32 --strict
 
 ``--checkpoint`` takes a ``model_*.pt`` file or a directory (stage or run); the
-file names carry the cumulative iteration count, so stage 4 ends around 3850.
+file names carry the cumulative iteration count, so stage 4 ends around 4200.
 ``--stage N`` picks the highest checkpoint of ``<newest run>/stageN_*`` instead,
 which is the "check this stage before spending the next one" entry point.
 """
@@ -123,6 +130,11 @@ TESTS: tuple[Test, ...] = (
     Test("7", (0.30, 0.00, 0.30), "forward + turn left"),
     Test("8", (-0.30, 0.20, -0.30), "back + strafe left + turn right"),
     Test("9", (0.00, 0.00, 0.00), "hold still"),
+    # The speed envelope, 2.0 m/s set by the wheel action scale (22.2 rad/s x
+    # 0.09 m). Rows 1-9 are all below 0.5 m/s, so without these two a policy
+    # that never left the low-speed regime would pass the battery.
+    Test("11", (1.00, 0.00, 0.00), "forward, half the envelope"),
+    Test("12", (2.00, 0.00, 0.00), "forward, top speed"),
 )
 
 # Acceptance thresholds from the plan.
