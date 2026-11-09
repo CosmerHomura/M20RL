@@ -154,7 +154,7 @@ tensorboard --logdir logs/rsl_rl --bind_all --port 6006
 - `Episode_Reward/flat_orientation` / `base_height`：是否在往 0 靠（机身水平、高度到位；两项现在都是**平方惩罚**）；
 - `Episode_Reward/wheel_speed`：零指令下越接近 0 越稳（没有空转）。**唯一带门控的一项**，"零指令不许动"更多看 `Train/mean_reward` 与 `[health]` 的 `|v_xy|`；
 - `Episode_Termination/base_height` / `bad_orientation`：翻车/趴下比例是否在降；
-- `Loss/learning_rate`：`schedule="adaptive"`，学不动时会自动降 lr。
+- `Loss/learning_rate`：速度任务**固定 3e-4**，应该是一条水平线；出现锯齿说明 `schedule` 被改回了 `adaptive`（`m20_v5` 就是在这上面崩的）；
 
 ## 6. 播放与评估
 

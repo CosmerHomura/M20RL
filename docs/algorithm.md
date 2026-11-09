@@ -532,12 +532,12 @@ logs/rsl_rl/m20_velocity/<run_name>/
 | `[health] fall_rew` / `timeout_rew` | 终端行里直接看的两项：摔倒步实际交给 rsl_rl 的奖励（应 ≈ −10）与超时步（应 ≥ 0）。**没有 `Episode_Reward/termination_penalty` 曲线了**——这条惩罚由 `M20VelocityEnv` 在奖励管理器之后加，只出现在 `Train/mean_reward` 与 `[health]` 里 |
 | `Episode_Termination/base_height` / `bad_orientation` | 从高往低降，阶段 2 末应 < 10% |
 | `Episode_Termination/time_out` | 应接近 1（绝大多数回合跑到 20 s）。**它和上面两项加起来不到 1，说明有回合被别的条件截断** |
-| `Episode/length` | 就是"平均活了多少步"。满值 1000 步；**如果这一项很高但录像里机器人在趴着，先看 `base_height`/`bad_orientation` 是否真的在涨**——终止判据没触发时，倒地也会跑满 20 s |
-| `Loss/learning_rate` | 自适应，学不动时自动降 |
+| `Episode/length` | 就是"平均活了多少步"。满值 1000 步；**如果这一项很高但录像里机器人在趴着，先看 `base_height`/`bad_orientation` 是否真的在涨**——终止判据没触发时，倒地也会跑满 20 s。**阶段 1 满 1000 步保持 100 轮以上不往下掉，这一阶段就该停**（阶段 1 的最优解是一个静态姿态，40–200 轮是平台期，继续跑只会撞上不稳定的边界） |
+| `Loss/learning_rate` | **固定 3e-4，应是一条水平线**。`m20_v5` 上它曾是 0 与 2e-3 之间的锯齿，`mean_episode_length` 在第 200 轮随一次 lr 尖峰从 1000 掉到 380 —— 见到锯齿就说明 `schedule` 又被改回 `adaptive` 了 |
 | `[terms]` 行（默认每 200 步） | `--per_term_every` 打开，`[terms] per-step (value×weight×dt)` 逐项列出**每步实际进账**，末尾 `sum=` 应与同一时刻 `[health]` 的 `rew=` 相等（摔倒罚在之后才加，会差那一步的 −10）；下一行 `[terms] episode sums` 是 `_episode_sums` 的均值，也就是 tensorboard 的 `Episode_Reward/*`。**权重之间唯一可比的尺度是 per-step 那一行**——episode sums 会随回合变长而变大，一项权重严重过大时在那里也可能看不出 |
 
 终端里每 50 轮打印 `[cmd] iter=... vx=... vy=... wz=...`（当前阶段与当前指令范围），退火期间能看到范围在长；每个阶段开始时还会打印一行 `[cmd] stage=... hold=...s zero_prob=...`，阶段 4 的 0.20/1.5–3 s 就在这一行里核对。`[health]` 行里的 `rew=` 是每步奖励的均值（**未做任何裁剪**，为负是正常的），`neg=` 是"负奖励步数占比"：`neg` 贴着 1.00 且 `Train/mean_reward` 不爬，说明这一阶段的指令已经跑在策略能力前面。**换阶段那一刻跟踪分会掉一下**（新维度从 0 长出来），看它能不能在 warmup 内爬回来；如果爬不回来，说明上一阶段的 checkpoint 没被正确加载（检查 `[INFO] Continuing from ...` 那行）。
 
-**`[terms]` 行怎么用**：看到 `rew=-3.4` 时不要猜，直接看同一行的分解——比如 `joint_deviation=-1.9  action_rate=-1.2  leg_joint_acc=-0.4  track_lin_vel_xy=+0.3`，立刻知道负号来自哪两项。若某一项稳定压过整个正项面（正项上限 = 2.0 + 1.0 = 3.0），先调那一项的权重或尺度，而不是加存活加成或裁剪奖励（`[terms]` 的设计就是让这种"某一项把信号压平"的情况在终端里可见，而不是等一整轮 `Train/mean_reward` 恒 0 才发现）。
+**`[terms]` 行怎么用**：看到 `rew=-3.4` 时不要猜，直接看同一行的分解——比如 `joint_deviation=-1.9  action_rate=-1.2  leg_joint_acc=-0.4  track_lin_vel_xy=+0.3`，立刻知道负号来自哪两项。若某一项稳定压过整个正项面（per-step 的正项上限 = `(2.0 + 1.0) × dt = 0.06`），先调那一项的权重或尺度，而不是加存活加成或裁剪奖励（`[terms]` 的设计就是让这种"某一项把信号压平"的情况在终端里可见，而不是等一整轮 `Train/mean_reward` 恒 0 才发现）。
 
 **训练总量参考**：`4096 × 24 × 3250 ≈ 3.2 亿` 条转移。4090 上 4096 环境的每轮耗时比 1024 环境高约 3–4 倍，但每轮见到的样本也多 4 倍；整条课程是数小时量级，具体看 tensorboard 的 `fps` 和每阶段的 `finished in ... min`。显存不够时降 `--num_envs`，别降 `num_steps_per_env`（24 步是 20 s 回合在上千环境下的抓取窗口）。
