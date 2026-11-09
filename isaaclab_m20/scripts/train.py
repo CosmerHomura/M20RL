@@ -6,14 +6,23 @@ previous stage's checkpoint:
 ======  ==================  ========  ================================  =========
 stage   name                iters     command range (half-widths)       zero cmd
 ======  ==================  ========  ================================  =========
-1       stand               300       vx 0,        vy 0,     wz 0        100%
+1       stand               900       vx 0,        vy 0,     wz 0        100%
 2       forward_backward    700       vx +-0.4,    vy 0,     wz 0        50%
 3       multi_direction     1000      vx +-0.5,    vy +-0.2, wz +-0.6    30%
 4       agile               1250      vx +-0.5,    vy +-0.2, wz +-0.8    20%
 ======  ==================  ========  ================================  =========
 
-3250 iterations total, in the order "stand -> forward/back -> everything ->
+3850 iterations total, in the order "stand -> forward/back -> everything ->
 faster and stop/go", one axis group introduced per stage.
+
+Stage 1 is budgeted at 900 to cover the *fixed*-rate mode (``--fixed_lr``), where
+the standing curve only flattens out around iteration 700-900; with the default
+adaptive schedule it converges much sooner (m20_v5 hit the same plateau at
+~200 iterations because the scheduler had pushed lr to 1.5e-3), so treat 900 as
+an upper bound and stop the stage when the curve is flat. The budget cannot be
+separated from the rate: change ``learning_rate`` or ``--fixed_lr`` and the
+iteration count that matters changes with it -- judge by the curve, not the
+budget.
 
 The last column is the point of the course. Every stage after the first keeps a
 share of zero commands, so the standing skill is rehearsed while the moving
@@ -134,7 +143,7 @@ class Stage:
 STAGES: tuple[Stage, ...] = (
     # Zero command: the standing baseline under the new 56-dim observation
     # layout. Every term still runs; the tracking terms just mean "be still".
-    Stage("1_stand", 300, (0.00, 0.0, 0.0), (0.00, 0.0, 0.0), 0, zero_prob=1.0),
+    Stage("1_stand", 900, (0.00, 0.0, 0.0), (0.00, 0.0, 0.0), 0, zero_prob=1.0),
     # Half the commands stay zero, so standing is rehearsed while the first
     # moving axis is learned.
     Stage("2_forward_backward", 700, (0.00, 0.0, 0.0), (0.40, 0.0, 0.0), 150,
@@ -238,6 +247,13 @@ parser.add_argument(
     "--dr_ramp", type=float, default=0.4,
     help="Standing task only (no command term): fraction of training over which the "
          "domain randomization ramps from 0 to full.")
+parser.add_argument(
+    "--fixed_lr", action="store_true",
+    help="Pin the learning rate at ``learning_rate`` (schedule='fixed') instead of "
+         "the cfg's adaptive-in-KL schedule. Adaptive is the default because it is "
+         "the plan's setting, but it also swings Adam's step size (lr moved between "
+         "~0 and ~2e-3 in m20_v5); with --fixed_lr the rate stays at 3e-4 and a "
+         "stage needs a longer budget before it plateaus.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 if args_cli.video:
@@ -740,6 +756,15 @@ def main() -> None:
     agent_cfg = getattr(importlib.import_module(agent_module), agent_class)()
     agent_cfg.seed = args_cli.seed
     agent_cfg.device = args_cli.device
+    if args_cli.fixed_lr:
+        # The cfg ships with the plan's adaptive schedule; pin the rate here so
+        # the two modes can be compared without editing the config file.
+        agent_cfg.algorithm.schedule = "fixed"
+        print(f"[INFO] Schedule: fixed at lr={agent_cfg.algorithm.learning_rate:g}"
+              f" (cfg default is 'adaptive'; --fixed_lr overrides it)")
+    else:
+        print(f"[INFO] Schedule: {agent_cfg.algorithm.schedule}"
+              f" (start lr={agent_cfg.algorithm.learning_rate:g}; pass --fixed_lr to pin it)")
 
     # The velocity task carries a command term; the standing task does not.
     is_velocity_task = hasattr(env_cfg, "commands")

@@ -44,7 +44,7 @@ Usage::
     python -m isaaclab_m20.scripts.eval --seconds 10 --num_envs 32 --strict
 
 ``--checkpoint`` takes a ``model_*.pt`` file or a directory (stage or run); the
-file names carry the cumulative iteration count, so stage 4 ends around 3250.
+file names carry the cumulative iteration count, so stage 4 ends around 3850.
 ``--stage N`` picks the highest checkpoint of ``<newest run>/stageN_*`` instead,
 which is the "check this stage before spending the next one" entry point.
 """

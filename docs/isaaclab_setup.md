@@ -132,7 +132,7 @@ python -m isaaclab_m20.scripts.train --headless --stage 1 --run_name m20_v1
 ```
 
 - 站立任务每个 iteration 采集 4096 × 24 = 98,304 步；默认跑 3000 iterations。
-- 速度指令任务每个 iteration 也是 4096 × 24 = 98,304 步，4 阶段合计 3250 iterations（≈3.2 亿条转移）。
+- 速度指令任务每个 iteration 也是 4096 × 24 = 98,304 步，4 阶段合计 3850 iterations（≈3.8 亿条转移）。
 - 日志：`logs/rsl_rl/m20_wheeled/<时间戳>/`（站立，每 100 iterations 存一个 checkpoint）；速度指令任务按阶段分目录，`logs/rsl_rl/m20_velocity/<run_name>/stage{N}_<name>/`，每阶段每 50 iterations 存一个 `model_*.pt`。
 - 想给这次实验起名：`--run_name v1`，日志就落在 `logs/rsl_rl/m20_velocity/v1/`。
 - 显存不够就降 `--num_envs`（16 GB 用 2048）。**训练期间只跑一个 Isaac Lab 进程**——两个进程抢同一张卡的表现是帧率崩到个位数，而不是干脆的 OOM。
@@ -154,7 +154,7 @@ tensorboard --logdir logs/rsl_rl --bind_all --port 6006
 - `Episode_Reward/flat_orientation` / `base_height`：是否在往 0 靠（机身水平、高度到位；两项现在都是**平方惩罚**）；
 - `Episode_Reward/wheel_speed`：零指令下越接近 0 越稳（没有空转）。**唯一带门控的一项**，"零指令不许动"更多看 `Train/mean_reward` 与 `[health]` 的 `|v_xy|`；
 - `Episode_Termination/base_height` / `bad_orientation`：翻车/趴下比例是否在降；
-- `Loss/learning_rate`：速度任务**固定 3e-4**，应该是一条水平线；出现锯齿说明 `schedule` 被改回了 `adaptive`（`m20_v5` 就是在这上面崩的）；
+- `Loss/learning_rate`：默认 `adaptive`，会按 KL 在 0 与 2e-3 之间乘除 1.5（锯齿是正常形态）；加 `--fixed_lr` 后固定 3e-4、应是一条水平线。`m20_v5` 的锯齿曾把 `mean_episode_length` 从 1000 打到 380，所以锯齿一旦出现要盯着回合长度看；
 
 ## 6. 播放与评估
 
@@ -178,7 +178,7 @@ python -m isaaclab_m20.scripts.play --headless --video
 
 `play.py` 加载 checkpoint 后就地站立推演，视频写到 `videos/`，`--video_length` 是策略步数（50 Hz，500 步 = 10 s）。
 
-`--task` 决定加载哪个任务的模型：不传 `--checkpoint` 时，脚本在 `logs/rsl_rl/<experiment>/` 下自动找最新 checkpoint——站立是 `m20_wheeled/`、速度指令是 `m20_velocity/`，两个目录的 checkpoint 维度不同（57 vs 56），按目录隔离就不会串。速度指令任务的 checkpoint 按阶段多一层目录（`.../stage4_agile/model_3250.pt`），给 `--stage N` 就直接定位到第 N 阶段、取其中迭代号最大的那个，不用去目录里翻这一阶段停在哪一轮；不给则递归查找、按修改时间取最新，拿到的是最后一阶段的最新模型。文件名里的数字是**累计**迭代数（rsl_rl 原有的 -1 已修正），所以阶段 4 的文件不叫 1250 而叫 3250 左右。
+`--task` 决定加载哪个任务的模型：不传 `--checkpoint` 时，脚本在 `logs/rsl_rl/<experiment>/` 下自动找最新 checkpoint——站立是 `m20_wheeled/`、速度指令是 `m20_velocity/`，两个目录的 checkpoint 维度不同（57 vs 56），按目录隔离就不会串。速度指令任务的 checkpoint 按阶段多一层目录（`.../stage4_agile/model_3850.pt`），给 `--stage N` 就直接定位到第 N 阶段、取其中迭代号最大的那个，不用去目录里翻这一阶段停在哪一轮；不给则递归查找、按修改时间取最新，拿到的是最后一阶段的最新模型。文件名里的数字是**累计**迭代数（rsl_rl 原有的 -1 已修正），所以阶段 4 的文件不叫 1250 而叫 3850 左右。
 
 ### 推一把试试
 
@@ -220,9 +220,9 @@ python -m isaaclab_m20.scripts.play --task Isaac-M20-Wheeled-Velocity-v0 \
 python -m isaaclab_m20.scripts.eval
 
 # 指定 checkpoint，结果同时写 JSON，任一项不过就返回非零退出码
-#（文件名 = 累计迭代数，阶段 4 结束时约 3250；也可以只给目录或 --stage 4，脚本自己取最新）
+#（文件名 = 累计迭代数，阶段 4 结束时约 3850；也可以只给目录或 --stage 4，脚本自己取最新）
 python -m isaaclab_m20.scripts.eval \
-    --checkpoint logs/rsl_rl/m20_velocity/m20_v1/stage4_agile/model_3250.pt \
+    --checkpoint logs/rsl_rl/m20_velocity/m20_v1/stage4_agile/model_3850.pt \
     --json_out eval.json --strict
 ```
 
