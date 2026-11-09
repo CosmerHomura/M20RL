@@ -73,9 +73,12 @@ python -m isaaclab_m20.scripts.train --headless --run_name m20_v1
 
 # 5. 推荐流程：一次只跑一个阶段，跑完进模拟器看，再决定下一步。
 #    --stage N 自动接上一阶段：从同一次 run 里第 N-1 阶段的最新 checkpoint 续训。
-#    重新训练**同一阶段＝接着训**：目录复用、加载该阶段最新模型、补到它的预算，
-#    `--iterations N` 表示“再练 N 轮”。要真的从头重来才加 --overwrite
-#    （旧目录改名为 stageN_xxx.bak-<时间戳>，不删）。--new_run 另开一个 run。
+#    重新训练**同一阶段＝接着训**：目录复用、加载该阶段最新模型，然后跑多少轮由你说了算
+#    ——默认该阶段预算，`--iterations N` 就是这次跑 N 轮（脚本不替你算差额、也不判断够不够）。
+#    续训时**环境回到停下那一刻**：命令 ramp 从该阶段已达的迭代位置接上（warmup 中断就从中断处继续，
+#    不会跳到满幅），采样分布用该阶段的；同时把当前 cfg 与首次训练的 env.yaml 逐项对比，
+#    有差异（指令范围/奖励权重/域随机化/环境数）会 WARN，并把本次配置另存为 env.resume-<时间戳>.yaml。
+#    要真的从头重来才加 --overwrite（旧目录改名为 stageN_xxx.bak-<时间戳>，不删）。--new_run 另开一个 run。
 #    checkpoint 文件名 = 训练结束时已完成的累计迭代数（rsl_rl 原本会少 1，这里改掉了）。
 python -m isaaclab_m20.scripts.train --headless --stage 1 --run_name m20_v1
 
@@ -108,6 +111,100 @@ python -m isaaclab_m20.scripts.eval --stage 4
 # 12. 曲线
 tensorboard --logdir logs/rsl_rl --bind_all --port 6006
 ```
+
+## 命令行参数总表
+
+所有脚本都以 `python -m isaaclab_m20.scripts.<名字>` 运行。下面几张表是**全部**参数（默认值取自代码），`--help` 的输出与之一致。
+
+### train.py —— 训练
+
+| 参数 | 默认 | 作用 |
+| --- | --- | --- |
+| `--task` | `Isaac-M20-Wheeled-Velocity-v0` | 任务 id；站立任务是 `Isaac-M20-Wheeled-v0` |
+| `--num_envs` | 不传＝4096 | 并行环境数。24 GB 卡直接 4096；只有冒烟测试才降到 128 之类 |
+| `--seed` | `0` | 随机种子 |
+| `--stage` | `all` | `1`…`4`（站稳 / 前后 / 全向 / 更快）或 `all`。给了某个阶段：已训练过就**接着训**，没训练过就从上一阶段最新模型起 |
+| `--stage_scale` | `1.0` | 所有阶段预算的倍率（`0.05` 用来冒烟） |
+| `--iterations` | 不传＝该阶段预算 | **这次跑多少轮**。新阶段、续训都一样是字面值，脚本不做差额、也不判断够不够 |
+| `--iters_stage1` … `--iters_stage4` | 该阶段预算 × `--stage_scale` | 只在 `--stage all` 有意义：分别指定每个阶段的轮数（优先级最高）。单跑某阶段请用 `--iterations` |
+| `--run_name` | 不传＝沿用最新 run | `logs/rsl_rl/m20_velocity/<run_name>/` 下的 run 目录名，阶段是其子目录 |
+| `--new_run` | 关 | 另开一个时间戳 run（保留旧 run 作对比），并从"任意 run 里上一阶段最新模型"起步 |
+| `--overwrite` | 关 | 真的从头重来：把该阶段旧目录**改名**为 `<stage>.bak-<时间戳>`（永不删除） |
+| `--log_root` | `logs/rsl_rl` | 日志根目录（checkpoint、`env.yaml`/`agent.yaml`、tensorboard event 都在里面） |
+| `--video` | 关 | 录第一轮的视频 |
+| `--video_length` | `200` | 视频长度（策略步） |
+| `--video_folder` | `videos` | 视频输出目录 |
+| `--zero_actions` | 关 | 保持默认姿态、不训练。隔离测试：这样还崩就说明问题在模型/仿真，不在策略 |
+| `--health_every` | `24` | 每 N 个 env step 打印一行 `[health]`（`0` 关闭） |
+| `--per_term_every` | `200` | 每 N 个 env step 打印 `[terms]`：每个奖励项的 `value*weight*dt` 与回合累计值。这是唯一可比的尺度（`0` 关闭） |
+| `--dr` | `off` | `off`＝名义机器人（平地、摩擦 1.0、无质量/质心扰动、无推力）；`full`＝开摩擦/质量/质心随机化与推力 |
+| `--dr_ramp` | `0.4` | **仅站立任务**：域随机化从 0 到满幅所占的训练比例 |
+| `--fixed_lr` | 关 | 把学习率钉死在 `3e-4`（`schedule="fixed"`），不用 cfg 的 adaptive-in-KL。adaptive 是默认（原计划设置），但它会让 Adam 步长在 ~0 与 ~2e-3 之间摆 |
+
+### play.py —— 在仿真里看模型
+
+| 参数 | 默认 | 作用 |
+| --- | --- | --- |
+| `--stage` | 不传 | `1`…`4`：取最新 run 的 `stageN_*` 里迭代号最大的 checkpoint。**给了它就不用再写 `--task`**（阶段只存在于速度任务） |
+| `--checkpoint` | 不传＝最新模型 | 可以是 `model_*.pt` 文件、阶段目录、或 run 目录（目录取其中迭代号最大者） |
+| `--task` | 由 `--stage` 决定 | 任务 id；不给 `--stage` 时默认站立任务 |
+| `--num_envs` | `16` | 播放时的环境数 |
+| `--log_root` | `logs/rsl_rl` | 找 checkpoint 的根目录 |
+| `--video` / `--video_length` / `--video_folder` | 关 / `500` / `videos` | 出视频而不是开窗口 |
+| `--real_time` / `--no-real-time` | 有窗口时开 | 按仿真步长节流 |
+| `--cmd_vx` `--cmd_vy` `--cmd_wz` | 全 `0` | 固定速度指令（m/s、m/s、rad/s）；不传则用键盘 |
+| `--cmd_step` | `0.25` | 键盘每次按键给指令加多少 |
+| `--push_speed` | `1.0` | 按键/自动推力的大小（m/s 的水平速度冲量） |
+| `--push_every` | `0.0` | 每 N 秒仿真时间自动推一次（`0` 关闭），做视频用 |
+
+键盘：`W/S` 前后、`A/D` 左右、`Q/E` 偏航、`空格` 指令清零、`P` 推一下、`R` 重置。
+
+### eval.py —— 验收（固定指令序列）
+
+| 参数 | 默认 | 作用 |
+| --- | --- | --- |
+| `--stage` | 不传 | `1`…`4`：评测最新 run 的该阶段 |
+| `--checkpoint` | 不传＝最新模型 | `model_*.pt` 文件、阶段目录或 run 目录 |
+| `--task` | `Isaac-M20-Wheeled-Velocity-v0` | 任务 id |
+| `--num_envs` | `16` | 评测环境数（同一组指令并行跑，最后取平均） |
+| `--seconds` | `8.0` | 每组测试的时长（扣掉 settle 之后） |
+| `--settle` | `0.5` | 切换指令后丢弃的过渡时间（s） |
+| `--seed` | `12345` | 评测种子（与训练种子分开，避免背题） |
+| `--log_root` | `logs/rsl_rl` | 找 checkpoint 的根目录 |
+| `--json_out` | 不传 | 把结果写成 JSON 到这个路径 |
+| `--strict` | 关 | 有任何一项 FAIL 就以非零码退出（CI 用） |
+
+输出 10 组：`(0.3,0,0)`、`(−0.3,0,0)`、`(0,0.2,0)`、`(0,−0.2,0)`、`(0,0,0.5)`、`(0,0,−0.5)`、`(0.3,0,0.3)`、`(−0.3,0.2,−0.3)`、`(0,0,0)`（含 `drift` 净位移）、以及 10 组"起步→停住"切换测试。
+
+### check_joints.py —— 关节/奖励配置审计
+
+| 参数 | 默认 | 作用 |
+| --- | --- | --- |
+| `--task` | `Isaac-M20-Wheeled-Velocity-v0` | 要建的任务 |
+| `--num_envs` | `1` | 环境数（1 个就够） |
+| `--usd` | 不传＝按 `assets/m20.py` | 覆盖机器人 USD（对比 `model/usd/M20.usd` 与 `model/M20_urdf.usd` 时用） |
+| `--steps` | `200` | 零动作跑多少步再读"落位"姿态 |
+| `--settle` | 关 | 每 25 步也打印一次姿态，用来看还在不在动 |
+
+### check_m20.py / inspect_usd.py
+
+| 脚本 | 参数 | 默认 | 作用 |
+| --- | --- | --- | --- |
+| `check_m20.py` | `--usd` | `model/M20_urdf.usd` | 要检查的 USD |
+| `check_m20.py` | `--convert urdf` | 不传 | 先把 `model/urdf/M20.urdf` 重新导入成 USD |
+| `inspect_usd.py` | `--usd` | `model/usd/M20.usd` | 打印 USD 的 prim/关节结构 |
+
+### 所有脚本共享的 Isaac 启动参数（由 AppLauncher 提供）
+
+| 参数 | 作用 |
+| --- | --- |
+| `--headless` | 不开窗口（服务器必用） |
+| `--device cuda:0` / `cpu` | 计算设备 |
+| `--enable_cameras` | 需要相机/RTX 传感器时打开 |
+| `--livestream 1` / `2` | 用 WebRTC 把视口推流出去（无显示器又要看画面时） |
+| `--kit_args "..."` | 透传给 Isaac Sim 的额外参数 |
+
+环境变量：`M20_USD=urdf` 强制用 `model/M20_urdf.usd`（默认优先官方 `model/usd/M20.usd`，层链不完整时自动回退并打印 WARN）。
 
 ## 控制与观测
 
@@ -155,7 +252,7 @@ tensorboard --logdir logs/rsl_rl --bind_all --port 6006
 | 观测拆分项（腿/轮/指令） | `isaaclab_m20/tasks/observations.py` |
 | 指令混合采样比例 | `isaaclab_m20/tasks/commands.py` |
 | 课程阶段、轮数、warmup、续训逻辑（含每阶段的零指令占比与最后一阶段的保持时间） | `isaaclab_m20/scripts/train.py`（`STAGES`） |
-| 重训同一阶段时覆盖还是接着训 | **默认接着训**：复用该阶段目录、加载其中最新的 `model_*.pt`、补到它的预算（`--iterations N`＝再练 N 轮）。要从头重来加 `--overwrite`（旧目录改名为 `.bak-<时间戳>`，不删）；要另开目录加 `--new_run` |
+| 重训同一阶段时覆盖还是接着训 | **默认接着训**：复用该阶段目录、加载其中最新的 `model_*.pt`；跑多少轮由命令行决定（默认该阶段预算，`--iterations N` 就是 N 轮，脚本不做差额计算）。要从头重来加 `--overwrite`（旧目录改名为 `.bak-<时间戳>`，不删）；要另开目录加 `--new_run` |
 | 验收阈值与测试指令 | `isaaclab_m20/scripts/eval.py` |
 | PPO 超参 | `isaaclab_m20/tasks/agents/rsl_rl_ppo_cfg.py` |
 | PD 增益、力矩上限、默认姿态 | `isaaclab_m20/assets/m20.py` |

@@ -51,11 +51,20 @@ warmup for the new width: only the sampling distribution and the hold time chang
 Two log-directory rules, both about the "train a stage, look at it, decide"
 loop:
 
-* Re-running a stage continues it. The stage directory is reused, the newest
-  ``model_*.pt`` in it is loaded, and the run tops the stage up to its budget
-  (``--iterations N`` means "N more"). Nothing is ever deleted. To retrain a
-  stage from scratch instead, pass ``--overwrite``: the old attempt is renamed to
-  ``<stage>.bak-<timestamp>``, so an accidental retrain can be undone.
+* Re-running a stage continues it. The stage directory is reused and the newest
+  ``model_*.pt`` in it is loaded, then exactly ``--iterations`` iterations run
+  (default: the stage's budget). The script does not subtract what the stage has
+  already done and never decides that a stage has had enough -- the operator
+  decides. Nothing is ever deleted. To retrain a stage from scratch, pass
+  ``--overwrite``: the old attempt is renamed to ``<stage>.bak-<timestamp>``, so
+  an accidental retrain can be undone.
+* A continued stage gets the environment it stopped with: the command ramp is
+  put back at the stage iteration it reached (an interrupted warmup resumes
+  mid-ramp instead of jumping to the full range), the sampling distribution is
+  the stage's, and the cfg is compared against the ``env.yaml`` written by the
+  first attempt -- any difference (command range, reward weights, domain
+  randomisation, env count) is printed as a warning, and the current config is
+  saved as ``env.resume-<stamp>.yaml`` so the original record survives.
 * A stage that does not exist yet starts from the previous stage's newest
   checkpoint in the same run. ``--new_run`` starts a separate timestamped run and
   seeds it from the previous stage of whichever run has one.
@@ -194,11 +203,10 @@ parser.add_argument("--stage", type=str, default="all",
 parser.add_argument("--stage_scale", type=float, default=1.0,
                     help="Multiply every stage's iteration budget (e.g. 0.05 for a smoke test).")
 parser.add_argument("--iterations", type=int, default=None,
-                    help="Iteration budget for the stage(s) being run. With a single "
-                         "--stage this is the normal way to say how long to train it "
-                         "(--stage 2 --iterations 1200); when the stage is being continued, "
-                         "it means that many MORE iterations on top of what it already did. "
-                         "--iters_stageN is for --stage all, "
+                    help="How many iterations to run now. Plain and literal: it is the "
+                         "same number whether the stage is new or being continued, and "
+                         "the script never decides on its own that a stage has had enough. "
+                         "--iters_stageN is only for --stage all, "
                          "where several stages run back to back with different budgets.")
 for _number, _course_stage in enumerate(STAGES, start=1):
     parser.add_argument(
@@ -218,7 +226,8 @@ parser.add_argument("--overwrite", action="store_true",
                     help="Retrain a stage from scratch instead of continuing it. The previous "
                          "attempt is RENAMED to <stage>.bak-<timestamp>, never deleted, so a "
                          "mistaken retrain can be undone. Without this flag, re-running a stage "
-                         "continues it (resumes its newest checkpoint and tops up its budget).")
+                         "continues it: newest checkpoint loaded, command ramp put back where "
+                         "it stopped, current cfg compared against the stage's env.yaml.")
 parser.add_argument("--log_root", type=str, default=str(REPO_ROOT / "logs" / "rsl_rl"))
 parser.add_argument("--video", action="store_true", help="Record a video of the first iteration.")
 parser.add_argument("--video_length", type=int, default=200, help="Video length in policy steps.")
@@ -336,6 +345,23 @@ def select_stages(
     return out
 
 
+def interpolate_ranges(stage: Stage, done: int,
+                       warmup: int | None = None) -> tuple[float, float, float]:
+    """Command range after ``done`` iterations of ``stage`` (linear warmup).
+
+    Shared by the schedule and by the pre-``gym.make`` setup, so the range the
+    env is built with equals the range the schedule will apply on step one.
+    """
+    span = stage.warmup if warmup is None else max(int(warmup), 0)
+    if span <= 0:
+        return stage.ranges_to
+    t = min(max(done / span, 0.0), 1.0)
+    return tuple(
+        low + (high - low) * t
+        for low, high in zip(stage.ranges_from, stage.ranges_to)
+    )
+
+
 class CommandSchedule:
     """Drives the command range through the current stage, one iteration at a time.
 
@@ -350,6 +376,10 @@ class CommandSchedule:
         self.stage: Stage | None = None
         self.iteration = 0
         self.warmup = 0
+        # How far into the stage the previous run already got. Resuming has to
+        # continue the ramp from there, not restart it: a stage stopped at 60% of
+        # its warmup must resume on the range it was actually training at.
+        self.offset = 0
         self._steps = 0
         self._applied: tuple[float, float, float] | None = None
         # Sampling defaults, restored for stages that do not override them: a
@@ -359,22 +389,31 @@ class CommandSchedule:
         dr.register_command_term(command_term)
 
     # -- stage lifecycle ---------------------------------------------------
-    def start_stage(self, stage: Stage, warmup: int | None = None) -> None:
-        """Enter ``stage``. ``warmup=0`` skips the range ramp (resumed stage)."""
+    def start_stage(self, stage: Stage, warmup: int | None = None,
+                    resume_iteration: int = 0) -> None:
+        """Enter ``stage``, optionally continuing it from ``resume_iteration``.
+
+        ``resume_iteration`` is how many iterations this stage had already done,
+        so the env comes back exactly where training stopped: same command range
+        (mid-warmup ranges stay mid-warmup) and same sampling distribution. Pass
+        0 for a fresh stage.
+
+        ``warmup`` overrides the stage's own (possibly ``--stage_scale``-trimmed)
+        warmup; when continuing, pass the *untrimmed* one so the ramp the stage was
+        climbing stays the same ramp.
+        """
         self.stage = stage
         self.warmup = stage.warmup if warmup is None else max(int(warmup), 0)
+        self.offset = max(int(resume_iteration), 0)
         self.iteration = 0
         self._steps = 0
         self._applied = None
         self.apply_sampling(stage, announce=True)
-        if self.warmup > 0:
-            self._apply(stage.ranges_from, announce=True)
-        else:
-            self._apply(stage.ranges_to, announce=True)
+        self._apply(self.ranges_at(self.offset), announce=True)
         # The buffer still holds commands drawn under the previous stage's
         # range (up to 4 s of them). For stage 1 the new range starts at zero,
         # so wipe them: the robot must not be asked for 0.4 m/s on step 0.
-        if max(stage.ranges_from) == 0.0:
+        if self.offset == 0 and max(stage.ranges_from) == 0.0:
             dr.zero_command(self.term)
 
     def apply_sampling(self, stage: Stage, announce: bool = False) -> None:
@@ -419,17 +458,15 @@ class CommandSchedule:
                   f"vy=+-{ranges[1]:.3f} wz=+-{ranges[2]:.3f}", flush=True)
 
     def ranges_at(self, iteration: int) -> tuple[float, float, float]:
-        """Range after ``iteration`` iterations of the current stage."""
+        """Range after ``iteration`` iterations of the current stage.
+
+        The stage's own offset is included, so resuming mid-warmup keeps the
+        range it was training at instead of jumping to ``ranges_to``.
+        """
         assert self.stage is not None
         stage = self.stage
-        warmup = getattr(self, "warmup", stage.warmup)
-        if warmup <= 0:
-            return stage.ranges_to
-        t = min(max(iteration / warmup, 0.0), 1.0)
-        return tuple(
-            low + (high - low) * t
-            for low, high in zip(stage.ranges_from, stage.ranges_to)
-        )
+        return interpolate_ranges(stage, getattr(self, "offset", 0) + iteration,
+                                  getattr(self, "warmup", stage.warmup))
 
     # -- per-step hook -----------------------------------------------------
     def on_step(self) -> None:
@@ -442,8 +479,8 @@ class CommandSchedule:
         self._apply(self.ranges_at(self.iteration))
         if self.iteration % 50 == 0:
             r = self._applied or self.ranges_at(self.iteration)
-            print(f"[cmd] iter={self.iteration:5d} vx=+-{r[0]:.3f} "
-                  f"vy=+-{r[1]:.3f} wz=+-{r[2]:.3f}", flush=True)
+            print(f"[cmd] stage_iter={self.offset + self.iteration:5d} "
+                  f"vx=+-{r[0]:.3f} vy=+-{r[1]:.3f} wz=+-{r[2]:.3f}", flush=True)
 
 
 def attach_stage_schedule(env, schedule: CommandSchedule) -> None:
@@ -722,6 +759,88 @@ def checkpoint_iteration(path: Path) -> int:
         return 0
 
 
+def stage_baseline(log_root_path: Path, stage_index: int) -> Path | None:
+    """Newest checkpoint of the stage before ``stage_index``, i.e. its baseline.
+
+    rsl_rl's counter is cumulative, so the number in this stage's filenames only
+    makes sense next to the *tail number of the previous stage's last model*:
+    stage 2 running from 900 to 3150 starts at 900.
+    """
+    if stage_index <= 0:
+        return None
+    return latest_checkpoint(
+        log_root_path / stage_label(stage_index, STAGES[stage_index - 1]))
+
+
+def stage_relative_iteration(checkpoint: Path, log_root_path: Path,
+                             stage_index: int) -> int:
+    """How many iterations into its own stage ``checkpoint`` was written.
+
+    Only used to put the command ramp back where it was: a stage interrupted at
+    iteration 400 of its 1000 must resume on the range it was training at, and a
+    stage interrupted at 400 of its 150 warmup must resume mid-ramp. It is *not*
+    used to decide how long the stage still has to run -- that is the operator's
+    call (see the module docstring).
+    """
+    baseline = stage_baseline(log_root_path, stage_index)
+    base = checkpoint_iteration(baseline) if baseline is not None else 0
+    return max(checkpoint_iteration(checkpoint) - base, 0)
+
+
+def _plain(value):
+    """Tuples to lists, recursively, so YAML round-trips compare equal."""
+    if isinstance(value, dict):
+        return {key: _plain(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(item) for item in value]
+    return value
+
+
+def _flatten(node, prefix: str = "") -> dict[str, object]:
+    if isinstance(node, dict):
+        flat: dict[str, object] = {}
+        for key, value in node.items():
+            flat.update(_flatten(value, f"{prefix}{key}."))
+        return flat
+    return {prefix.rstrip("."): _plain(node)}
+
+
+def env_differences(previous_path: Path, env_cfg, limit: int = 40) -> list[str] | None:
+    """Leaves where the current env cfg differs from the saved ``env.yaml``.
+
+    Dumped through the same ``_LogDumper`` on both sides so sentinels and tuples
+    serialise identically; returns ``None`` when the old file cannot be read.
+
+    The command range is skipped on purpose: ``CommandSchedule`` rewrites it every
+    few steps and the pre-``gym.make`` setup points it at the resumed position, so
+    it is *expected* to differ from the value stored when the stage started. The
+    range actually in force is printed separately ("First rollout range").
+    """
+    try:
+        previous = yaml.safe_load(previous_path.read_text())
+        current = yaml.safe_load(yaml.dump(env_cfg.to_dict(), Dumper=_LogDumper,
+                                           sort_keys=False))
+    except (OSError, yaml.YAMLError):
+        return None
+    if not isinstance(previous, dict):
+        return None
+    old_flat = _flatten(previous)
+    new_flat = _flatten(current or {})
+    ignored = ("commands.base_velocity.ranges.",)
+    diffs = []
+    for key in sorted(set(old_flat) | set(new_flat)):
+        if key.startswith(ignored):
+            continue
+        before = old_flat.get(key, "<absent>")
+        after = new_flat.get(key, "<absent>")
+        if before == after:
+            continue
+        diffs.append(f"{key}: {before!r} -> {after!r}")
+        if len(diffs) >= limit:
+            break
+    return diffs
+
+
 def latest_checkpoint_across_runs(experiment_dir: Path, stage_index: int) -> Path | None:
     """Newest checkpoint for course stage ``stage_index`` in *any* run.
 
@@ -824,14 +943,6 @@ def main() -> None:
                 flags = ", ".join(f"--iters_stage{n + 1}" for n in sorted(ignored))
                 print(f"[WARN] --stage {running} ignores {flags} (other stages are not "
                       f"running); use --iterations for the length of this stage.")
-        # The commands drawn on the very first reset use whatever range the
-        # config carries, and that happens during gym.make -- before the stage
-        # schedule can intervene. Point the config at the first selected stage
-        # so the first rollout is already on the right distribution.
-        first_vx, first_vy, first_wz = stages[0][1].ranges_from
-        env_cfg.commands.base_velocity.ranges.lin_vel_x = (-first_vx, first_vx)
-        env_cfg.commands.base_velocity.ranges.lin_vel_y = (-first_vy, first_vy)
-        env_cfg.commands.base_velocity.ranges.ang_vel_z = (-first_wz, first_wz)
         agent_cfg.max_iterations = sum(stage.iterations for _, stage in stages)
     else:
         agent_cfg.max_iterations = args_cli.iterations or agent_cfg.max_iterations
@@ -875,6 +986,30 @@ def main() -> None:
     log_root_path = experiment_dir / run_name
     print(f"[INFO] Logging to {log_root_path}")
 
+    if stages:
+        # The commands of the very first reset are drawn from whatever range the
+        # config carries, and that happens inside gym.make -- before the schedule
+        # can intervene. Point it at the range the first selected stage trains at
+        # *now*: ranges_from for a fresh stage, the interrupted position for a
+        # stage being continued. Otherwise a resumed stage starts its first 2-4 s
+        # on the wrong distribution, which is exactly "starting over".
+        first_number, first_stage = stages[0]
+        first_done = 0
+        if args_cli.stage != "all":
+            candidate = latest_checkpoint(
+                log_root_path / stage_label(first_number + 1, first_stage))
+            if candidate is not None:
+                first_done = stage_relative_iteration(
+                    candidate, log_root_path, first_number)
+        first_vx, first_vy, first_wz = interpolate_ranges(
+            first_stage, first_done, STAGES[first_number].warmup)
+        env_cfg.commands.base_velocity.ranges.lin_vel_x = (-first_vx, first_vx)
+        env_cfg.commands.base_velocity.ranges.lin_vel_y = (-first_vy, first_vy)
+        env_cfg.commands.base_velocity.ranges.ang_vel_z = (-first_wz, first_wz)
+        print(f"[INFO] First rollout range: vx=+-{first_vx:.3f} vy=+-{first_vy:.3f} "
+              f"wz=+-{first_wz:.3f}" +
+              (f" (stage iteration {first_done})" if first_done else ""))
+
     print(f"[INFO] Environment: {args_cli.task}  num_envs={env_cfg.scene.num_envs}")
     print_dict(agent_cfg.to_dict(), nesting=0)
 
@@ -915,8 +1050,12 @@ def main() -> None:
 
     for position, (label, iterations, stage) in enumerate(planned):
         stage_dir = log_root_path if stage is None else log_root_path / label
+        stage_index = -1
+        if stage is not None:
+            stage_index = next(i for i, s in enumerate(STAGES) if s.name == stage.name)
         resume_path: Path | None = None
         resuming_own_stage = False
+        resumed_iterations = 0
 
         if stage_dir.exists() and any(stage_dir.iterdir()):
             if args_cli.overwrite:
@@ -935,20 +1074,50 @@ def main() -> None:
                 if resuming_own_stage:
                     print(f"[INFO] {label}: earlier attempt found -- continuing it from "
                           f"{resume_path.name} (use --overwrite to retrain from scratch)")
+                    resumed_iterations = stage_relative_iteration(
+                        resume_path, log_root_path, stage_index)
+                    # Same environment as when it stopped: if anything in the cfg
+                    # changed (command range, rewards, DR, env count), resuming is
+                    # not the same run and the operator has to know.
+                    previous_env = stage_dir / "env.yaml"
+                    if previous_env.exists():
+                        diff = env_differences(previous_env, env_cfg)
+                        if diff is None:
+                            print(f"[WARN] {label}: could not read {previous_env.name}; "
+                                  f"cannot confirm the environment is unchanged")
+                        elif diff:
+                            print(f"[WARN] {label}: env cfg differs from the one this stage "
+                                  f"was trained with ({previous_env.name}):")
+                            for line in diff[:10]:
+                                print(f"        {line}")
+                            if len(diff) > 10:
+                                print(f"        ... {len(diff) - 10} more difference(s)")
+                            print("        Resuming on a different environment is not the same "
+                                  "run; pass --overwrite to start the stage cleanly instead.")
+                        else:
+                            print(f"[INFO] {label}: env cfg matches {previous_env.name}")
                 else:
                     print(f"[INFO] {label}: directory holds logs but no checkpoint, so "
                           f"this stage starts over")
         stage_dir.mkdir(parents=True, exist_ok=True)
-        with open(stage_dir / "env.yaml", "w") as f:
+        # Continuing a stage keeps the first attempt's env.yaml/agent.yaml as the
+        # record of how it was trained; this run's config goes beside them.
+        if resuming_own_stage:
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            env_yaml = stage_dir / f"env.resume-{stamp}.yaml"
+            agent_yaml = stage_dir / f"agent.resume-{stamp}.yaml"
+        else:
+            env_yaml = stage_dir / "env.yaml"
+            agent_yaml = stage_dir / "agent.yaml"
+        with open(env_yaml, "w") as f:
             yaml.dump(env_cfg.to_dict(), f, Dumper=_LogDumper, sort_keys=False)
-        with open(stage_dir / "agent.yaml", "w") as f:
+        with open(agent_yaml, "w") as f:
             yaml.dump(agent_cfg.to_dict(), f, Dumper=_LogDumper, sort_keys=False)
 
         if resume_path is None and stage is not None:
             # Fresh stage: pick up where the previous stage of this run left off,
             # so "--stage 2" after "--stage 1" really does continue rather than
             # start from a random policy.
-            stage_index = next(i for i, s in enumerate(STAGES) if s.name == stage.name)
             if stage_index > 0:
                 previous = log_root_path / stage_label(stage_index, STAGES[stage_index - 1])
                 resume_path = latest_checkpoint(previous)
@@ -970,28 +1139,23 @@ def main() -> None:
         if resume_path is not None and not resume_path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {resume_path}")
 
-        # How much to run in this invocation. Continuing a stage tops it up to
-        # its budget by default; --iterations means "this many more".
-        run_iterations = iterations
-        if resuming_own_stage and resume_path is not None:
-            done = checkpoint_iteration(resume_path)
-            if args_cli.iterations is not None:
-                run_iterations = int(args_cli.iterations)
-                print(f"[INFO] {label}: {done} done + {run_iterations} more "
-                      f"(ends at {done + run_iterations})")
-            else:
-                run_iterations = max(iterations - done, 0)
-                print(f"[INFO] {label}: budget {iterations}, {done} done -> "
-                      f"{run_iterations} more iteration(s)")
-            if run_iterations <= 0:
-                print(f"[INFO] {label}: already at its budget; nothing to do. "
-                      f"Pass --iterations N to keep training it.")
-                resume_path = None
-                continue
+        # How much to run now. No arithmetic against what the stage already did:
+        # how long a stage should be trained is the operator's decision, so the
+        # default is simply the stage budget and --iterations replaces it.
+        if args_cli.iterations is not None:
+            run_iterations = int(args_cli.iterations)
+        else:
+            run_iterations = iterations
 
         print(f"\n[INFO] ===== stage {label}: {run_iterations} iterations =====")
         if resume_path is not None:
-            print(f"[INFO] Continuing from {resume_path}")
+            baseline = stage_baseline(log_root_path, stage_index)
+            source = (f"baseline {baseline.name}" if baseline is not None
+                      else "no previous stage, absolute baseline 0")
+            print(f"[INFO] Continuing from {resume_path} "
+                  f"(global iteration {checkpoint_iteration(resume_path)}; {source}"
+                  + (f"; stage iteration {resumed_iterations}" if resuming_own_stage else "")
+                  + ")")
 
         runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=str(stage_dir),
                                 device=agent_cfg.device)
@@ -999,9 +1163,15 @@ def main() -> None:
             runner.load(str(resume_path))
 
         if schedule is not None and stage is not None:
-            # A stage we are continuing is already past its ramp, so it goes
-            # straight to the full range; a fresh stage keeps its warmup.
-            schedule.start_stage(stage, warmup=0 if resuming_own_stage else None)
+            # Continuing a stage resumes its ramp where it stopped (same command
+            # range as the last iteration it trained), so the env looks exactly
+            # like it did at the end of the previous attempt. The untrimmed warmup
+            # is used on purpose: --stage_scale trims a *fresh* stage's ramp, but a
+            # resumed one has to stay on the same ramp it was already climbing.
+            schedule.start_stage(
+                stage,
+                warmup=STAGES[stage_index].warmup if resuming_own_stage else None,
+                resume_iteration=resumed_iterations)
 
         start = time.time()
         runner.learn(num_learning_iterations=run_iterations, init_at_random_ep_len=True)

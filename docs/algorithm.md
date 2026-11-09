@@ -393,7 +393,17 @@ for stage in stages:
 
 `--stage N` 单独跑某一阶段时会自动去前一阶段目录找 checkpoint，找不到就打 `[WARN]` 从头开始——不会静默地用一个错维度的权重。不给 `--run_name` 时它会自动沿用 `<experiment>/` 下最新的 run 目录（否则每次 `--stage N` 都会新建一个空目录、每次都找不到上一阶段）。
 
-**同一阶段再训＝接着训，而且不删任何东西**。`--stage N` 发现该阶段目录里已经有 `model_*.pt` 时，直接复用目录、加载其中最"新"的那个 checkpoint，然后把该阶段补到它的预算：默认跑 `预算 − 已完成` 轮，给了 `--iterations N` 就是"在这个基础上再练 N 轮"。这时不再重放 warmup（ramp 只服务第一次从上一阶段接手）。要真的从头重来才加 `--overwrite`：旧目录被**改名**为 `<stage>.bak-<时间戳>`（不是删除，误操作可以改回来），然后从上一阶段重训。`--new_run` 另开一个时间戳 run，并从"任意一个 run 里上一阶段最新的 checkpoint"起步——否则空目录会让新 run 从随机策略开始。
+**同一阶段再训＝接着训，而且不删任何东西**。`--stage N` 发现该阶段目录里已经有 `model_*.pt` 时，直接复用目录并加载最"新"的那个 checkpoint，然后跑 `--iterations` 指定的轮数（默认该阶段预算）。脚本**不做**"已经练了多少 / 还差多少"的减法，也不判断某阶段是否"练够了"——那是操作者的决定：它只检测**上一阶段模型的尾号**作为基线，打印一行 `(global iteration 3150; baseline model_900.pt)` 供对照。
+
+**续训时环境必须回到停下那一刻的环境**，否则等于换了个任务从头学：
+
+- **命令 ramp 按该阶段已达的迭代位置接上**。`CommandSchedule.start_stage(..., resume_iteration=N)` 把 `N` 记进 `offset`，`ranges_at()` 用 `offset + iteration` 插值，所以 warmup 中断在第 90/150 轮就从中断处的范围继续，而不是直接跳到 `ranges_to`、也不再从头重放 warmup（重放会把 vx 反复拽回 0，这是 2250 轮不收敛的真实原因之一）。`gym.make` **之前**还会按同一位置把 `env_cfg.commands...ranges` 写好（`interpolate_ranges()` 与调度器共用同一个函数），否则第一次 reset 抽到的指令会是 `ranges_from`——那 2–4 s 等于换了个环境。启动时会打印 `[INFO] First rollout range: vx=+-... (stage iteration N)`。
+- **采样分布用该阶段的**（`zero_prob` / 保持时间），由 `apply_sampling()` 在一次进入阶段时写好。
+- **配置逐项对比**：续训时把当前 `env_cfg.to_dict()` 与首次训练写下的 `stage_dir/env.yaml` 递归比较叶子，任何差异（指令范围、奖励权重、`--dr` 档位、`num_envs`、`decimation`…）都打印成
+  `[WARN] stage2_forward_backward: env cfg differs from the one this stage was trained with` 并列出最多 10 条 `key: old -> new`。确认要换环境再训就加 `--overwrite` 从头开始，而不是接着训。
+- **不覆盖历史记录**：续训时本次配置写成 `env.resume-<时间戳>.yaml` / `agent.resume-<时间戳>.yaml`，首次那份 `env.yaml` / `agent.yaml` 保留。
+
+要真的从头重来才加 `--overwrite`：旧目录被**改名**为 `<stage>.bak-<时间戳>`（不是删除，误操作可以改回来），然后从上一阶段重训。`--new_run` 另开一个时间戳 run，并从"任意一个 run 里上一阶段最新的 checkpoint"起步——否则空目录会让新 run 从随机策略开始。
 
 **跨阶段默认用上一阶段最新的模型**：`latest_checkpoint(<run>/stage{N-1}_*)` 按迭代号取最大，不看"是不是这次练的"。因为重训同一阶段是接着训而不是清空，`latest_checkpoint()` 的语义才自洽：它永远指"这个阶段做到哪儿了"。
 
