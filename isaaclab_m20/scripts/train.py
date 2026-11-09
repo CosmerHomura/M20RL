@@ -51,16 +51,14 @@ warmup for the new width: only the sampling distribution and the hold time chang
 Two log-directory rules, both about the "train a stage, look at it, decide"
 loop:
 
-* Retraining a stage is an explicit choice, and it never deletes anything. If the
-  plan touches a stage directory that already holds a run, training stops before
-  the simulator starts and asks you to pick: ``--overwrite`` moves the old
-  attempt to ``<stage>.bak-<timestamp>`` and retrains into a clean directory,
-  ``--keep_logs`` appends into the existing one, ``--new_run`` starts a separate
-  timestamped run and leaves the old one alone. (Silently clearing the directory
-  was the earlier behaviour; one ``--stage 1`` was enough to lose a run.)
-* A stage starts from the previous stage's newest checkpoint in the same run.
-  That is what makes the loop safe to interrupt: stage N+1 picks up whatever
-  stage N actually produced, and ``--resume_from`` overrides it for one run.
+* Re-running a stage continues it. The stage directory is reused, the newest
+  ``model_*.pt`` in it is loaded, and the run tops the stage up to its budget
+  (``--iterations N`` means "N more"). Nothing is ever deleted. To retrain a
+  stage from scratch instead, pass ``--overwrite``: the old attempt is renamed to
+  ``<stage>.bak-<timestamp>``, so an accidental retrain can be undone.
+* A stage that does not exist yet starts from the previous stage's newest
+  checkpoint in the same run. ``--new_run`` starts a separate timestamped run and
+  seeds it from the previous stage of whichever run has one.
 
 Example runs::
 
@@ -191,14 +189,16 @@ parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--stage", type=str, default="all",
                     help=f"Velocity task: which course stage to run "
                          f"('1'..'{_LAST_STAGE}' or 'all'). "
-                         "Each stage continues from the previous stage's latest checkpoint "
-                         "unless --resume_from says otherwise.")
+                         "A stage that already has a run is continued from its newest "
+                         "checkpoint; a new stage continues from the previous one.")
 parser.add_argument("--stage_scale", type=float, default=1.0,
                     help="Multiply every stage's iteration budget (e.g. 0.05 for a smoke test).")
 parser.add_argument("--iterations", type=int, default=None,
                     help="Iteration budget for the stage(s) being run. With a single "
                          "--stage this is the normal way to say how long to train it "
-                         "(--stage 2 --iterations 1200). --iters_stageN is for --stage all, "
+                         "(--stage 2 --iterations 1200); when the stage is being continued, "
+                         "it means that many MORE iterations on top of what it already did. "
+                         "--iters_stageN is for --stage all, "
                          "where several stages run back to back with different budgets.")
 for _number, _course_stage in enumerate(STAGES, start=1):
     parser.add_argument(
@@ -206,9 +206,6 @@ for _number, _course_stage in enumerate(STAGES, start=1):
         help=f"Iterations for stage {_number} ({_course_stage.name}) inside a --stage all "
              f"run; default {_course_stage.iterations} x --stage_scale. When you run that "
              f"stage alone, --iterations does the same job more directly.")
-parser.add_argument("--resume_from", type=str, default=None,
-                    help="Checkpoint for the first selected stage. Without it, stage 1 starts "
-                         "from scratch and stages 2-4 continue from the previous stage.")
 parser.add_argument("--run_name", type=str, default=None,
                     help="Sub-directory inside logs/rsl_rl/<experiment>; stages get their own "
                          "sub-sub-directory inside it. Without it a single --stage reuses the "
@@ -218,15 +215,10 @@ parser.add_argument("--new_run", action="store_true",
                          "one. Use this to keep an earlier attempt of the same stage for "
                          "comparison.")
 parser.add_argument("--overwrite", action="store_true",
-                    help="Retrain a stage whose directory already has a run in it. The previous "
+                    help="Retrain a stage from scratch instead of continuing it. The previous "
                          "attempt is RENAMED to <stage>.bak-<timestamp>, never deleted, so a "
-                         "mistaken retrain can be undone. Without this flag (and without "
-                         "--keep_logs) training refuses to start rather than touch the folder.")
-parser.add_argument("--keep_logs", action="store_true",
-                    help="Append into an existing stage directory instead of moving it aside. "
-                         "Only sensible when the old checkpoints are older than the new ones; "
-                         "otherwise latest_checkpoint() will report the stale file as this "
-                         "stage's result.")
+                         "mistaken retrain can be undone. Without this flag, re-running a stage "
+                         "continues it (resumes its newest checkpoint and tops up its budget).")
 parser.add_argument("--log_root", type=str, default=str(REPO_ROOT / "logs" / "rsl_rl"))
 parser.add_argument("--video", action="store_true", help="Record a video of the first iteration.")
 parser.add_argument("--video_length", type=int, default=200, help="Video length in policy steps.")
@@ -357,6 +349,7 @@ class CommandSchedule:
         self.steps_per_iteration = steps_per_iteration
         self.stage: Stage | None = None
         self.iteration = 0
+        self.warmup = 0
         self._steps = 0
         self._applied: tuple[float, float, float] | None = None
         # Sampling defaults, restored for stages that do not override them: a
@@ -366,13 +359,18 @@ class CommandSchedule:
         dr.register_command_term(command_term)
 
     # -- stage lifecycle ---------------------------------------------------
-    def start_stage(self, stage: Stage) -> None:
+    def start_stage(self, stage: Stage, warmup: int | None = None) -> None:
+        """Enter ``stage``. ``warmup=0`` skips the range ramp (resumed stage)."""
         self.stage = stage
+        self.warmup = stage.warmup if warmup is None else max(int(warmup), 0)
         self.iteration = 0
         self._steps = 0
         self._applied = None
         self.apply_sampling(stage, announce=True)
-        self._apply(stage.ranges_from, announce=True)
+        if self.warmup > 0:
+            self._apply(stage.ranges_from, announce=True)
+        else:
+            self._apply(stage.ranges_to, announce=True)
         # The buffer still holds commands drawn under the previous stage's
         # range (up to 4 s of them). For stage 1 the new range starts at zero,
         # so wipe them: the robot must not be asked for 0.4 m/s on step 0.
@@ -424,9 +422,10 @@ class CommandSchedule:
         """Range after ``iteration`` iterations of the current stage."""
         assert self.stage is not None
         stage = self.stage
-        if stage.warmup <= 0:
+        warmup = getattr(self, "warmup", stage.warmup)
+        if warmup <= 0:
             return stage.ranges_to
-        t = min(max(iteration / stage.warmup, 0.0), 1.0)
+        t = min(max(iteration / warmup, 0.0), 1.0)
         return tuple(
             low + (high - low) * t
             for low, high in zip(stage.ranges_from, stage.ranges_to)
@@ -715,6 +714,38 @@ def latest_run_dir(experiment_dir: Path) -> Path | None:
     return max(runs, key=lambda path: path.stat().st_mtime) if runs else None
 
 
+def checkpoint_iteration(path: Path) -> int:
+    """Iteration count encoded in a ``model_<n>.pt`` name, 0 if unreadable."""
+    try:
+        return int(path.stem.split("_")[-1])
+    except (ValueError, IndexError):
+        return 0
+
+
+def latest_checkpoint_across_runs(experiment_dir: Path, stage_index: int) -> Path | None:
+    """Newest checkpoint for course stage ``stage_index`` in *any* run.
+
+    Used by ``--new_run``: the new directory is empty by construction, so a
+    stage other than the first has to borrow the previous stage from an earlier
+    run instead of silently starting from a random policy.
+    """
+    if not experiment_dir.is_dir() or stage_index <= 0:
+        return None
+    label = stage_label(stage_index, STAGES[stage_index - 1])
+    best: tuple[float, Path] | None = None
+    for run_dir in experiment_dir.iterdir():
+        stage_dir = run_dir / label
+        if not run_dir.is_dir() or not stage_dir.is_dir():
+            continue
+        found = latest_checkpoint(stage_dir)
+        if found is None:
+            continue
+        mtime = found.stat().st_mtime
+        if best is None or mtime > best[0]:
+            best = (mtime, found)
+    return None if best is None else best[1]
+
+
 def rename_final_checkpoint(stage_dir: Path, last_iteration: int | None) -> Path | None:
     """Rename the stage's final checkpoint to the number of iterations it completed.
 
@@ -836,31 +867,13 @@ def main() -> None:
         run_name = previous_run.name if previous_run else datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         if previous_run is not None:
             print(f"[INFO] Continuing run {previous_run} "
-                  f"(a stage that already has a run refuses to be retrained unless you "
-                  f"pass --overwrite or --keep_logs; --new_run starts a separate one)")
+                  f"(re-running a stage continues it from its newest checkpoint; "
+                  f"--overwrite moves that attempt aside and retrains, --new_run "
+                  f"starts a separate directory)")
     else:
         run_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     log_root_path = experiment_dir / run_name
     print(f"[INFO] Logging to {log_root_path}")
-
-    # Pre-flight, before the simulator starts: never touch a previous attempt
-    # without being asked to. The checkpoints in those directories are the only
-    # copy of that experiment, so retraining a stage is an explicit decision.
-    planned_labels = [stage_label(number + 1, stage) for number, stage in stages] or ["standing"]
-    occupied = [
-        log_root_path / label for label in planned_labels
-        if (log_root_path / label).exists() and any((log_root_path / label).iterdir())
-    ]
-    if occupied and not (args_cli.overwrite or args_cli.keep_logs):
-        listed = "\n".join(f"    {path}" for path in occupied)
-        raise SystemExit(
-            f"[ERROR] These stage directories already contain a run:\n{listed}\n"
-            f"        Nothing was touched. Pick one:\n"
-            f"          --overwrite   retrain them; the previous attempt is renamed to\n"
-            f"                        <stage>.bak-<timestamp> and nothing is deleted\n"
-            f"          --keep_logs   append into the existing directories\n"
-            f"          --new_run     start a separate timestamped run, leave these alone"
-        )
 
     print(f"[INFO] Environment: {args_cli.task}  num_envs={env_cfg.scene.num_envs}")
     print_dict(agent_cfg.to_dict(), nesting=0)
@@ -893,8 +906,6 @@ def main() -> None:
         attach_dr_ramp(env, agent_cfg.max_iterations, agent_cfg.num_steps_per_env,
                        args_cli.dr_ramp)
 
-    resume_path = Path(args_cli.resume_from) if args_cli.resume_from else None
-
     planned: list[tuple[str, int, Stage | None]] = []
     if stages:
         for stage_index, stage in stages:
@@ -904,16 +915,29 @@ def main() -> None:
 
     for position, (label, iterations, stage) in enumerate(planned):
         stage_dir = log_root_path if stage is None else log_root_path / label
-        if stage is not None and stage_dir.exists() and any(stage_dir.iterdir()):
-            if args_cli.keep_logs:
-                print(f"[INFO] {label}: --keep_logs, appending into {stage_dir}")
-            elif args_cli.overwrite:
+        resume_path: Path | None = None
+        resuming_own_stage = False
+
+        if stage_dir.exists() and any(stage_dir.iterdir()):
+            if args_cli.overwrite:
                 # Moved, not deleted: a mistaken retrain stays recoverable.
                 stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
                 backup = stage_dir.with_name(f"{stage_dir.name}.bak-{stamp}")
                 stage_dir.rename(backup)
-                print(f"[INFO] {label}: previous attempt moved to {backup.name} "
-                      f"(nothing was deleted)")
+                print(f"[INFO] {label}: --overwrite, previous attempt moved to "
+                      f"{backup.name} (nothing was deleted)")
+            else:
+                # Re-running a stage continues it. That is what "keep training"
+                # has to mean: resuming from the previous stage's checkpoint
+                # instead would throw this stage's work away.
+                resume_path = latest_checkpoint(stage_dir)
+                resuming_own_stage = resume_path is not None
+                if resuming_own_stage:
+                    print(f"[INFO] {label}: earlier attempt found -- continuing it from "
+                          f"{resume_path.name} (use --overwrite to retrain from scratch)")
+                else:
+                    print(f"[INFO] {label}: directory holds logs but no checkpoint, so "
+                          f"this stage starts over")
         stage_dir.mkdir(parents=True, exist_ok=True)
         with open(stage_dir / "env.yaml", "w") as f:
             yaml.dump(env_cfg.to_dict(), f, Dumper=_LogDumper, sort_keys=False)
@@ -921,26 +945,51 @@ def main() -> None:
             yaml.dump(agent_cfg.to_dict(), f, Dumper=_LogDumper, sort_keys=False)
 
         if resume_path is None and stage is not None:
-            # Running one stage per invocation: pick up where the previous stage
-            # of the same run left off, so "--stage 2" after "--stage 1" really
-            # does continue rather than start from a random policy.
+            # Fresh stage: pick up where the previous stage of this run left off,
+            # so "--stage 2" after "--stage 1" really does continue rather than
+            # start from a random policy.
             stage_index = next(i for i, s in enumerate(STAGES) if s.name == stage.name)
             if stage_index > 0:
                 previous = log_root_path / stage_label(stage_index, STAGES[stage_index - 1])
                 resume_path = latest_checkpoint(previous)
+                if resume_path is None and args_cli.new_run:
+                    # A --new_run directory is empty by construction, so seed it
+                    # from the previous stage of whichever run has one.
+                    resume_path = latest_checkpoint_across_runs(experiment_dir, stage_index)
+                    if resume_path is not None:
+                        print(f"[INFO] --new_run: seeding {stage.name} from "
+                              f"{resume_path} (previous stage, earlier run)")
                 if resume_path is not None:
                     print(f"[INFO] Stage {stage.name}: continuing from the previous "
                           f"stage's checkpoint {resume_path}")
                 else:
                     print(f"[WARN] Stage {stage.name}: no checkpoint from "
-                          f"{previous} -- starting from a fresh policy. Run "
-                          f"--stage {stage_index} first, or pass --resume_from "
-                          f"(a --new_run directory starts empty, so it has to be "
-                          f"filled from stage 1).")
+                          f"{previous} and no earlier run to borrow from -- starting "
+                          f"from a fresh policy. Run --stage {stage_index} first.")
 
         if resume_path is not None and not resume_path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {resume_path}")
-        print(f"\n[INFO] ===== stage {label}: {iterations} iterations =====")
+
+        # How much to run in this invocation. Continuing a stage tops it up to
+        # its budget by default; --iterations means "this many more".
+        run_iterations = iterations
+        if resuming_own_stage and resume_path is not None:
+            done = checkpoint_iteration(resume_path)
+            if args_cli.iterations is not None:
+                run_iterations = int(args_cli.iterations)
+                print(f"[INFO] {label}: {done} done + {run_iterations} more "
+                      f"(ends at {done + run_iterations})")
+            else:
+                run_iterations = max(iterations - done, 0)
+                print(f"[INFO] {label}: budget {iterations}, {done} done -> "
+                      f"{run_iterations} more iteration(s)")
+            if run_iterations <= 0:
+                print(f"[INFO] {label}: already at its budget; nothing to do. "
+                      f"Pass --iterations N to keep training it.")
+                resume_path = None
+                continue
+
+        print(f"\n[INFO] ===== stage {label}: {run_iterations} iterations =====")
         if resume_path is not None:
             print(f"[INFO] Continuing from {resume_path}")
 
@@ -950,10 +999,12 @@ def main() -> None:
             runner.load(str(resume_path))
 
         if schedule is not None and stage is not None:
-            schedule.start_stage(stage)
+            # A stage we are continuing is already past its ramp, so it goes
+            # straight to the full range; a fresh stage keeps its warmup.
+            schedule.start_stage(stage, warmup=0 if resuming_own_stage else None)
 
         start = time.time()
-        runner.learn(num_learning_iterations=iterations, init_at_random_ep_len=True)
+        runner.learn(num_learning_iterations=run_iterations, init_at_random_ep_len=True)
         print(f"[INFO] stage {label} finished in {(time.time() - start) / 60:.1f} min")
 
         # Stage N+1 continues from the checkpoint this stage ended on. rsl_rl
