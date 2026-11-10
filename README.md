@@ -45,6 +45,10 @@ isaaclab_m20/
     ├── train.py       # 训练（速度任务含 4 阶段课程与续训）
     ├── play.py        # 播放 / 键盘给指令 / 录视频
     └── eval.py        # 固定指令验收测试（RMSE、倾角、摔倒率）
+docs/
+├── control.md         # 控制细节：时间尺度、执行器参数、两环带宽、驻车环、硬件对应、调试清单
+├── algorithm.md       # 奖励、课程、PPO 超参、验收
+└── isaaclab_setup.md  # 环境搭建与速查
 ```
 
 ## 快速开始
@@ -225,6 +229,8 @@ tensorboard --logdir logs/rsl_rl --bind_all --port 6006
 - **域随机化默认关闭**（摩擦 1.0、质量/质心固定、无推力），`--dr full` 打开。
 
 **PD 伺服环**（`ImplicitActuatorCfg`，200 Hz）：腿 kp=80 / kd=2，轮 kp=0 / kd=2，力矩上限 76.4 / 21.6 N·m。
+
+**零指令时的轮子驻车环**（`isaaclab_m20/envs.py` 的 `M20VelocityEnv`）：轮子是 `stiffness=0` 的速度伺服，而 PhysX 不建模滚动阻力——静摩擦只阻止滑动、不阻止滚动，所以零指令下唯一的阻力就是 `damping=2`，机身只要倾斜 0.9° 就会以 `F_bias/(4·damping) ≈ 5 mm/s` 持续蠕动，8 s 就是 4 cm，正好卡在验收线附近。因此当命令缓冲严格为零时，env 把四个轮子动作列替换成位置外环的输出：`ω* = clip(15·(q_hold − q), ±3 rad/s)`，再由原有的速度环跟踪（`τ = damping·(ω* − q̇)`）。外环**没有独立的 kd**（阻尼就是共享的 `damping=2`，比外环快 47 倍），所以它是一阶过阻尼、不会振；等效驻车刚度 `15×2 = 30 N·m/rad ≈ 0.5 N·m/deg`，比腿的 80 软。**不切增益**（执行器始终是速度伺服，所以没有力矩阶跃），**替换值写回 action**（`last_action` 与 `action_rate` 看到的是真正下发的命令），**轮角不 wrap**（转 2π 车身走 0.57 m，缠绕会把方向弄反），`q_hold` 只在指令刚归零的上升沿和回合重置时重锚，误差超过 0.3 rad 就重锚（被拖动/打滑）。参数在 `M20WheeledVelocityEnvCfg`：`wheel_park_enabled / wheel_park_kp / wheel_park_omega_max / wheel_park_error_clamp`。控制细节（时间尺度、执行器参数、两环带宽、调试清单）见 [docs/control.md](docs/control.md)，设计动机见 `docs/algorithm.md` §6.2.1。
 
 ## 显存与环境数
 

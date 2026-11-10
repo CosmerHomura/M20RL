@@ -259,6 +259,7 @@ eval 会强制**关掉域随机化、关掉指令重采样**，机器人是标�
 | 奖励 | 站立 14 项 / 速度指令 **10 项每步 + 摔倒 −10**（`track_lin_vel_xy`/`track_ang_vel_z` 用有界柯西核；高度、姿态、垂直速度都是平方惩罚；`wheel_speed` 是**唯一带门控**的一项，只在严格零指令时生效；**没有存活加成、没有位置保持、没有死区**；−10 只罚真摔倒、不罚超时，且由 `M20VelocityEnv` 在终止标志上加而不是奖励项；动作变化率按 1.0、腿关节加速度按 2000 归一——**别为"可读"把它们收紧**，那会把探索噪声放大成 −40/步；不做与指令无关的绝对速度惩罚、不强制四轮着地、不惩罚横向滑移），完整权重表见 [docs/algorithm.md](algorithm.md) §1 与 §6.3 |
 | 终止 | 站立：高度 < 0.25、倾角 > 0.7、超时；速度指令：高度 < 0.33、倾角 > 0.5、超时 |
 | 奖励裁剪 | **没有**。速度指令任务不把每步奖励压到 0（`only_positive_rewards` 试过又删了：策略早期每步为负会被 clip 成常数 0、梯度消失）；`Train/mean_reward` 与 `Episode_Reward/*` 是同一套数字，为负是正常的 |
+| 轮子驻车环 | **速度指令任务自带**（`M20VelocityEnv`）：命令缓冲严格为零时，四个轮子动作列被替换成位置外环 `ω* = clip(15·(q_hold − q), ±3 rad/s)`，由原有速度环跟踪。原因：轮子 `stiffness=0`、PhysX 无滚阻，机身倾斜 0.9° 就会以 ~5 mm/s 蠕动。不切增益、替换值写回 action、轮角不 wrap、误差 > 0.3 rad 重锚。参数 `wheel_park_*` 在 `M20WheeledVelocityEnvCfg`；控制细节见 `docs/control.md` |
 | 域随机化 | 站立全开（带 `--dr_ramp` 课程）；速度指令第一版**默认关闭**，`--dr full` 打开 |
 | 终端诊断 | `--health_every 24`：`[health]` 行（`max|qdot|`、`z`、`|v_xy|`、`standing`、`rew`、`neg`、`fall_rew`、`timeout_rew`）；`--per_term_every 200`：`[terms] per-step` 逐项 `value×weight×dt`（唯一可比的尺度，`sum=` 应等于同一时刻的 `rew=`）与 `[terms] episode sums`（即 tensorboard 的 `Episode_Reward/*`） |
 

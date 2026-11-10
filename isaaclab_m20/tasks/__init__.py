@@ -2,8 +2,9 @@
 
 The standing task is a plain ``ManagerBasedRLEnv``. The velocity task uses
 ``isaaclab_m20.envs:M20VelocityEnv``, which applies the fall penalty from the
-termination flags (falls only, never the time-out) and adds no reward floor
-(see that module for why the floor was removed).
+termination flags (falls only, never the time-out), adds no reward floor (see that
+module for why the floor was removed), and parks the wheels with a position outer
+loop while the velocity command is exactly zero.
 """
 import gymnasium as gym
 

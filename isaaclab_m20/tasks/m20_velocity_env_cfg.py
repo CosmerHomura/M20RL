@@ -493,6 +493,31 @@ class M20WheeledVelocityEnvCfg(ManagerBasedRLEnvCfg):
     # critic has to fit. Zero would make falling free, so it is kept negative.
     fall_penalty: float = -10.0
 
+    # -- wheel parking brake (see ``isaaclab_m20.envs.M20VelocityEnv``) --------
+    # While the velocity command is exactly zero the env replaces the four wheel
+    # action columns with a position loop: ``omega* = kp * (q_hold - q)``, clipped
+    # to +-``omega_max``, and the existing velocity servo (``damping = 2``) tracks
+    # it. The wheels are a pure velocity servo with ``stiffness = 0`` and PhysX
+    # does not model rolling resistance, so without this a body a fraction of a
+    # degree off level creeps at ``F_bias / (4 * damping)`` -- a few cm/s, enough
+    # to leave the acceptance box over an 8 s hold.
+    #
+    # Gains: the loop has no damping of its own -- ``kd`` stays the shared velocity
+    # servo ``damping = 2`` (``kd / I = 700 1/s``), which is already far faster than
+    # the position loop, so the cascade is overdamped and does not ring. Only the
+    # stiffness is ours: kp = 15 1/s is a 67 ms time constant and an equivalent
+    # parking stiffness of ``kp * damping = 30 N*m/rad`` (0.5 N*m/deg, well under the
+    # legs' 80 N*m/rad). It is deliberately soft: 25 1/s braked the wheel hard
+    # enough to be felt as a lurch at the go/stop edge. ``omega_max = 3 rad/s`` is
+    # 0.27 m/s: a fast walk, but capped so that a wheel that got dragged cannot be
+    # commanded into a large spin back. ``error_clamp = 0.3 rad`` is 2.7 cm of
+    # rolling; beyond it the wheel was dragged or skidded and the hold is simply
+    # re-seeded at the current angle.
+    wheel_park_enabled: bool = True
+    wheel_park_kp: float = 15.0
+    wheel_park_omega_max: float = 3.0
+    wheel_park_error_clamp: float = 0.3
+
     def __post_init__(self) -> None:
         # 200 Hz physics, 50 Hz policy.
         self.decimation = 4
