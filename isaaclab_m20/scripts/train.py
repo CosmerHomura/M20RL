@@ -277,6 +277,13 @@ parser.add_argument(
          "the plan's setting, but it also swings Adam's step size (lr moved between "
          "~0 and ~2e-3 in m20_v5); with --fixed_lr the rate stays at 3e-4 and a "
          "stage needs a longer budget before it plateaus.")
+parser.add_argument(
+    "--desired_kl", type=float, default=None,
+    help="Override the adaptive schedule's KL target (cfg default 0.01). rsl_rl "
+         "compares this against the KL *summed over the 16 action dims*, so 0.01 is "
+         "0.0006 per dim -- tight enough that a 40-step round exceeds it even at "
+         "lr=1e-5, which pins the rate to the 1e-5 floor. 0.05-0.08 is the usable "
+         "range for this network. Ignored with --fixed_lr.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 if args_cli.video:
@@ -963,6 +970,12 @@ def main() -> None:
     agent_cfg = getattr(importlib.import_module(agent_module), agent_class)()
     agent_cfg.seed = args_cli.seed
     agent_cfg.device = args_cli.device
+    if args_cli.desired_kl is not None:
+        # Only meaningful for the adaptive schedule, and only in the sense the
+        # controller uses it: a *sum over the 16 action dims*.
+        agent_cfg.algorithm.desired_kl = float(args_cli.desired_kl)
+        print(f"[INFO] desired_kl: {agent_cfg.algorithm.desired_kl:g} "
+              f"(summed over {16} action dims; cfg default is 0.01)")
     if args_cli.fixed_lr:
         # The cfg ships with the plan's adaptive schedule; pin the rate here so
         # the two modes can be compared without editing the config file.

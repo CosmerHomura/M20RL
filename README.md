@@ -145,6 +145,7 @@ tensorboard --logdir logs/rsl_rl --bind_all --port 6006
 | `--dr` | `off` | `off`＝名义机器人（平地、摩擦 1.0、无质量/质心扰动、无推力）；`full`＝开摩擦/质量/质心随机化与推力 |
 | `--dr_ramp` | `0.4` | **仅站立任务**：域随机化从 0 到满幅所占的训练比例 |
 | `--fixed_lr` | 关 | 把学习率钉死在 `3e-4`（`schedule="fixed"`），不用 cfg 的 adaptive-in-KL。adaptive 是默认（原计划设置），但它会让 Adam 步长在 ~0 与 ~2e-3 之间摆 |
+| `--desired_kl` | 不传（cfg `0.01`） | 覆盖 adaptive 的 KL 目标。**注意 rsl_rl 比的是 16 个动作维的 KL 之和**，所以 0.01 相当于单维 6e-4——太紧，40 步一轮在 `lr=1e-5` 都能超，结果 lr 永久贴地板。这个网络可用的区间是 **0.05–0.08** |
 
 ### play.py —— 在仿真里看模型
 
