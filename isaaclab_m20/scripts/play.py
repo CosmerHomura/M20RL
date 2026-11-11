@@ -263,7 +263,7 @@ def write_command(command_term, command) -> None:
         command, device=buffer.device, dtype=buffer.dtype)
 
 
-def status_line(env, command_term, wheel_ids, timestep: int) -> str:
+def status_line(env, command_term, wheel_ids, timestep: int, obs=None) -> str:
     """One line that answers "is the command reaching the robot, and is it moving".
 
     Everything here is read-only and env-averaged, so it can run while the robot
@@ -271,6 +271,10 @@ def status_line(env, command_term, wheel_ids, timestep: int) -> str:
     ``standing`` (1.00 = the command buffer is still zero, so the parking brake is
     also still holding the wheels), ``|v_xy|`` (actual speed), ``qdot_wheel``
     (wheels spinning with no speed = they are not loaded) and ``qdot_leg``.
+
+    ``obs_cmd`` is the command as the *policy* sees it, taken out of the policy
+    observation tensor (columns 37:40). If ``cmd=`` and ``obs_cmd=`` ever disagree,
+    something between the buffer and the observation is rewriting or mapping it.
     """
     unwrapped = env.unwrapped
     data = unwrapped.scene["robot"].data
@@ -301,8 +305,16 @@ def status_line(env, command_term, wheel_ids, timestep: int) -> str:
             zero = (buffer[:, :3].abs() <= 1e-3).all(dim=1).float().mean()
             standing = f"{float(zero):.2f}"
 
+    observed = ""
+    policy_obs = obs
+    if isinstance(policy_obs, dict):
+        policy_obs = policy_obs.get("policy")
+    if policy_obs is not None and policy_obs.ndim == 2 and policy_obs.shape[1] >= 40:
+        ox, oy, ow = (float(value) for value in policy_obs[0, 37:40])
+        observed = f"obs_cmd=({ox:+.2f},{oy:+.2f},{ow:+.2f}) "
+
     seconds = timestep * unwrapped.step_dt
-    return (f"[status] t={seconds:5.1f}s {command}|v_xy|={speed:.3f} wz={wz:+.2f} "
+    return (f"[status] t={seconds:5.1f}s {command}{observed}|v_xy|={speed:.3f} wz={wz:+.2f} "
             f"h={height:.3f} tilt={tilt:4.1f}deg qdot_leg={qdot_leg:5.1f} "
             f"qdot_wheel={qdot_wheel:6.2f} standing={standing}")
 
@@ -344,6 +356,19 @@ def main() -> None:
     policy = runner.get_inference_policy(device=env.unwrapped.device)
 
     obs = env.get_observations()
+    try:
+        sliced = obs["policy"] if isinstance(obs, dict) else obs
+        obs_dim = int(sliced.shape[-1])
+        if sliced.ndim == 2 and sliced.shape[1] >= 40:
+            # A startup dump of the command the policy actually receives: if this
+            # does not track the value printed by [INFO] command, the command is
+            # not reaching the observation and nothing else matters.
+            print(f"[INFO] Policy obs: {obs_dim} dims, command slice obs[37:40] = "
+                  f"{[round(float(v), 3) for v in sliced[0, 37:40]]}")
+        else:
+            print(f"[INFO] Policy obs: {obs_dim} dims (no command slice)")
+    except Exception as exc:  # noqa: BLE001 - diagnostics only
+        print(f"[WARN] Could not read the policy obs shape: {exc}")
     dt = env.unwrapped.step_dt
     real_time = args_cli.real_time if args_cli.real_time is not None else not args_cli.headless
     push_period = int(round(args_cli.push_every / dt)) if args_cli.push_every > 0 else 0
@@ -416,7 +441,7 @@ def main() -> None:
                     overwrite_reports += 1
         timestep += 1
         if args_cli.status_every and timestep % args_cli.status_every == 0:
-            print(status_line(env, command_term, wheel_ids, timestep), flush=True)
+            print(status_line(env, command_term, wheel_ids, timestep, obs), flush=True)
 
         if push_period and timestep % push_period == 0:
             shove(env, args_cli.push_speed)
