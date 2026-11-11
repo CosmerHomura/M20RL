@@ -103,6 +103,7 @@ from rsl_rl.runners import OnPolicyRunner
 from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 
 import isaaclab_m20.tasks  # noqa: F401 - registers both M20 task ids
+from isaaclab_m20.tasks import control
 from isaaclab_m20.tasks.commands import freeze_command_resampling
 from isaaclab_m20.tasks.m20_env_cfg import fit_viewer_to_grid
 
@@ -305,13 +306,26 @@ def status_line(env, command_term, wheel_ids, timestep: int, obs=None) -> str:
 
     command = ""
     standing = "n/a"
+    mode_text = ""
     if command_term is not None:
         buffer = getattr(command_term, "vel_command_b", None)
         if buffer is not None:
             vx, vy, wz_cmd = (float(value) for value in buffer[0, :3])
             command = f"cmd=({vx:+.2f},{vy:+.2f},{wz_cmd:+.2f}) "
+            modes = getattr(command_term, "mode_buf", None)
+            if modes is not None:
+                label = control.MODE_NAMES[int(modes[0])].lower()
+                mode_text = f"mode={label} "
             zero = (buffer[:, :3].abs() <= 1e-3).all(dim=1).float().mean()
             standing = f"{float(zero):.2f}"
+
+    targets_text = ""
+    try:
+        targets = control.command_targets(unwrapped)
+        bx, by = (float(value) for value in targets.v_body[0])
+        targets_text = f"v*=({bx:+.2f},{by:+.2f}) w*={float(targets.omega[0]):+.2f} "
+    except Exception:  # noqa: BLE001 - a status line must never stop playback
+        pass
 
     observed = ""
     policy_obs = obs
@@ -322,7 +336,8 @@ def status_line(env, command_term, wheel_ids, timestep: int, obs=None) -> str:
         observed = f"obs_cmd=({ox:+.2f},{oy:+.2f},{ow:+.2f}) "
 
     seconds = timestep * unwrapped.step_dt
-    return (f"[status] t={seconds:5.1f}s {command}{observed}|v_xy|={speed:.3f} wz={wz:+.2f} "
+    return (f"[status] t={seconds:5.1f}s {command}{mode_text}{targets_text}{observed}"
+            f"|v_xy|={speed:.3f} wz={wz:+.2f} "
             f"h={height:.3f} tilt={tilt:4.1f}deg qdot_leg={qdot_leg:5.1f} "
             f"qdot_wheel={qdot_wheel:6.2f} standing={standing}")
 

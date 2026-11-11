@@ -5,14 +5,15 @@ set it has always used. ``Isaac-M20-Wheeled-Velocity-v0`` uses ten per-step
 terms, plus a fall penalty that is applied by the environment rather than by a
 reward term:
 
-    r = + 2.0   · r_vel                 speed tracking, 1/(1 + e²/0.25²)
-      + 1.0   · r_yaw                 yaw-rate tracking, 1/(1 + e²/0.3²)
+    r = + 2.0   · r_vel                 speed tracking, 1/(1 + e²/0.25²)   [body target]
+      + 1.0   · r_yaw                 yaw-rate tracking, 1/(1 + e²/0.3²)   [ω*]
+      - 1.0   · p_rot_xy              1[mode=ROTATE]·sum((v_xy/0.15)²)
       - 0.5   · p_h                   ((h - 0.50)/0.05)²                  ride height
       - 0.5   · p_ori                 (gx² + gy²) / 0.2²                    roll/pitch
       - 0.2   · p_vz                  (v_z / 0.2)²                     vertical bounce
       - 0.2   · p_ang                 sum(w_xy² / 1²)                       wobble
-      - 0.2   · p_wheel               1[cmd==0]·mean((qdot_w / 2)²)   spinning wheels
-      - 0.05  · p_pose                sum((q - q_default)²/0.3²)   legs only
+      - 0.2   · p_wheel               1[mode=STAND]·mean((qdot_w / 2)²)  wheels
+      - 1.0   · p_pose                mean_legs((q - q_default)²/1.0²)  legs only
       - 0.02  · p_qacc                sum((qdd / 2000)²)           legs only
       - 0.01  · p_action              sum((Δa / 1.0)²)
 
@@ -20,7 +21,7 @@ reward term:
     ``fall_penalty`` on the env cfg). It is not one of the terms below because the
     termination flags are only known after the reward manager has run.
 
-**Ten, not sixteen.** The earlier set had a pair of channels for each axis group
+**Eleven, not sixteen.** The earlier set had a pair of channels for each axis group
 -- an exp kernel *and* a quadratic for linear velocity, again for yaw -- plus a
 gated position hold and regularisers that measured almost nothing (leg joint
 velocity was 1% of the height term, joint torque less). Two springs of different
@@ -28,15 +29,20 @@ stiffness on the same error cannot be attributed or tuned, which is exactly why
 the table kept growing. The consolidation replaced pairs instead of adding to
 them:
 
-* one bounded kernel per axis group (``track_lin_vel_xy``, ``track_ang_vel_z``).
-  The Cauchy form 1/(1+e²/σ²) keeps a usable gradient across the whole command
-  range, where exp is already flat at 0.018 by the far end;
+* one bounded kernel per axis group (``track_lin_vel_xy``, ``track_ang_vel_z``),
+  both against the *resolved* target from ``tasks/control.py`` -- the body-frame
+  velocity and the outer-loop yaw-rate target. The Cauchy form 1/(1+e²/σ²) keeps a
+  usable gradient across the whole command range, where exp is already flat at
+  0.018 by the far end;
 * ride height is a plain quadratic error, not an exp bonus: on flat ground the
   target is a set point, so what the channel needs is stiffness around it, and a
   quadratic has no ceiling to saturate against;
 * ``leg_joint_acc_l2`` replaces the leg joint-velocity channel, and
   ``action_rate_l2`` (both at their un-scaled magnitudes) make joint chatter cost
-  something.
+  something;
+* the two mode gates: ``wheel_speed_l2`` on STAND (legs holding the body up while
+  the wheels spin) and ``zero_xy_speed_l2`` on ROTATE (a pure spin must not
+  translate). Both read the label the sampler wrote, never a float re-test here.
 
 **No survival bonus, and no reward floor either.** Both were tried and both were
 compensations for other mistakes, so neither is in this file. The floor
@@ -91,7 +97,7 @@ import torch
 from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
 
-from isaaclab_m20.tasks import observations
+from isaaclab_m20.tasks import control, observations
 from isaaclab_m20.tasks.observations import LEG_JOINT_NAMES, WHEEL_JOINT_NAMES
 
 
@@ -162,29 +168,56 @@ def wheel_vel_exp(env, sigma: float = 2.0,
 # --------------------------------------------------------------------------- #
 def track_lin_vel_xy(env, sigma: float = 0.25, command_name: str = "base_velocity",
                      asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """1 / (1 + ((vx-cmd_x)^2 + (vy-cmd_y)^2) / sigma^2), in (0, 1].
+    """1 / (1 + |v_body - v_body*|^2 / sigma^2), in (0, 1].
 
-    ``sigma = 0.25 m/s`` against commands of +-0.5 / +-0.2: a 0.25 m/s error
-    scores 0.5, a 0.5 m/s error 0.2 -- a gradient across the whole range, where an
-    exp kernel is already flat at 0.02 by then.
+    ``sigma = 0.25 m/s`` against a 2.5 m/s envelope: a 0.25 m/s error scores 0.5,
+    a 0.5 m/s error 0.2 -- a gradient across the whole range, where an exp kernel
+    is already flat at 0.02 by then.
 
-    Both velocities are body-frame, and so is the command, so the comparison is
-    frame-consistent by construction.
+    The target is ``control.command_targets(env).v_body``: the command-frame
+    velocity rotated into the body frame with ``R(-psi_rel)``. Comparing it to
+    ``root_lin_vel_b`` is therefore the same error the operator asked for, in the
+    frame both quantities are measured in. The raw command is *not* used here --
+    using it directly would demand a body velocity the operator never asked for
+    whenever the robot is not aligned with its command frame.
     """
     robot = _robot(env, asset_cfg)
     velocity = robot.data.root_lin_vel_b[:, :2]
-    command = observations.velocity_command(env, command_name)[:, :2]
-    error = torch.sum(torch.square(velocity - command), dim=1)
+    target = control.command_targets(env).v_body
+    error = torch.sum(torch.square(velocity - target), dim=1)
     return 1.0 / (1.0 + error / (sigma * sigma))
 
 
 def track_ang_vel_z(env, sigma: float = 0.3, command_name: str = "base_velocity",
                     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """1 / (1 + (w_z - cmd_wz)^2 / sigma^2), in (0, 1]: yaw-rate tracking."""
+    """1 / (1 + (w_z - omega*)^2 / sigma^2), in (0, 1]: yaw-rate tracking.
+
+    ``omega*`` is the outer loop's target (feed-forward plus heading PD), not
+    ``wz_cmd``: in MOVE/COMBINED the robot is expected to steer while it drives,
+    and in ROTATE the two are equal by construction.
+    """
     ang_vel_z = _robot(env, asset_cfg).data.root_ang_vel_b[:, 2]
-    cmd = observations.velocity_command(env, command_name)[:, 2]
-    error = torch.square(ang_vel_z - cmd)
+    target = control.command_targets(env).omega
+    error = torch.square(ang_vel_z - target)
     return 1.0 / (1.0 + error / (sigma * sigma))
+
+
+def zero_xy_speed_l2(env, scale: float = 0.15,
+                     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """1[ROTATE] * |v_xy|^2 / scale^2 (positive; weight is negative).
+
+    The third gate. While the command is a pure spin the operator asked for *no
+    translation*, and the tracking kernel cannot say that: with a zero linear
+    target it would already ask for zero velocity, but a spin is the one case
+    where "stay in place" is the whole task, so it gets its own stiffness
+    (``scale = 0.15 m/s`` -- 50 mm/s costs ~0.1/step at weight -1.0) rather than
+    relying on the gentler tracking kernel.
+
+    Gated on the mode label, so a moving command never pays it.
+    """
+    mask = control.mode_mask(env, control.MODE_ROTATE)
+    velocity = _robot(env, asset_cfg).data.root_lin_vel_b[:, :2]
+    return mask * torch.sum(torch.square(velocity / scale), dim=1)
 
 
 # --------------------------------------------------------------------------- #
@@ -389,7 +422,7 @@ def wheel_speed_l2(env, scale: float = 2.0, command_name: str = "base_velocity",
     Mean over the four wheels, not sum: a single noisy wheel should not outweigh
     the whole posture channel.
     """
-    mask = standing_mask(env, command_name)
+    mask = control.mode_mask(env, control.MODE_STAND)
     wheel_vel = _robot(env, asset_cfg).data.joint_vel
     return mask * torch.mean(torch.square(wheel_vel / scale), dim=1)
 

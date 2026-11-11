@@ -161,18 +161,19 @@ STAGES: tuple[Stage, ...] = (
     # layout. Every term still runs; the tracking terms just mean "be still".
     Stage("1_stand", 900, (0.00, 0.0, 0.0), (0.00, 0.0, 0.0), 0, zero_prob=1.0),
     # Half the commands stay zero, so standing is rehearsed while the first
-    # moving axis is learned. 0.8 m/s is 40% of the 2.0 m/s envelope: enough to
-    # force a real gait, slow enough that falling is not the first lesson.
-    Stage("2_forward_backward", 700, (0.00, 0.0, 0.0), (0.80, 0.0, 0.0), 300,
+    # moving axis is learned. vx now grows all the way to the 2.5 m/s envelope:
+    # the wheel action scale is 27.78 rad/s per unit, so a command beyond that
+    # is outside what the actor can ask for.
+    Stage("2_forward_backward", 700, (0.00, 0.0, 0.0), (2.50, 0.0, 0.0), 350,
           zero_prob=0.5),
     # Lateral and yaw arrive together: they are the two axes the wheels cannot
     # produce on their own and the ones that break the standing skill first.
-    # vx is already at 0.8 and grows to 1.4 while vy/wz grow in from 0.
-    Stage("3_multi_direction", 1200, (0.80, 0.0, 0.0), (1.40, 0.40, 0.80), 400,
+    # vx stays at the envelope while vy/wz grow in from 0.
+    Stage("3_multi_direction", 1200, (2.50, 0.0, 0.0), (2.50, 0.40, 0.80), 400,
           zero_prob=0.3),
-    # The last 0.6 m/s of vx plus 20% stops and shorter holds: accelerate, stop,
-    # turn and side-step several times per episode, at the top of the envelope.
-    Stage("4_agile", 1400, (1.40, 0.40, 0.80), (2.00, 0.50, 1.00), 300,
+    # 20% stops and shorter holds: accelerate, stop, turn and side-step several
+    # times per episode, at the top of the envelope.
+    Stage("4_agile", 1400, (2.50, 0.40, 0.80), (2.50, 0.50, 1.00), 300,
           zero_prob=0.2, resampling=(1.5, 3.0)),
 )
 
@@ -296,7 +297,7 @@ from isaaclab.utils.dict import print_dict
 from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 
 import isaaclab_m20.tasks  # noqa: F401 - registers the M20 task ids
-from isaaclab_m20.tasks import dr
+from isaaclab_m20.tasks import control, dr
 from isaaclab_m20.tasks.m20_env_cfg import fit_viewer_to_grid
 
 
@@ -614,13 +615,14 @@ def attach_diagnostics(env, every: int, zero_actions: bool, per_term_every: int 
     crash instead of after it.
 
     For the velocity task the line also carries ``|v_xy|`` (mean body speed -- the
-    quantity the tracking kernel prices), ``standing`` (the fraction of envs whose
-    command buffer is zero, which is both the stage-1 set point and the gate that
-    ``wheel_speed`` multiplies), and ``rew``/``neg`` (the per-step reward and the
+    quantity the tracking kernel prices), ``stand``/``move``/``rot`` (the shares of
+    each mode label; the sampler writes the label and the reward gates
+    ``wheel_speed``/``zero_xy_speed`` read it), ``w*`` (the yaw-rate target the
+    outer loop is asking for), and ``rew``/``neg`` (the per-step reward and the
     fraction of envs where it is negative). A stage-1 run that wanders shows up in
     ``|v_xy|`` immediately: the command is zero, so anything above ~0.05 m/s is
-    drift. ``standing=0.00`` would mean the command buffer is not zero rather than
-    the reward being too weak. ``neg=1.00`` is *not* an error by itself -- with no
+    drift. ``stand=0.00`` during stage 1 would mean the labels are wrong rather
+    than the reward being too weak. ``neg=1.00`` is *not* an error by itself -- with no
     reward floor a bad policy legitimately earns a negative step -- but if it sits
     at 1.00 for a whole stage while ``Train/mean_reward`` does not rise, the
     command range is ahead of the policy.
@@ -656,12 +658,11 @@ def attach_diagnostics(env, every: int, zero_actions: bool, per_term_every: int 
             root_vel = robot.data.root_lin_vel_w.abs().max()
             # "does the robot actually stand still when told to" is otherwise
             # only visible in tensorboard hours later: |v_xy| is the residual the
-            # tracking kernel prices, and `standing` is the fraction of envs whose
-            # command is exactly zero (the same gate `wheel_speed` applies). It is
-            # derived from the command buffer -- the same source `standing_mask`
-            # reads -- rather than from `is_standing_env`, so this line reports the
-            # gate the reward actually applies. If it is 0.00 during stage 1, the
-            # command buffer is not zero, not the reward weights.
+            # tracking kernel prices; `stand=`/`move=`/`rot=` are the shares of
+            # each *mode label* -- the sampler writes the label, and the reward
+            # gates (`wheel_speed` on STAND, `zero_xy_speed` on ROTATE) read the
+            # label, not re-tested floats. `w*` is the yaw-rate target the outer
+            # loop is asking for, which is what `track_ang_vel_z` compares to.
             speed_xy = robot.data.root_lin_vel_b[:, :2].norm(dim=1).mean()
             extra = f"  |v_xy|={speed_xy.item():.3f}"
             command_manager = getattr(unwrapped, "command_manager", None)
@@ -670,10 +671,18 @@ def attach_diagnostics(env, every: int, zero_actions: bool, per_term_every: int 
                     term = command_manager.get_term("base_velocity")
                 except KeyError:
                     term = None
-                buffer = getattr(term, "vel_command_b", None) if term else None
-                if buffer is not None:
-                    gate = (buffer[:, :3].abs() <= 1e-3).all(dim=1)
-                    extra += f"  standing={gate.float().mean().item():.2f}"
+                modes = getattr(term, "mode_buf", None) if term else None
+                if modes is not None:
+                    extra += (
+                        f"  stand={(modes == control.MODE_STAND).float().mean().item():.2f}"
+                        f"  move={(modes == control.MODE_MOVE).float().mean().item():.2f}"
+                        f"  rot={(modes == control.MODE_ROTATE).float().mean().item():.2f}"
+                    )
+                try:
+                    omega_star = control.command_targets(unwrapped).omega
+                    extra += f"  w*={omega_star.abs().mean().item():.2f}"
+                except Exception:  # noqa: BLE001 - diagnostics must never stop a run
+                    pass
             # Per-step reward as the reward manager summed it (no clamp since the
             # floor was removed). A large negative `rew` here is not a broken
             # reward -- it is the regime where the penalties outweigh the tracking

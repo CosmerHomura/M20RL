@@ -38,13 +38,44 @@ from __future__ import annotations
 import torch
 
 from isaaclab.envs.mdp.commands import UniformVelocityCommand, UniformVelocityCommandCfg
+from isaaclab.managers import CommandTermCfg
 from isaaclab.utils import configclass
+
+from isaaclab_m20.tasks import control
+
+_ZERO_EPS = 1e-6
 
 
 class MixedVelocityCommand(UniformVelocityCommand):
-    """Uniform-in-range commands, sampled with 1-3 active axes."""
+    """Uniform-in-range commands, sampled with 1-3 active axes.
+
+    Alongside the twist this term publishes a **mode label** (``STAND`` / ``MOVE``
+    / ``ROTATE`` / ``COMBINED``) in ``mode_buf``.  The reward gates read the label
+    instead of re-testing the floats: the sampler writes exact zeros today, so a
+    float test would work, but any future command filter or noise would make "the
+    label says MOVE while the numbers say 0.001" a silent inconsistency.  The
+    label is written by the sampler, i.e. by the same code that chose the numbers.
+    """
 
     cfg: MixedVelocityCommandCfg
+
+    def __init__(self, cfg: CommandTermCfg, env):
+        super().__init__(cfg, env)
+        self.mode_buf = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+
+    def _write_modes(self, env_ids, command: torch.Tensor) -> None:
+        """Derive the mode label from the twist that was just written."""
+        moving = command[:, :2].norm(dim=1) > _ZERO_EPS
+        spinning = command[:, 2].abs() > _ZERO_EPS
+        mode = torch.full((command.shape[0],), control.MODE_STAND,
+                          dtype=torch.long, device=command.device)
+        mode = torch.where(moving & spinning,
+                           torch.full_like(mode, control.MODE_COMBINED), mode)
+        mode = torch.where(moving & ~spinning,
+                           torch.full_like(mode, control.MODE_MOVE), mode)
+        mode = torch.where(~moving & spinning,
+                           torch.full_like(mode, control.MODE_ROTATE), mode)
+        self.mode_buf[env_ids] = mode
 
     def _resample_command(self, env_ids):
         # Heading mode replaces the yaw-rate command with a feedback law on the
@@ -75,6 +106,7 @@ class MixedVelocityCommand(UniformVelocityCommand):
             self.vel_command_b[env_ids, :3] = command
             self.is_standing_env[env_ids] = True
             self.is_heading_env[env_ids] = False
+            self._write_modes(env_ids, command)
             return
 
         # How many axes this draw activates: 1 / 2 / 3 with the 50/30/10 shares,
@@ -116,6 +148,7 @@ class MixedVelocityCommand(UniformVelocityCommand):
         self.vel_command_b[env_ids, :3] = command
         self.is_standing_env[env_ids] = standing
         self.is_heading_env[env_ids] = False
+        self._write_modes(env_ids, command)
 
 
 def freeze_command_resampling(term) -> None:

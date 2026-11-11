@@ -17,8 +17,8 @@ robot is the nominal one, and the numbers are what deployment would see.
 8                  (-0.30, 0.20, -0.30) backward + strafe left + turn right
 9                  (0, 0, 0)        hold still
 10                 (0.30,0,0) <-> (0,0,0)   switch go/stop, 3 cycles
-11                 (1.00, 0, 0)     forward at half the 2.0 m/s envelope
-12                 (2.00, 0, 0)     forward at the top speed
+11                 (1.25, 0, 0)     forward at half the 2.5 m/s envelope
+12                 (2.50, 0, 0)     forward at the top speed
 =================  ===============  ===============
 
 Rows 1-8 are the plan's low-speed checks and stay absolute (0.10 m/s is 33% of a
@@ -108,6 +108,7 @@ from rsl_rl.runners import OnPolicyRunner
 from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 
 import isaaclab_m20.tasks  # noqa: F401 - registers the task ids
+from isaaclab_m20.tasks import control
 from isaaclab_m20.tasks.commands import freeze_command_resampling
 
 
@@ -131,11 +132,11 @@ TESTS: tuple[Test, ...] = (
     Test("7", (0.30, 0.00, 0.30), "forward + turn left"),
     Test("8", (-0.30, 0.20, -0.30), "back + strafe left + turn right"),
     Test("9", (0.00, 0.00, 0.00), "hold still"),
-    # The speed envelope, 2.0 m/s set by the wheel action scale (22.2 rad/s x
+    # The speed envelope, 2.5 m/s set by the wheel action scale (27.78 rad/s x
     # 0.09 m). Rows 1-9 are all below 0.5 m/s, so without these two a policy
     # that never left the low-speed regime would pass the battery.
-    Test("11", (1.00, 0.00, 0.00), "forward, half the envelope"),
-    Test("12", (2.00, 0.00, 0.00), "forward, top speed"),
+    Test("11", (1.25, 0.00, 0.00), "forward, half the envelope"),
+    Test("12", (2.50, 0.00, 0.00), "forward, top speed"),
 )
 
 # Acceptance thresholds from the plan.
@@ -307,9 +308,14 @@ def run_test(env, policy, test: Test, steps: int, settle_steps: int,
                   f"{command[0].tolist()} but the term holds {live.tolist()}. "
                   "The command term is still resampling.")
         seen = obs[0, COMMAND_OBS_SLICE]
-        if not torch.allclose(seen, command[0], atol=5.0e-2):
-            print("[WARN] The policy sees a different command than the test wrote: "
-                  f"wrote {command[0].tolist()} but the observation holds {seen.tolist()}. "
+        # The last three observation columns are the *resolved* target (body-frame
+        # velocity + outer-loop yaw rate), not the raw twist, so compare against
+        # what ``control.py`` resolves for this state instead of the command.
+        targets = control.command_targets(env.unwrapped)
+        expected = torch.cat((targets.v_body[0], targets.omega[0].reshape(1)))
+        if not torch.allclose(seen, expected, atol=5.0e-2):
+            print("[WARN] The policy sees a different target than command.py resolves: "
+                  f"observation {seen.tolist()} vs resolved {expected.tolist()}. "
                   "Check the observation term order in observations.py.")
 
     for step in range(steps + settle_steps):

@@ -14,8 +14,10 @@ observation         56 dims, body frame (see ``observations.py``)
 action              16 dims: 12 leg position targets + 4 wheel speed targets
 control rate        50 Hz (decimation 4 on 200 Hz physics)
 episode             20 s
-rewards             10 weighted per-step terms (see ``rewards.py``) and a
-                    terminal -10 applied by ``M20VelocityEnv`` on falls only
+rewards             11 weighted per-step terms (see ``rewards.py``) and a
+                    terminal -10 applied by ``M20VelocityEnv`` on falls only;
+                    the perception is ``tasks/control.py``'s resolved target,
+                    not the raw command
 command mix         50% single axis / 30% two axes / 10% three / 10% zero,
                     held 2-4 s; stages 2-4 keep 50/30/20% zero commands
                     (stage 4 also shortens the hold to 1.5-3 s)
@@ -58,7 +60,7 @@ from isaaclab.managers import (
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.utils import configclass
 
-from isaaclab_m20.tasks import commands, dr, observations, rewards
+from isaaclab_m20.tasks import commands, control, dr, observations, rewards
 from isaaclab_m20.tasks.m20_env_cfg import M20SceneCfg, fit_viewer_to_grid
 
 # Base ride height. The USD spawns the base at z = 0.50 and the legs' default
@@ -146,13 +148,14 @@ class ActionsCfg:
     wheel_velocities = mdp.JointVelocityActionCfg(
         asset_name="robot",
         joint_names=observations.WHEEL_JOINT_NAMES,
-        # |a| = 1 asks for 22.2 rad/s. With the 0.09 m wheel that is 2.0 m/s, the
+        # |a| = 1 asks for 27.78 rad/s. With the 0.09 m wheel that is 2.5 m/s, the
         # speed the top stage commands. The motor itself allows far more (the
         # actuator velocity limit is 200 rad/s = 18 m/s, and 21.6 N*m / 0.09 m =
         # 240 N per wheel against a 338 N friction ceiling for the whole robot),
         # so the scale -- not the hardware -- sets the envelope. 8.0 was the old
-        # value and capped the robot at 0.72 m/s, slower than walking.
-        scale=22.2,
+        # value and capped the robot at 0.72 m/s, slower than walking; 22.2 gave
+        # 2.0 m/s and is what the shared checkpoints were trained with.
+        scale=27.78,
         use_default_offset=False,
     )
 
@@ -178,8 +181,8 @@ class ObservationsCfg:
         # -- 4: wheel angular velocities --------------------------------------
         wheel_vel = ObservationTermCfg(
             func=mdp.joint_vel_rel, params={"asset_cfg": wheel_obs_cfg()})
-        # -- 3: the command itself (must be part of the input) ----------------
-        velocity_command = ObservationTermCfg(func=observations.velocity_command)
+        # -- 3: the resolved command target (body-frame v*, yaw-rate target) ---
+        command_target = ObservationTermCfg(func=observations.command_target)
         # -- 16: previous action, for action smoothness ------------------------
         last_action = ObservationTermCfg(func=mdp.last_action)
 
@@ -195,8 +198,8 @@ class ObservationsCfg:
 
 @configclass
 class RewardsCfg:
-    """Ten per-step channels: two tracking, four base-state, three regularisers and
-    the one gated term. The fall penalty is *not* here -- it is applied by
+    """Eleven per-step channels: two tracking, four base-state, three regularisers
+    and **two mode-gated terms**. The fall penalty is *not* here -- it is applied by
     ``isaaclab_m20.envs.M20VelocityEnv`` from the termination flags (see
     ``fall_penalty`` on the env cfg).
 
@@ -218,10 +221,18 @@ class RewardsCfg:
     * ``leg_joint_acc`` replaces the leg joint-velocity channel and
       ``action_rate`` is normalised, so joint chatter is no longer free.
 
-    One gated term only: ``wheel_speed`` (wheels spinning under a still body),
-    gated on a strictly-zero command read from the command buffer
-    (``eps = 1e-3``). Everything else is ungated because it is either relative to
-    the command or meaningful while driving.
+    Two mode-gated terms, both reading the label the sampler wrote (never a float
+    re-test here):
+
+    * ``wheel_speed`` -- STAND: legs holding the body up while the wheels spin.
+      The body does not move, so every body-frame channel is satisfied; only the
+      wheel rate exposes it.
+    * ``zero_xy_speed`` -- ROTATE: a pure yaw command must not translate. The
+      tracking kernel only asks for a zero *linear* target, which is a soft way to
+      say "stay put"; this is the hard one that the spin task is actually about.
+
+    Everything else is ungated because it is either relative to the command or
+    meaningful while driving.
 
     Deliberately absent, and each one was a deliberate deletion:
 
@@ -252,10 +263,18 @@ class RewardsCfg:
     """
 
     # -- task ---------------------------------------------------------------
+    # Both kernels compare against ``control.command_targets``: the command-frame
+    # velocity rotated into the body frame, and the outer loop's yaw-rate target.
+    # That is the only definition of "on target" in this project.
     track_lin_vel_xy = RewardTermCfg(
         func=rewards.track_lin_vel_xy, weight=2.0, params={"sigma": 0.25})
     track_ang_vel_z = RewardTermCfg(
         func=rewards.track_ang_vel_z, weight=1.0, params={"sigma": 0.3})
+    # The third gate: a pure spin must not translate. Zero linear target alone does
+    # not express that strongly enough, and "stay in place while spinning" is the
+    # whole task of the ROTATE mode rather than a side condition.
+    zero_xy_speed = RewardTermCfg(
+        func=rewards.zero_xy_speed_l2, weight=-1.0, params={"scale": 0.15})
 
     # -- base state ----------------------------------------------------------
     # Quadratic, not exp: on flat ground the tilt and the ride height should be
@@ -276,10 +295,10 @@ class RewardsCfg:
         func=rewards.ang_vel_xy_l2, weight=-0.2, params={"scale": 1.0})
 
     # -- wheels under a parked body -----------------------------------------
-    # The one gated term. The body-frame channels cannot see this: with the legs
-    # holding the base up, the wheels can be commanded to any speed without moving
-    # the robot. Gated because when a command is present the wheels are *supposed*
-    # to spin -- an ungated version taxes every in-place turn.
+    # Gated on the STAND label. The body-frame channels cannot see this: with the
+    # legs holding the base up, the wheels can be commanded to any speed without
+    # moving the robot. Gated because when a command is present the wheels are
+    # *supposed* to spin -- an ungated version taxes every in-place turn.
     wheel_speed = RewardTermCfg(
         func=rewards.wheel_speed_l2, weight=-0.2, params={"scale": 2.0})
 
@@ -517,6 +536,27 @@ class M20WheeledVelocityEnvCfg(ManagerBasedRLEnvCfg):
     wheel_park_kp: float = 15.0
     wheel_park_omega_max: float = 3.0
     wheel_park_error_clamp: float = 0.3
+
+    # -- yaw outer loop (see ``isaaclab_m20.tasks.control``) ------------------
+    # ``omega_target = psi_dot_cmd + kp * e_psi - kd * (psi_dot_meas - psi_dot_cmd)``
+    # feeds the third command slot of the observation. Kp is 1/s, Kd is
+    # dimensionless, and the numbers are starting values: the plant inside the loop
+    # is the policy tracking a yaw-rate command, so "critical damping" is not a
+    # property of this pair -- judge them by the yaw RMSE in ``eval`` and the
+    # settling time in ``play``.
+    #
+    # ``omega_max`` / ``omega_rate`` are limits on the *target*, not on the robot:
+    # without them a 180 degree branch switch asks for a rate the policy cannot
+    # deliver, the tracking term saturates, and the critic sees a discontinuity.
+    # ``alpha_*`` shape how fast the travel-direction set point may move (branch
+    # switches and command changes), which is what keeps the PD output smooth.
+    yaw_kp: float = 1.2
+    yaw_kd: float = 0.25
+    yaw_omega_max: float = 1.5
+    yaw_omega_rate: float = 60.0
+    yaw_alpha_tau: float = 0.05
+    yaw_alpha_rate: float = 3.0
+    yaw_branch_hysteresis: float = 0.15
 
     def __post_init__(self) -> None:
         # 200 Hz physics, 50 Hz policy.

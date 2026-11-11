@@ -10,6 +10,8 @@ import torch
 
 from isaaclab.envs import ManagerBasedRLEnv
 
+from isaaclab_m20.tasks import control
+
 
 class M20VelocityEnv(ManagerBasedRLEnv):
     """Velocity task with a fall penalty and a wheel parking brake.
@@ -99,6 +101,9 @@ class M20VelocityEnv(ManagerBasedRLEnv):
         super().__init__(cfg=cfg, render_mode=render_mode, **kwargs)
         self._fall_penalty = self._read_fall_penalty()
         self._check_timeout_is_not_a_fall()
+        # The command -> target resolver is created on first use; create it here so
+        # the per-environment state exists before the first reset.
+        control.computer(self)
         # Bring-up helper, not part of the task contract: if this IsaacLab version
         # shapes the action manager differently than expected, the brake disables
         # itself and training continues. The policy keeps its full action authority,
@@ -259,12 +264,14 @@ class M20VelocityEnv(ManagerBasedRLEnv):
         self._park_was_standing = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
     def _standing_command_mask(self) -> torch.Tensor | None:
-        """Envs whose velocity command is exactly zero, from the command buffer.
+        """Envs parked under a STAND command, read from the sampler's mode label.
 
-        The buffer is the same source the observation and the gated wheel-speed
-        reward use, so "the reward thinks it is standing" and "the brake thinks it
-        is standing" cannot disagree. Returns ``None`` when the task has no
-        velocity command at all (the standing task), in which case the brake stays
+        The label is written by the code that *chose* the command, so the brake,
+        the observation and the gated reward all agree about what "standing"
+        means without any of them re-testing floats. Falls back to the strict-zero
+        buffer test when the term predates the label (``mode_buf`` missing), which
+        keeps the standing task and older checkpoints working. Returns ``None``
+        when the task has no velocity command at all, in which case the brake stays
         out of the way.
         """
         manager = getattr(self, "command_manager", None)
@@ -274,6 +281,9 @@ class M20VelocityEnv(ManagerBasedRLEnv):
             term = manager.get_term("base_velocity")
         except (KeyError, ValueError):
             return None
+        modes = getattr(term, "mode_buf", None)
+        if modes is not None:
+            return modes == control.MODE_STAND
         buffer = getattr(term, "vel_command_b", None)
         if buffer is None:
             return None
@@ -386,7 +396,39 @@ class M20VelocityEnv(ManagerBasedRLEnv):
         if value.numel() != 3:
             raise ValueError(f"expected (vx, vy, wz), got {value.numel()} values")
         self.command_override = value.repeat(self.num_envs, 1)
+        self._pin_command_ranges(value)
         self._apply_command_override()
+
+    def _pin_command_ranges(self, value: torch.Tensor) -> None:
+        """Make the sampler itself produce the pinned command.
+
+        Writing the buffer alone is not enough everywhere: a resample inside
+        ``step`` can still fire and draw a *new* command from ``cfg.ranges``. When
+        the ranges collapse to a single point, whatever the sampler draws is the
+        requested command -- so the pin survives even when the resample hook could
+        not be frozen (which happens when a term keeps a private copy of its
+        ranges and ignores later config edits).
+
+        This is the same trick ``eval`` needs: its tests must be reproducible, not
+        "roughly this command with 10% zero commands mixed in".
+        """
+        try:
+            cfg = self.cfg.commands.base_velocity
+        except AttributeError:
+            return
+        vx, vy, wz = (float(v) for v in value.flatten().tolist())
+        try:
+            ranges = cfg.ranges
+            ranges.lin_vel_x = (vx, vx)
+            ranges.lin_vel_y = (vy, vy)
+            ranges.ang_vel_z = (wz, wz)
+            ranges.heading = (0.0, 0.0)
+            cfg.rel_standing_envs = 0.0
+            cfg.rel_heading_envs = 0.0
+            if hasattr(cfg, "zero_prob"):
+                cfg.zero_prob = 0.0
+        except Exception:  # noqa: BLE001 - the buffer write above still applies
+            pass
 
     def _apply_command_override(self, env_ids=None) -> None:
         override = getattr(self, "command_override", None)
@@ -408,12 +450,46 @@ class M20VelocityEnv(ManagerBasedRLEnv):
             buffer[:, :3] = override
         else:
             buffer[env_ids, :3] = override[env_ids]
+        # The label has to follow the pinned numbers: the reward gates and the
+        # brake read the label, not the floats.
+        modes = getattr(term, "mode_buf", None)
+        if modes is not None:
+            labels = self._mode_labels(override)
+            if env_ids is None:
+                modes[:] = labels
+            else:
+                modes[env_ids] = labels[env_ids]
+
+    @staticmethod
+    def _mode_labels(command: torch.Tensor) -> torch.Tensor:
+        """Mode label per row, exactly as the sampler derives it."""
+        moving = command[:, :2].norm(dim=1) > 1e-6
+        spinning = command[:, 2].abs() > 1e-6
+        labels = torch.full((command.shape[0],), control.MODE_STAND,
+                            dtype=torch.long, device=command.device)
+        labels = torch.where(moving & spinning,
+                             torch.full_like(labels, control.MODE_COMBINED), labels)
+        labels = torch.where(moving & ~spinning,
+                             torch.full_like(labels, control.MODE_MOVE), labels)
+        labels = torch.where(~moving & spinning,
+                             torch.full_like(labels, control.MODE_ROTATE), labels)
+        return labels
 
     def _reset_idx(self, env_ids) -> None:
         super()._reset_idx(env_ids)
         # Runs before the observation is built, so a reset cannot hand the policy a
         # command we did not ask for.
         self._apply_command_override(env_ids)
+        # The command frame integral and the branch angle are per-episode state:
+        # re-seed them from the command the reset just installed.
+        try:
+            control.computer(self).reset(env_ids)
+        except Exception as exc:  # noqa: BLE001 - never take a run down for this
+            if not getattr(self, "_targets_failed", False):
+                self._targets_failed = True
+                print(
+                    f"[WARN] M20VelocityEnv: could not re-seed the command targets on "
+                    f"reset ({type(exc).__name__}: {exc}).", flush=True)
 
     def step(self, action):
         # A pinned command must also be what the parking brake sees on this step.
