@@ -214,6 +214,12 @@ parser.add_argument("--stage", type=str, default="all",
                          "checkpoint; a new stage continues from the previous one.")
 parser.add_argument("--stage_scale", type=float, default=1.0,
                     help="Multiply every stage's iteration budget (e.g. 0.05 for a smoke test).")
+parser.add_argument("--cmd_scale", type=float, default=1.0,
+                    help="Multiply every stage's command range on all three axes (e.g. 0.7 "
+                         "makes stage 2 ask for +-1.75 m/s instead of +-2.5). Budget, "
+                         "zero-command share and hold time are untouched. This is the "
+                         "'the policy cannot hold that speed yet' knob -- --stage_scale only "
+                         "shrinks the number of iterations.")
 parser.add_argument("--iterations", type=int, default=None,
                     help="How many iterations to run now. Plain and literal: it is the "
                          "same number whether the stage is new or being continued, and "
@@ -271,6 +277,12 @@ parser.add_argument(
     help="Standing task only (no command term): fraction of training over which the "
          "domain randomization ramps from 0 to full.")
 parser.add_argument(
+    "--learning_rate", "--lr", type=float, default=None, dest="learning_rate",
+    help="Starting learning rate for PPO (cfg default 3e-4). With the default adaptive "
+         "schedule this is where the KL controller starts, not where it stays; with "
+         "--fixed_lr it is the rate that holds for the whole stage. Only the rate "
+         "changes -- budgets, command ranges and rewards are untouched.")
+parser.add_argument(
     "--fixed_lr", action="store_true",
     help="Pin the learning rate at ``learning_rate`` (schedule='fixed') instead of "
          "the cfg's adaptive-in-KL schedule. Adaptive is the default because it is "
@@ -327,6 +339,7 @@ def select_stages(
     iterations: int | None,
     per_stage: dict[int, int | None] | None = None,
     warmup_frac: float | None = None,
+    cmd_scale: float = 1.0,
 ) -> list[tuple[int, Stage]]:
     """Which stages this run executes, with the iteration budget applied.
 
@@ -339,10 +352,18 @@ def select_stages(
     needs: stage 2 over 4000 iterations should spend the first 2000 growing the
     range instead of reaching +-0.4 after 150 and sampling there for 39 minutes.
 
+    ``cmd_scale`` (``--cmd_scale``) multiplies the *command ranges* -- all three
+    axes, both ends of the ramp -- and leaves the budget, the zero-command share
+    and the hold time alone. This is the knob for "the policy cannot hold this
+    speed yet, give it an easier task", as opposed to ``--stage_scale`` which only
+    shrinks the number of iterations.
+
     Returns ``(index_in_STAGES, stage)`` pairs so the caller can find the
     preceding stage's checkpoint for the first selected stage.
     """
     per_stage = per_stage or {}
+    if cmd_scale <= 0.0:
+        raise SystemExit(f"--cmd_scale must be positive, got {cmd_scale}")
     if selector == "all":
         indices = list(range(len(STAGES)))
     else:
@@ -352,6 +373,11 @@ def select_stages(
             raise SystemExit(f"--stage must be 1..{len(STAGES)} or 'all', got {selector!r}") from exc
         stage_by_number(number)  # validates the 1..N range
         indices = [number - 1]
+
+    def _scaled(ranges: tuple[float, float, float]) -> tuple[float, float, float]:
+        if cmd_scale == 1.0:
+            return ranges
+        return tuple(value * cmd_scale for value in ranges)  # type: ignore[return-value]
 
     out: list[tuple[int, Stage]] = []
     for index in indices:
@@ -375,8 +401,9 @@ def select_stages(
             warmup = min(int(round(budget * warmup_frac)), budget)
         else:
             warmup = min(stage.warmup, budget // 2) if stage.warmup else 0
-        out.append((index, Stage(stage.name, budget, stage.ranges_from, stage.ranges_to,
-                                 warmup, stage.zero_prob, stage.resampling)))
+        out.append((index, Stage(stage.name, budget, _scaled(stage.ranges_from),
+                                 _scaled(stage.ranges_to), warmup, stage.zero_prob,
+                                 stage.resampling)))
     return out
 
 
@@ -970,6 +997,13 @@ def main() -> None:
     agent_cfg = getattr(importlib.import_module(agent_module), agent_class)()
     agent_cfg.seed = args_cli.seed
     agent_cfg.device = args_cli.device
+    if args_cli.learning_rate is not None:
+        # The rate the schedule *starts* from. With adaptive it is only the
+        # starting point (the KL controller moves it every round); with
+        # --fixed_lr it is the rate that stays for the whole stage.
+        agent_cfg.algorithm.learning_rate = float(args_cli.learning_rate)
+        print(f"[INFO] learning_rate: {agent_cfg.algorithm.learning_rate:g} "
+              f"(cfg default is {3.0e-4:g}; adaptive moves it, --fixed_lr pins it)")
     if args_cli.desired_kl is not None:
         # Only meaningful for the adaptive schedule, and only in the sense the
         # controller uses it: a *sum over the 16 action dims*.
@@ -990,7 +1024,7 @@ def main() -> None:
     is_velocity_task = hasattr(env_cfg, "commands")
     per_stage = {index: getattr(args_cli, f"iters_stage{index + 1}") for index in range(len(STAGES))}
     stages = select_stages(args_cli.stage, args_cli.stage_scale, args_cli.iterations, per_stage,
-                           args_cli.warmup_frac) \
+                           args_cli.warmup_frac, args_cli.cmd_scale) \
         if is_velocity_task else []
 
     if is_velocity_task:
@@ -1017,6 +1051,9 @@ def main() -> None:
         total = sum(stage.iterations for _, stage in stages)
         print(f"[INFO] Course plan: {len(stages)} stage(s), {total} iterations "
               f"({env_cfg.scene.num_envs} envs x {agent_cfg.num_steps_per_env} steps/env)")
+        if args_cli.cmd_scale != 1.0:
+            print(f"[INFO] --cmd_scale {args_cli.cmd_scale:g}: every command range below "
+                  f"is scaled by it (the scheduled ranges come from the stage table)")
         for number, stage in stages:
             sampling = []
             if stage.zero_prob is not None:

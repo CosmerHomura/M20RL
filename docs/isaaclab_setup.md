@@ -138,7 +138,7 @@ python -m isaaclab_m20.scripts.train --headless --stage 1 --run_name m20_v1
 - 显存不够就降 `--num_envs`（16 GB 用 2048）。**训练期间只跑一个 Isaac Lab 进程**——两个进程抢同一张卡的表现是帧率崩到个位数，而不是干脆的 OOM。
 - 断点续训：站立任务与速度指令任务同一条规则——目录里已有 `model_*.pt` 就加载最新的接着训（站立任务的目录就是 run 目录本身）；速度指令任务的每个阶段默认从上一阶段**最新的** checkpoint 续训（Actor 与 Critic 全部参数一起继承）。`--stage N` 不给 `--run_name` 时会自动沿用最新 run 目录。
 - 同一阶段再训＝**接着训**，且不删任何文件：目录复用、加载该阶段最新 `model_*.pt`，跑多少轮由命令行决定（`--iterations N` 就是 N 轮；不写就用该阶段预算）。脚本不替你算差额、也不判断够不够。**续训的环境回到停下那一刻**：命令 ramp 按该阶段已达的迭代位置接上（warmup 中断就从中断处继续），采样分布沿用该阶段；当前配置会与首次的 `env.yaml` 逐项对比，有差异会 WARN，本次配置另存为 `env.resume-<时间戳>.yaml`。要真的从头重来才加 `--overwrite`（旧目录改名为 `stageN_xxx.bak-<时间戳>`，不是删除）；`--new_run` 另开时间戳 run，并从其他 run 的上一阶段最新 checkpoint 起步。
-- 每阶段轮数都是参数：单阶段训练直接写 `--stage 2 --iterations 1200`（`--stage` 已选定一个阶段，`--iters_stageN` 是同一件事，多余）；`--iters_stage1 … --iters_stage4` 只在 `--stage all` 跑整套课程时才用；`--stage_scale` 按比例整体缩。
+- 每阶段轮数都是参数：单阶段训练直接写 `--stage 2 --iterations 1200`（`--stage` 已选定一个阶段，`--iters_stageN` 是同一件事，多余）；`--iters_stage1 … --iters_stage4` 只在 `--stage all` 跑整套课程时才用；`--stage_scale` 按比例缩**轮数**，`--cmd_scale` 按比例缩**指令范围**（两个不是一回事）。
 - 只想确认流程能通：`--stage 1 --iterations 20 --num_envs 128`（约一分钟）。
 
 粗略预期（4090，单场景，无相机）：4096 环境下每 1000 iterations 是小时以内量级，整条 4 阶段课程通常几小时；具体耗时看 tensorboard 的 `fps` 和每阶段结束打印的 `finished in ... min`，基本随 `--num_envs` 线性变化。
@@ -154,7 +154,7 @@ tensorboard --logdir logs/rsl_rl --bind_all --port 6006
 - `Episode_Reward/flat_orientation` / `base_height`：是否在往 0 靠（机身水平、高度到位；两项现在都是**平方惩罚**）；
 - `Episode_Reward/wheel_speed`：零指令下越接近 0 越稳（没有空转）。**唯一带门控的一项**，"零指令不许动"更多看 `Train/mean_reward` 与 `[health]` 的 `|v_xy|`；
 - `Episode_Termination/base_height` / `bad_orientation`：翻车/趴下比例是否在降；
-- `Loss/learning_rate`：默认 `adaptive`，会按 KL 在 0 与 2e-3 之间乘除 1.5（锯齿是正常形态）；加 `--fixed_lr` 后固定 3e-4、应是一条水平线。`m20_v5` 的锯齿曾把 `mean_episode_length` 从 1000 打到 380，所以锯齿一旦出现要盯着回合长度看；
+- `Loss/learning_rate`：默认 `adaptive`，会按 KL 在 0 与 2e-3 之间乘除 1.5（锯齿是正常形态）；加 `--fixed_lr` 后固定为起始值（默认 3e-4，可用 `--learning_rate` / `--lr` 改）、应是一条水平线。`m20_v5` 的锯齿曾把 `mean_episode_length` 从 1000 打到 380，所以锯齿一旦出现要盯着回合长度看；
 
 ## 6. 播放与评估
 

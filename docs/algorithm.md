@@ -355,7 +355,7 @@ r = 2·r_v + 1·r_ω
 
 | 参数 | 值 | 说明 |
 | --- | --- | --- |
-| Learning Rate | 3e-4（起点） | `schedule="adaptive"`（原计划默认；`--fixed_lr` 可钉死为 3e-4，见下） |
+| Learning Rate | 3e-4（起点） | 命令行 `--learning_rate`（别名 `--lr`）可覆盖；`schedule="adaptive"` 只把它当起点（原计划默认；`--fixed_lr` 可钉死，见下） |
 | Gamma | 0.99 | 折扣因子 |
 | GAE Lambda | 0.95 | GAE 参数 |
 | Clip Parameter | 0.2 | PPO 裁剪范围 |
@@ -382,7 +382,7 @@ r = 2·r_v + 1·r_ω
 
 样本量：`4096 × 24 = 98,304` 条/轮；4200 轮 ≈ 4.1 亿条环境转移。注意 RSL-RL 每轮还对这批 rollout 做 5 遍 × 8 个 minibatch 的更新，所以不能把 4.1 亿理解成"网络只训练了 4.1 亿次"。
 
-**关于 `schedule`：默认 `adaptive`（原计划设置），`--fixed_lr` 可钉死。** RSL-RL 的优化器是 Adam，Actor 和 Critic 各一个参数组。自适应调度每轮按实测 KL 把 lr 乘或除 1.5，并直接写进 `optimizer.param_groups[*]["lr"]`；固定模式则始终用 `learning_rate`。两者的取舍：
+**关于 `schedule`：默认 `adaptive`（原计划设置），`--fixed_lr` 可钉死。** RSL-RL 的优化器是 Adam，Actor 和 Critic 各一个参数组。自适应调度每轮按实测 KL 把 lr 乘或除 1.5，并直接写进 `optimizer.param_groups[*]["lr"]`；固定模式则始终用 `learning_rate`。起始值由 `--learning_rate`（别名 `--lr`）给定，不传就用 cfg 的 3e-4。两者的取舍：
 
 - 自适应跟着实测进度走，前期能自己把 lr 推到 1e-3 量级、快速离开初始平台；代价是 Adam 的更新步长 `η·m̂/(√v̂+ε)` 里 `m̂/√v̂` 近似 O(1)，**实际步长几乎正比于 η**，所以 lr 一锯齿、步长就同倍数锯齿（`max_grad_norm=1.0` 只防梯度爆炸，防不了"梯度正常、lr 被放大"）。
 - `m20_v5` 演示了这个代价：`Loss/learning_rate` 在 0 和 2e-3 之间来回锯（一半迭代在 lr≈0 上空转），`mean_episode_length` 第 40 轮满 1000、稳到第 200 轮，然后在 lr 尖峰处掉到 380、`Loss/value_function` 冒出 0.24 的尖峰；`Loss/entropy` 反而单调下降（11.5 → 4.27，σ 0.5 → 0.32），说明不是探索噪声撞倒的。
@@ -615,7 +615,7 @@ logs/rsl_rl/m20_velocity/<run_name>/
 | `Loss/learning_rate` | 看模式：默认 `adaptive` 下**应当锯齿**（在 0 与 2e-3 之间按 KL 乘除 1.5）；加 `--fixed_lr` 后应是**水平线**（3e-4）。`m20_v5` 的锯齿曾把 `mean_episode_length` 在第 200 轮从 1000 打到 380——锯齿本身不是故障，但它意味着步长每轮都在跳，判断成败要看 `Episode/length` 是否跟着塌 |
 | `[terms]` 行（默认每 200 步） | `--per_term_every` 打开，`[terms] per-step (value×weight×dt)` 逐项列出**每步实际进账**，末尾 `sum=` 应与同一时刻 `[health]` 的 `rew=` 相等（摔倒罚在之后才加，会差那一步的 −10）；下一行 `[terms] episode sums` 是 `_episode_sums` 的均值，也就是 tensorboard 的 `Episode_Reward/*`。**权重之间唯一可比的尺度是 per-step 那一行**——episode sums 会随回合变长而变大，一项权重严重过大时在那里也可能看不出 |
 
-终端里每 50 轮打印 `[cmd] iter=... vx=... vy=... wz=...`（当前阶段与当前指令范围），退火期间能看到范围在长；每个阶段开始时还会打印一行 `[cmd] stage=... hold=...s zero_prob=...`，阶段 4 的 0.20/1.5–3 s 就在这一行里核对。`[health]` 行里的 `rew=` 是每步奖励的均值（**未做任何裁剪**，为负是正常的），`neg=` 是"负奖励步数占比"：`neg` 贴着 1.00 且 `Train/mean_reward` 不爬，说明这一阶段的指令已经跑在策略能力前面。**换阶段那一刻跟踪分会掉一下**（新维度从 0 长出来），看它能不能在 warmup 内爬回来；如果爬不回来，说明上一阶段的 checkpoint 没被正确加载（检查 `[INFO] Continuing from ...` 那行）。
+终端里每 50 轮打印 `[cmd] iter=... vx=... vy=... wz=...`（当前阶段与当前指令范围），退火期间能看到范围在长；每个阶段开始时还会打印一行 `[cmd] stage=... hold=...s zero_prob=...`，阶段 4 的 0.20/1.5–3 s 就在这一行里核对。`[health]` 行里的 `rew=` 是每步奖励的均值（**未做任何裁剪**，为负是正常的），`neg=` 是"负奖励步数占比"：`neg` 贴着 1.00 且 `Train/mean_reward` 不爬，说明这一阶段的指令已经跑在策略能力前面——**这时缩的是指令，不是轮数**：用 `--cmd_scale 0.7`（三轴同比缩，预算/零指令占比/保持时间不变）。`--stage_scale` 只缩轮数，对"吃不吃得下这个速度"没有任何作用，两个参数别混。**换阶段那一刻跟踪分会掉一下**（新维度从 0 长出来），看它能不能在 warmup 内爬回来；如果爬不回来，说明上一阶段的 checkpoint 没被正确加载（检查 `[INFO] Continuing from ...` 那行）。
 
 **`[terms]` 行怎么用**：看到 `rew=-3.4` 时不要猜，直接看同一行的分解——比如 `joint_deviation=-1.9  action_rate=-1.2  leg_joint_acc=-0.4  track_lin_vel_xy=+0.3`，立刻知道负号来自哪两项。若某一项稳定压过整个正项面（per-step 的正项上限 = `(2.0 + 1.0) × dt = 0.06`），先调那一项的权重或尺度，而不是加存活加成或裁剪奖励（`[terms]` 的设计就是让这种"某一项把信号压平"的情况在终端里可见，而不是等一整轮 `Train/mean_reward` 恒 0 才发现）。
 
