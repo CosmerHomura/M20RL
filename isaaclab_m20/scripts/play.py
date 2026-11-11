@@ -308,14 +308,28 @@ def status_line(env, command_term, wheel_ids, timestep: int, obs=None) -> str:
     standing = "n/a"
     mode_text = ""
     if command_term is not None:
+        # Print the intent we *pin*, not the raw buffer: with ``set_command`` the
+        # buffer is re-asserted at the start of every step, so a buffer read taken
+        # after ``env.step`` can already show the next sample. Printing the pinned
+        # value keeps ``cmd=`` and ``v*=`` comparable, which is the whole point of
+        # this line.
+        pinned = getattr(unwrapped, "command_override", None)
         buffer = getattr(command_term, "vel_command_b", None)
-        if buffer is not None:
+        if pinned is not None:
+            vx, vy, wz_cmd = (float(value) for value in pinned[0, :3])
+            command = f"cmd=({vx:+.2f},{vy:+.2f},{wz_cmd:+.2f}) "
+        elif buffer is not None:
             vx, vy, wz_cmd = (float(value) for value in buffer[0, :3])
             command = f"cmd=({vx:+.2f},{vy:+.2f},{wz_cmd:+.2f}) "
-            modes = getattr(command_term, "mode_buf", None)
-            if modes is not None:
-                label = control.MODE_NAMES[int(modes[0])].lower()
-                mode_text = f"mode={label} "
+        modes = getattr(command_term, "mode_buf", None)
+        if modes is not None:
+            # The label is what the reward gates and the parking brake read, so it
+            # is the honest answer to "is the robot being asked to hold still".
+            label = control.MODE_NAMES[int(modes[0])].lower()
+            mode_text = f"mode={label} "
+            zero = (modes == control.MODE_STAND).float().mean()
+            standing = f"{float(zero):.2f}"
+        elif buffer is not None:
             zero = (buffer[:, :3].abs() <= 1e-3).all(dim=1).float().mean()
             standing = f"{float(zero):.2f}"
 
