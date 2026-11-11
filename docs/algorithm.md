@@ -10,7 +10,8 @@
 - 奖励权重与观测/动作：`tasks/m20_env_cfg.py`（站立）、`tasks/m20_velocity_env_cfg.py`（速度指令）
 - 奖励公式：`tasks/rewards.py`；观测项与指令采样：`tasks/observations.py`、`tasks/commands.py`
 - 网络与 PPO 超参：`tasks/agents/rsl_rl_ppo_cfg.py`
-- 课程与续训：`scripts/train.py`；验收测试：`scripts/eval.py`
+- 课程与续训：`training/stages.py`（阶段表）、`training/curriculum.py`（`CommandSchedule`：范围推进、零指令占比、warmup/续训位置）、`training/checkpoints.py`（日志目录规则与 `env.yaml` 对比）；验收测试：`scripts/eval.py`
+- 命令行：`cli/train_args.py`（只有 argparse）；`scripts/train.py` 是薄入口，只负责"解析 → 启动 app → 调 training"
 
 ## 1. 奖励函数（站立任务）
 
@@ -409,7 +410,7 @@ r = 2·r_v + 1·r_ω
 
 ### 6.6 课程（4 阶段，阶段间续训）
 
-`scripts/train.py` 的 `STAGES`。**每个阶段都从上一阶段的最佳模型继续训练，不重新初始化**。顺序是"先站稳 → 前后 → 全向（横移+偏航一起）→ 更快、含起步急停"，每个阶段都保留一部分零指令，让"站住"在学新动作时被反复复习：
+`training/stages.py` 的 `STAGES`。**每个阶段都从上一阶段的最佳模型继续训练，不重新初始化**。顺序是"先站稳 → 前后 → 全向（横移+偏航一起）→ 更快、含起步急停"，每个阶段都保留一部分零指令，让"站住"在学新动作时被反复复习：
 
 | 阶段 | 名称 | 轮数 | 起始 → 结束指令范围 | warmup | 指令分布 |
 | --- | --- | --- | --- | --- | --- |
@@ -598,7 +599,7 @@ logs/rsl_rl/m20_velocity/<run_name>/
 
 | 指标 | 期望趋势 |
 | --- | --- |
-| `Episode_Reward/track_lin_vel_xy` | 往 2.0 爬。**长期 < 0.5 就是速度跟踪没学会** |
+| `Episode_Reward/track_lin_vel_xy` | 往 2.0 爬。**长期 < 0.5 就是速度跟踪没学会**。注意这是**全部环境的平均**——零指令环境几乎恒在 2.0 附近（指令 0、机器人基本不动），所以 50% 零指令时这个数会虚高：`stand=2.0 move=0.2` 也会读成 ~1.1。要看真实跟踪能力，看终端 `[track]` 那行（按模式拆开，用同一个核与同一个 σ） |
 | `Episode_Reward/track_ang_vel_z` | 往 1.0 爬（阶段 3 之后才有意义，前 2 阶段 ωz 指令恒为 0） |
 | `Episode_Reward/flat_orientation` | 负值，往 0 爬（现在是平方惩罚，越平越接近 0；阶段 1 就该接近 0） |
 | `Episode_Reward/ang_vel_xy` | 负值，小幅（0.05 量级）。**和 `flat_orientation` 分开读**：姿态平但这一项大 = 机身在小幅快抖 |
@@ -614,8 +615,9 @@ logs/rsl_rl/m20_velocity/<run_name>/
 | `Episode/length` | 就是"平均活了多少步"。满值 1000 步；**如果这一项很高但录像里机器人在趴着，先看 `base_height`/`bad_orientation` 是否真的在涨**——终止判据没触发时，倒地也会跑满 20 s。**阶段 1 满 1000 步保持 100 轮以上不往下掉，这一阶段就该停**（阶段 1 的最优解是一个静态姿态，40–200 轮是平台期，继续跑只会撞上不稳定的边界） |
 | `Loss/learning_rate` | 看模式：默认 `adaptive` 下**应当锯齿**（在 0 与 2e-3 之间按 KL 乘除 1.5）；加 `--fixed_lr` 后应是**水平线**（3e-4）。`m20_v5` 的锯齿曾把 `mean_episode_length` 在第 200 轮从 1000 打到 380——锯齿本身不是故障，但它意味着步长每轮都在跳，判断成败要看 `Episode/length` 是否跟着塌 |
 | `[terms]` 行（默认每 200 步） | `--per_term_every` 打开，`[terms] per-step (value×weight×dt)` 逐项列出**每步实际进账**，末尾 `sum=` 应与同一时刻 `[health]` 的 `rew=` 相等（摔倒罚在之后才加，会差那一步的 −10）；下一行 `[terms] episode sums` 是 `_episode_sums` 的均值，也就是 tensorboard 的 `Episode_Reward/*`。**权重之间唯一可比的尺度是 per-step 那一行**——episode sums 会随回合变长而变大，一项权重严重过大时在那里也可能看不出 |
+| `[track]` 行（跟 `[terms]` 一起） | 把 `track_lin_vel_xy` 的原始值（0–1 的核）**按模式拆开**：`stand=…(xx%) move=…(xx%) rot=…(xx%)`，用同一个核与同一个 σ。存在的理由：`Episode_Reward/track_lin_vel_xy` 是全体环境平均，零指令环境恒在 2.0 附近，会把"运动其实没学会"掩盖成 1.1。判断标准是 **`move=` 那一格**：阶段 2 应往 1.5 以上爬，长期 < 0.5 就是没在跟踪，不管总分多好看 |
 
-终端里每 50 轮打印 `[cmd] iter=... vx=... vy=... wz=...`（当前阶段与当前指令范围），退火期间能看到范围在长；每个阶段开始时还会打印一行 `[cmd] stage=... hold=...s zero_prob=...`，阶段 4 的 0.20/1.5–3 s 就在这一行里核对。`[health]` 行里的 `rew=` 是每步奖励的均值（**未做任何裁剪**，为负是正常的），`neg=` 是"负奖励步数占比"：`neg` 贴着 1.00 且 `Train/mean_reward` 不爬，说明这一阶段的指令已经跑在策略能力前面——**这时缩的是指令，不是轮数**：用 `--cmd_scale 0.7`（三轴同比缩，预算/零指令占比/保持时间不变）。`--stage_scale` 只缩轮数，对"吃不吃得下这个速度"没有任何作用，两个参数别混。**换阶段那一刻跟踪分会掉一下**（新维度从 0 长出来），看它能不能在 warmup 内爬回来；如果爬不回来，说明上一阶段的 checkpoint 没被正确加载（检查 `[INFO] Continuing from ...` 那行）。
+终端里每 50 轮打印 `[cmd] iter=... vx=... vy=... wz=...`（当前阶段与当前指令范围），退火期间能看到范围在长；每个阶段开始时还会打印一行 `[cmd] stage=... hold=...s zero_prob=...`，阶段 4 的 0.20/1.5–3 s 就在这一行里核对。`[health]` 行里的 `rew=` 是每步奖励的均值（**未做任何裁剪**，为负是正常的），`neg=` 是"负奖励步数占比"：`neg` 贴着 1.00 且 `Train/mean_reward` 不爬，说明这一阶段的指令已经跑在策略能力前面——**这时缩的是指令，不是轮数**：用 `--cmd_scale 0.7`（三轴同比缩，预算/零指令占比/保持时间不变）。`--stage_scale` 只缩轮数，对"吃不吃得下这个速度"没有任何作用，两个参数别混。`lr=` 与 `sig=` 是**当前这一轮**优化器真正用的学习率（adaptive 会就地改写它）和平均动作标准差（`H = 16(1.419 + ln sig)`）：`lr` 贴 1e-5 而 `sig` 在掉 = KL 目标永远满足不了；`lr` 冲到 1e-2 而 `sig` 在涨 = 控制器过冲。这两个数要跟 `Train/mean_reward` 一起读——**只有奖励在动，调度才算在"工作"**。**换阶段那一刻跟踪分会掉一下**（新维度从 0 长出来），看它能不能在 warmup 内爬回来；如果爬不回来，说明上一阶段的 checkpoint 没被正确加载（检查 `[INFO] Continuing from ...` 那行）。
 
 **`[terms]` 行怎么用**：看到 `rew=-3.4` 时不要猜，直接看同一行的分解——比如 `joint_deviation=-1.9  action_rate=-1.2  leg_joint_acc=-0.4  track_lin_vel_xy=+0.3`，立刻知道负号来自哪两项。若某一项稳定压过整个正项面（per-step 的正项上限 = `(2.0 + 1.0) × dt = 0.06`），先调那一项的权重或尺度，而不是加存活加成或裁剪奖励（`[terms]` 的设计就是让这种"某一项把信号压平"的情况在终端里可见，而不是等一整轮 `Train/mean_reward` 恒 0 才发现）。
 

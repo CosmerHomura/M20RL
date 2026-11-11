@@ -81,12 +81,12 @@ class M20VelocityRslRlPpoRunnerCfg(M20RslRlPpoRunnerCfg):
       exploration paid for by nothing.
     * action std 0.3 rather than 1.0 -- the sampler puts the *same* sigma on all
       16 action dims, but the dims do not mean the same thing: one unit of leg
-      action is 0.25 rad (14 deg), one unit of wheel action is 22.2 rad/s
-      (2.0 m/s at the contact). A std of 0.9 commanded the wheels to +-20 rad/s
-      (+-1.8 m/s) on every step of the "stand still" stage, which is more than the
-      whole speed envelope; even 0.5 gives +-1.0 m/s, far above the 0.15 m/s the
-      standing terms try to hold. With the 2.0 m/s envelope the compromise is
-      0.3: +-6.7 rad/s of wheel noise (+-0.6 m/s, enough to break the standstill
+      action is 0.25 rad (14 deg), one unit of wheel action is 27.78 rad/s
+      (2.5 m/s at the contact). A std of 0.9 commanded the wheels to +-25 rad/s
+      (+-2.25 m/s) on every step of the "stand still" stage, which is more than the
+      whole speed envelope; even 0.5 gives +-1.25 m/s, far above the 0.15 m/s the
+      standing terms try to hold. With the 2.5 m/s envelope the compromise is
+      0.3: +-8.3 rad/s of wheel noise (+-0.75 m/s, enough to break the standstill
       deadlock) and +-0.075 rad of leg noise (enough to find a gait), and rsl_rl
       shrinks the std as the policy improves.
     * save_interval 50 -- the stages are 700-1400 iterations long, so 100 would

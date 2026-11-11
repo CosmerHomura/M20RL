@@ -23,7 +23,9 @@ isaaclab_m20/
 ├── tasks/dr.py                # 域随机化的课程缩放
 ├── tasks/__init__.py          # gym.register(...) 两个任务 id
 ├── tasks/agents/rsl_rl_ppo_cfg.py
-└── scripts/
+├── cli/train_args.py           # train 的全部命令行参数（纯 argparse）
+├── training/                   # stages.py 课程表 / curriculum.py 进度 / checkpoints.py 目录规则 / diagnostics.py 诊断
+└── scripts/                    # 薄入口：启动 app，再调 cli + training
     ├── check_m20.py           # 加载 USD，打印关节/质量，验证资产
     ├── train.py
     └── play.py

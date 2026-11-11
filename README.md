@@ -36,15 +36,18 @@ isaaclab_m20/
 │   ├── m20_velocity_env_cfg.py   # 速度指令任务：56 维观测、11 项奖励、4 阶段
 │   ├── observations.py           # 56 维观测的拆分项（腿/轮/指令）
 │   ├── commands.py               # MixedVelocityCommand：50/30/10/10 混合采样
-│   ├── rewards.py                # 奖励函数（站立 14 项 + 速度 10 项）
+│   ├── rewards.py                # 奖励函数（站立 14 项 + 速度 11 项）
 │   ├── dr.py                     # 域随机化档位（站立任务用）
 │   └── agents/rsl_rl_ppo_cfg.py  # PPO 超参（两个任务各一套）
-└── scripts/
+├── cli/train_args.py  # train 的全部命令行参数（只有 argparse，不含仿真逻辑）
+├── training/          # 课程 stages.py / 调度 curriculum.py / 目录规则 checkpoints.py / 诊断 diagnostics.py
+└── scripts/           # 薄入口：启动 app，然后调 cli + training
     ├── check_m20.py   # 加载 USD，打印关节/质量，验证资产
     ├── check_joints.py# 关节配置审计：正则解析、默认姿态一致性、零动作落位
-    ├── train.py       # 训练（速度任务含 4 阶段课程与续训）
+    ├── diagnose_command.py # 指令链路体检：谁在改命令缓冲
+    ├── train.py       # 训练入口（课程表在 training/stages.py，调度在 training/curriculum.py）
     ├── play.py        # 播放 / 键盘给指令 / 录视频
-    └── eval.py        # 固定指令验收测试（RMSE、倾角、摔倒率）
+    └── eval.py        # 固定指令验收测试（RMSE、倾角、摔倒率、净位移）
 docs/
 ├── control.md         # 控制细节：时间尺度、执行器参数、两环带宽、驻车环、硬件对应、调试清单
 ├── algorithm.md       # 奖励、课程、PPO 超参、验收
@@ -264,7 +267,7 @@ tensorboard --logdir logs/rsl_rl --bind_all --port 6006
 | 终端诊断输出 | `--health_every 24`（`[health]` 行：`|v_xy|`/`standing`/`rew`/`neg`/`fall_rew`/`timeout_rew`）、`--per_term_every 200`（`[terms]` 行：逐项 `value×weight×dt` 的每步实际贡献 + `_episode_sums` 累计值；`sum=` 应等于同一时刻的 `rew=`） |
 | 观测拆分项（腿/轮/指令） | `isaaclab_m20/tasks/observations.py` |
 | 指令混合采样比例 | `isaaclab_m20/tasks/commands.py` |
-| 课程阶段、轮数、warmup、续训逻辑（含每阶段的零指令占比与最后一阶段的保持时间） | `isaaclab_m20/scripts/train.py`（`STAGES`） |
+| 课程阶段、轮数、warmup、续训逻辑（含每阶段的零指令占比与最后一阶段的保持时间） | `isaaclab_m20/training/stages.py`（`STAGES`）与 `training/curriculum.py`（`CommandSchedule`） |
 | 重训同一阶段时覆盖还是接着训 | **默认接着训**：复用该阶段目录、加载其中最新的 `model_*.pt`；跑多少轮由命令行决定（默认该阶段预算，`--iterations N` 就是 N 轮，脚本不做差额计算）。要从头重来加 `--overwrite`（旧目录改名为 `.bak-<时间戳>`，不删）；要另开目录加 `--new_run` |
 | 验收阈值与测试指令 | `isaaclab_m20/scripts/eval.py` |
 | PPO 超参 | `isaaclab_m20/tasks/agents/rsl_rl_ppo_cfg.py` |

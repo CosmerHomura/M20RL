@@ -30,21 +30,23 @@ Why the command range defaults to zero
 The config carries the *first* course stage, which is a zero command ("stand
 still"), not the final one, so a plain
 ``train.py --task Isaac-M20-Wheeled-Velocity-v0`` run cannot ask an untrained
-policy for 0.5 m/s on the first step. ``scripts/train.py`` rewrites these ranges
-per stage through ``dr.set_command_ranges`` and the command distribution through
-``CommandSchedule.apply_sampling``; see ``STAGES`` there for the four stages of
-the course.
+policy for anything above zero on the first step. ``isaaclab_m20.training.
+curriculum.CommandSchedule`` rewrites these ranges per stage through
+``dr.set_command_ranges``, and applies the command distribution through
+``apply_sampling``; the four stages themselves live in
+``isaaclab_m20.training.stages.STAGES``.
 
 Wheel action scale
 ------------------
-22.2 rad/s per unit action against a 0.09 m wheel radius is **2.0 m/s at full
-action**, which is the top speed the last stage commands (+-2.0 m/s forward). That
-is the speed envelope the whole course is built around. It is a policy choice, not
-a hardware one: the wheel actuator allows 200 rad/s (18 m/s at the contact) and
-its 21.6 N*m is 240 N per wheel against a 338 N friction ceiling for the 34.5 kg
-robot. The earlier 8.0 (0.72 m/s) was picked to leave exploration headroom and
-instead capped the robot below walking speed; changing the scale changes the
-meaning of the four wheel actions, so the course restarts from stage 1.
+27.78 rad/s per unit action against a 0.09 m wheel radius is **2.5 m/s at full
+action**, which is the top speed stage 2 already commands and stages 3-4 hold.
+That is the speed envelope the whole course is built around. It is a policy
+choice, not a hardware one: the wheel actuator allows 200 rad/s (18 m/s at the
+contact) and its 21.6 N*m is 240 N per wheel against a 338 N friction ceiling for
+the 34.5 kg robot. The earlier 8.0 (0.72 m/s) was picked to leave exploration
+headroom and instead capped the robot below walking speed; 22.2 (2.0 m/s) was the
+first correction and 27.78 is the current one. Changing the scale changes the
+meaning of the four wheel actions, so any change restarts the course from stage 1.
 """
 from __future__ import annotations
 
