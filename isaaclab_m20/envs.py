@@ -99,7 +99,24 @@ class M20VelocityEnv(ManagerBasedRLEnv):
         super().__init__(cfg=cfg, render_mode=render_mode, **kwargs)
         self._fall_penalty = self._read_fall_penalty()
         self._check_timeout_is_not_a_fall()
-        self._init_wheel_park()
+        # Bring-up helper, not part of the task contract: if this IsaacLab version
+        # shapes the action manager differently than expected, the brake disables
+        # itself and training continues. The policy keeps its full action authority,
+        # so the only consequence is the few-mm/s creep documented in
+        # ``docs/control.md`` -- far cheaper than losing a run to a traceback.
+        self._park_enabled = False
+        try:
+            self._init_wheel_park()
+        except Exception as exc:  # noqa: BLE001 - see above
+            self._park_enabled = False
+            self._park_slice = None
+            self._park_scale = 0.0
+            print(
+                f"[WARN] M20VelocityEnv: wheel parking brake disabled after an unexpected "
+                f"error ({type(exc).__name__}: {exc}). Training continues; the wheels will "
+                "creep while standing.",
+                flush=True,
+            )
 
     # -- wheel parking brake --------------------------------------------------
     def _iter_action_terms(self) -> list[tuple[str, object]]:
@@ -134,6 +151,37 @@ class M20VelocityEnv(ManagerBasedRLEnv):
             except Exception:  # noqa: BLE001 - a disabled term must not break startup
                 continue
         return pairs
+
+    def _resolve_term_joint_ids(self, term) -> torch.Tensor | None:
+        """Explicit joint ids of an action term, whatever this version calls them.
+
+        Action terms expose the resolved ids under ``joint_ids`` in some releases
+        and only ``_joint_ids`` in others, and fall back to a ``slice`` when the
+        term means "every joint". The parking brake needs a real index tensor, so
+        the last resort re-resolves the term's configured joint names against the
+        robot -- that path uses only the public ``Articulation.find_joints``.
+        """
+        for attribute in ("joint_ids", "_joint_ids"):
+            ids = getattr(term, attribute, None)
+            if isinstance(ids, torch.Tensor):
+                return ids.to(self.device).long()
+            if isinstance(ids, (list, tuple)) and len(ids) > 0:
+                return torch.as_tensor(ids, dtype=torch.long, device=self.device)
+
+        names = getattr(getattr(term, "cfg", None), "joint_names", None)
+        if not names:
+            return None
+        try:
+            ids, _ = self.scene["robot"].find_joints(names, preserve_order=True)
+        except Exception as exc:  # noqa: BLE001 - reported by the caller
+            print(
+                f"[WARN] M20VelocityEnv: could not resolve joint names {names!r}: {exc}",
+                flush=True,
+            )
+            return None
+        if not ids:
+            return None
+        return torch.as_tensor(ids, dtype=torch.long, device=self.device)
 
     def _init_wheel_park(self) -> None:
         """Resolve the wheel columns of the action vector and the hold buffers.
@@ -191,19 +239,20 @@ class M20VelocityEnv(ManagerBasedRLEnv):
             self._park_enabled = False
             return
         self._park_slice = slice(offset, offset + term.action_dim)
-        joint_ids = term.joint_ids
-        if not isinstance(joint_ids, torch.Tensor):
-            # ``joint_ids`` is a slice when the term resolves to "every joint of
-            # the articulation"; the brake needs explicit ids to index its
-            # per-wheel hold buffer.
+        joint_ids = self._resolve_term_joint_ids(term)
+        if joint_ids is None:
+            # The term resolved to "every joint of the articulation" (a slice) and
+            # its joint names are not usable, so there is nothing to index the
+            # per-wheel hold buffer with.
             print(
-                f"[WARN] M20VelocityEnv: '{term_name}' resolves to a slice of joints rather "
-                "than explicit ids, so the wheel parking brake is disabled.",
+                f"[WARN] M20VelocityEnv: cannot resolve explicit joint ids for '{term_name}' "
+                "(`joint_ids` / `_joint_ids` missing and `cfg.joint_names` unusable), so the "
+                "wheel parking brake is disabled.",
                 flush=True,
             )
             self._park_enabled = False
             return
-        self._park_joint_ids = joint_ids.to(self.device)
+        self._park_joint_ids = joint_ids
         self._park_robot = self.scene["robot"]
         num_wheels = int(term.action_dim)
         self._park_q_hold = torch.zeros(self.num_envs, num_wheels, device=self.device)
@@ -236,7 +285,11 @@ class M20VelocityEnv(ManagerBasedRLEnv):
         Returns a new tensor only when something actually changes, so the common
         case (driving) stays allocation-free.
         """
-        if not self._park_enabled or self._park_slice is None or self._park_scale <= 0.0:
+        if (
+            not getattr(self, "_park_enabled", False)
+            or getattr(self, "_park_slice", None) is None
+            or getattr(self, "_park_scale", 0.0) <= 0.0
+        ):
             return action
         standing = self._standing_command_mask()
         if standing is None:
@@ -322,7 +375,18 @@ class M20VelocityEnv(ManagerBasedRLEnv):
         # This happens before the action term runs, so ``last_action`` (an
         # observation) and ``action_rate`` (a reward term) both see the command
         # that was actually sent, not the policy's ignored output.
-        action = self._park_wheels(action)
+        try:
+            action = self._park_wheels(action)
+        except Exception as exc:  # noqa: BLE001 - degrade, never take the run down
+            self._park_enabled = False
+            self._park_slice = None
+            if not getattr(self, "_park_failed", False):
+                self._park_failed = True
+                print(
+                    f"[WARN] M20VelocityEnv: wheel parking brake disabled after a runtime "
+                    f"error ({type(exc).__name__}: {exc}). Training continues without it.",
+                    flush=True,
+                )
         obs, rew, terminated, truncated, extras = super().step(action)
         if self._fall_penalty >= 0.0:
             return obs, rew, terminated, truncated, extras

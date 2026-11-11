@@ -543,22 +543,31 @@ def reward_term_contributions(env, manager) -> dict[str, float] | None:
         dt = getattr(manager, "_dt", None)
     if dt is None:
         return None
-    names = getattr(manager, "_term_names", None)
-    if not names or len(names) != len(term_cfgs):
-        names = [getattr(term_cfg, "name", f"term{index}")
-                 for index, term_cfg in enumerate(term_cfgs)]
+    names = getattr(manager, "_term_names", None) or []
+    # ``_term_cfgs`` is a list in some releases and a dict keyed by name in others;
+    # iterating the dict would hand us the keys, so normalise to pairs first.
+    if isinstance(term_cfgs, dict):
+        pairs = [(name, term_cfgs[name]) for name in names if name in term_cfgs]
+        if not pairs:
+            pairs = list(term_cfgs.items())
+    else:
+        term_cfgs = list(term_cfgs)
+        pairs = list(zip(names, term_cfgs)) if len(names) == len(term_cfgs) else [
+            (getattr(term_cfg, "name", f"term{index}"), term_cfg)
+            for index, term_cfg in enumerate(term_cfgs)
+        ]
     contributions: dict[str, float] = {}
-    for name, term_cfg in zip(names, term_cfgs):
+    for name, term_cfg in pairs:
         # Class-based terms keep state inside an instance the manager owns; calling
         # the class again would build a fresh one and report zeros.
-        if isinstance(term_cfg.func, type):
+        if isinstance(getattr(term_cfg, "func", None), type):
             continue
         try:
             value = term_cfg.func(env, **term_cfg.params)
             value = torch.as_tensor(value, dtype=torch.float32)
+            contributions[name] = float((value * term_cfg.weight * dt).mean().item())
         except Exception:  # noqa: BLE001 - diagnostics must never break training
             continue
-        contributions[name] = float((value * term_cfg.weight * dt).mean().item())
     return contributions or None
 
 
@@ -572,8 +581,15 @@ def episode_sums(manager) -> dict[str, float] | None:
     sums = getattr(manager, "_episode_sums", None)
     if not sums:
         return None
+    items = getattr(sums, "items", None)
+    if items is None:
+        # A plain list: fall back to the manager's names, or skip the readout.
+        names = getattr(manager, "_term_names", None) or []
+        if len(names) != len(sums):
+            return None
+        items = lambda: zip(names, sums)  # noqa: E731 - local shim, one use
     values: dict[str, float] = {}
-    for name, tensor in sums.items():
+    for name, tensor in items():
         try:
             values[name] = float(tensor.mean().item())
         except Exception:  # noqa: BLE001 - diagnostics must never break training
