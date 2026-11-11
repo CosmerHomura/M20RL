@@ -370,7 +370,54 @@ class M20VelocityEnv(ManagerBasedRLEnv):
                 )
         return penalty
 
+    # -- externally owned command (play / eval) -------------------------------
+
+    def set_command(self, command) -> None:
+        """Pin ``(vx, vy, wz)`` for every env, and keep it pinned across resets.
+
+        ``play`` and ``eval`` own the command, but a reset inside ``step`` re-samples
+        the command term *after* the external write and *before* the observations are
+        built, so the policy would read a freshly sampled command instead of the
+        requested one (with a zero-range stage that reads as "the command never
+        arrived"). Pinning it here survives that ordering: ``_reset_idx`` writes it
+        back before the observation is assembled.
+        """
+        value = torch.as_tensor(command, device=self.device, dtype=torch.float32).flatten()
+        if value.numel() != 3:
+            raise ValueError(f"expected (vx, vy, wz), got {value.numel()} values")
+        self.command_override = value.repeat(self.num_envs, 1)
+        self._apply_command_override()
+
+    def _apply_command_override(self, env_ids=None) -> None:
+        override = getattr(self, "command_override", None)
+        if override is None:
+            return
+        manager = getattr(self, "command_manager", None)
+        if manager is None:
+            return
+        try:
+            term = manager.get_term("base_velocity")
+        except (KeyError, ValueError):
+            return
+        buffer = getattr(term, "vel_command_b", None)
+        if buffer is None:
+            buffer = getattr(term, "command", None)
+        if buffer is None:
+            return
+        if env_ids is None:
+            buffer[:, :3] = override
+        else:
+            buffer[env_ids, :3] = override[env_ids]
+
+    def _reset_idx(self, env_ids) -> None:
+        super()._reset_idx(env_ids)
+        # Runs before the observation is built, so a reset cannot hand the policy a
+        # command we did not ask for.
+        self._apply_command_override(env_ids)
+
     def step(self, action):
+        # A pinned command must also be what the parking brake sees on this step.
+        self._apply_command_override()
         # The parking brake replaces the wheel columns while the command is zero.
         # This happens before the action term runs, so ``last_action`` (an
         # observation) and ``action_rate`` (a reward term) both see the command

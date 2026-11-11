@@ -192,7 +192,9 @@ q̇_eq = 5.3 × 0.09 / (4 × 2) = 0.06 rad/s ≈ 5.4 mm/s
 
 所以两边都调 `isaaclab_m20.tasks.commands.freeze_command_resampling(term)`：改 `cfg.resampling_time_range`、改它缓存下来的 `_resampling_time_range`、把 `time_left` 倒计时填满，最后把 `_resample_command` 换成空函数（这一条同时覆盖重置路径）。改成空函数后 `is_standing_env` 保持初值 False 也无所谓——奖励和驻车环读的都是命令缓冲，不是这个标志。
 
-另加两道自证：`play` 每步写完后比对"写入值 vs `env.step` 之后读回值"，不一致就 `[WARN] The command was overwritten inside env.step`；`eval` 在第 1 组测试前额外走一步，同时检查命令项里的值和**策略观测里 `obs[37:40]` 的值**，任一不符就报警。看到这两条 WARN 才是"指令没送进去"，否则问题在策略或抓地，不在指令链路。
+另加三道自证：启动时打印 `[INFO] Policy obs: 56 dims, command slice obs[37:40] = [...]`（策略真正看到的指令，非零才算链路通）；`[status]` 里同时给出 `cmd=` 与 `obs_cmd=`，两者一致说明观测没有另行缩放或取错项；`play` 写完指令后立刻打一行 `[INFO] write check: sent [...], buffer now [...]`，若这一行就已经不等，说明写入根本没落到缓冲区（属性不是那个张量），而不是被谁覆盖。
+
+还有一层容易被忽略的顺序：**回合重置发生在 `env.step` 内部**，即"先执行动作 → 再重采样命令 → 再构建观测"。所以外部写入即使用 `_resample_command` 之外的方式，也会被重置路径挡在观测之前。为此 `M20VelocityEnv` 提供 `set_command(vx, vy, wz)`：把指令存成 `command_override`，在 `step()` 开头与每次 `_reset_idx()` 之后各写回一次，`play`/`eval` 优先走这条路。它同时保证驻车环看到的就是这条指令。
 
 | 现象 | 先看 | 处理 |
 | --- | --- | --- |

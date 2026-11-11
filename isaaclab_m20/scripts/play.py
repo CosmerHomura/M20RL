@@ -250,12 +250,20 @@ class KeyboardControls:
         self._input.unsubscribe_to_keyboard_events(self._keyboard, self._sub)
 
 
-def write_command(command_term, command) -> None:
+def write_command(env, command_term, command) -> None:
     """Overwrite the (vx, vy, wz) columns of the command buffer.
 
     The velocity command buffer is 4 columns -- index 3 is the heading target,
     unused with ``heading_command=False`` -- so only the first three are written.
+
+    Prefers ``env.unwrapped.set_command`` when the env offers it: that path also
+    re-asserts the command after an episode reset, which happens inside ``step``
+    *after* this write and *before* the observation is built.
     """
+    pin = getattr(env.unwrapped, "set_command", None)
+    if callable(pin):
+        pin(command)
+        return
     buffer = getattr(command_term, "vel_command_b", None)
     if buffer is None:
         buffer = command_term.command
@@ -406,6 +414,7 @@ def main() -> None:
 
     timestep = 0
     overwrite_reports = 0
+    write_checked = False
     wheel_ids = None
     if args_cli.status_every:
         try:
@@ -420,14 +429,21 @@ def main() -> None:
         if command_term is not None:
             if keyboard is not None:
                 intended = list(keyboard.command)
-                write_command(command_term, keyboard.command)
+                write_command(env, command_term, keyboard.command)
                 if keyboard.command_changed:
                     print(f"[INFO] command -> vx={keyboard.command[0]:+.2f}  "
                           f"vy={keyboard.command[1]:+.2f}  wz={keyboard.command[2]:+.2f}")
                     keyboard.command_changed = False
             else:
                 intended = list(pending_command)
-                write_command(command_term, pending_command)
+                write_command(env, command_term, pending_command)
+        if (intended is not None and not write_checked
+                and any(abs(value) > 1.0e-6 for value in intended)):
+            buffer = getattr(command_term, "vel_command_b", None)
+            if buffer is not None:
+                print(f"[INFO] write check: sent {[round(v, 3) for v in intended]}, "
+                      f"buffer now {[round(float(v), 3) for v in buffer[0, :3]]}")
+            write_checked = True
         with torch.inference_mode():
             obs, _, _, _ = env.step(policy(obs))
         if intended is not None and overwrite_reports < 3:

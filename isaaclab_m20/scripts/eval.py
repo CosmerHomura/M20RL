@@ -251,6 +251,23 @@ class Result:
         return all(ok for _, ok, _ in self.checks)
 
 
+def send_command(env, term, command) -> None:
+    """Give the test command to the env, preferring the env's own pin hook.
+
+    ``M20VelocityEnv.set_command`` also re-asserts the command after an episode
+    reset, which happens inside ``step`` after this call and before the observation
+    is built -- writing the buffer alone cannot cover that ordering.
+    """
+    pin = getattr(env.unwrapped, "set_command", None)
+    if callable(pin):
+        pin(command)
+        return
+    buffer = getattr(term, "vel_command_b", None)
+    if buffer is None:
+        buffer = term.command
+    buffer[:, :3] = torch.as_tensor(command, dtype=buffer.dtype, device=buffer.device)
+
+
 def run_test(env, policy, test: Test, steps: int, settle_steps: int,
              device: torch.device, probe: bool = False) -> Result:
     """Hold one command for ``steps`` policy steps and collect the metrics.
@@ -281,7 +298,7 @@ def run_test(env, policy, test: Test, steps: int, settle_steps: int,
     obs = env.get_observations()
 
     if probe:
-        term.vel_command_b[:, :3] = command
+        send_command(env, term, test.command)
         with torch.inference_mode():
             obs, _, _, _ = env.step(policy(obs))
         live = term.vel_command_b[0, :3]
@@ -299,7 +316,7 @@ def run_test(env, policy, test: Test, steps: int, settle_steps: int,
         # The command manager resamples on resets even with resampling disabled,
         # so write the command every step: this test measures the policy against
         # a fixed target, not against whatever the sampler drew.
-        term.vel_command_b[:, :3] = command
+        send_command(env, term, test.command)
         with torch.inference_mode():
             actions = policy(obs)
             obs, _, _, _ = env.step(actions)
@@ -413,7 +430,7 @@ def run_switching_test(env, policy, device: torch.device,
         command = torch.tensor(command_tuple, dtype=torch.float, device=device).expand(num_envs, 3)
         is_go = command_tuple[0] != 0.0 or command_tuple[1] != 0.0 or command_tuple[2] != 0.0
         for step in range(phase_steps):
-            term.vel_command_b[:, :3] = command
+            send_command(env, term, command_tuple)
             with torch.inference_mode():
                 actions = policy(obs)
                 obs, _, _, _ = env.step(actions)
