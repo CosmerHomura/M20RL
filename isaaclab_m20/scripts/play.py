@@ -74,6 +74,12 @@ parser.add_argument("--cmd_wz", type=float, default=0.0, help="Constant yaw-rate
 parser.add_argument(
     "--cmd_step", type=float, default=0.25,
     help="Amount W/S, A/D, Q/E add to the command per key press.")
+parser.add_argument(
+    "--status_every", type=int, default=50,
+    help="Print one status line every N policy steps (0 disables). 50 steps = 1 s "
+         "at 50 Hz. The line shows the command buffer, |v_xy|, height, tilt and the "
+         "worst leg/wheel joint speed -- enough to tell 'command not reaching the "
+         "robot' from 'wheels spinning without grip'.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 if args_cli.task is None:
@@ -256,6 +262,50 @@ def write_command(command_term, command) -> None:
         command, device=buffer.device, dtype=buffer.dtype)
 
 
+def status_line(env, command_term, wheel_ids, timestep: int) -> str:
+    """One line that answers "is the command reaching the robot, and is it moving".
+
+    Everything here is read-only and env-averaged, so it can run while the robot
+    moves. The four numbers that matter when a command seems ignored:
+    ``standing`` (1.00 = the command buffer is still zero, so the parking brake is
+    also still holding the wheels), ``|v_xy|`` (actual speed), ``qdot_wheel``
+    (wheels spinning with no speed = they are not loaded) and ``qdot_leg``.
+    """
+    unwrapped = env.unwrapped
+    data = unwrapped.scene["robot"].data
+    speed = float(data.root_lin_vel_b[:, :2].norm(dim=1).mean())
+    wz = float(data.root_ang_vel_b[:, 2].mean())
+    height = float(data.root_pos_w[:, 2].mean())
+    tilt = float(
+        torch.rad2deg(torch.acos(torch.clamp(-data.projected_gravity_b[:, 2], -1.0, 1.0))).mean()
+    )
+
+    qdot = data.joint_vel.abs()
+    if wheel_ids is not None and len(wheel_ids) > 0:
+        is_wheel = torch.zeros(qdot.shape[1], dtype=torch.bool, device=qdot.device)
+        is_wheel[wheel_ids] = True
+        qdot_wheel = float(qdot[:, is_wheel].max()) if bool(is_wheel.any()) else 0.0
+        qdot_leg = float(qdot[:, ~is_wheel].max()) if bool((~is_wheel).any()) else 0.0
+    else:
+        qdot_wheel = 0.0
+        qdot_leg = float(qdot.max())
+
+    command = ""
+    standing = "n/a"
+    if command_term is not None:
+        buffer = getattr(command_term, "vel_command_b", None)
+        if buffer is not None:
+            vx, vy, wz_cmd = (float(value) for value in buffer[0, :3])
+            command = f"cmd=({vx:+.2f},{vy:+.2f},{wz_cmd:+.2f}) "
+            zero = (buffer[:, :3].abs() <= 1e-3).all(dim=1).float().mean()
+            standing = f"{float(zero):.2f}"
+
+    seconds = timestep * unwrapped.step_dt
+    return (f"[status] t={seconds:5.1f}s {command}|v_xy|={speed:.3f} wz={wz:+.2f} "
+            f"h={height:.3f} tilt={tilt:4.1f}deg qdot_leg={qdot_leg:5.1f} "
+            f"qdot_wheel={qdot_wheel:6.2f} standing={standing}")
+
+
 def main() -> None:
     entry_point = gym.spec(args_cli.task).kwargs["env_cfg_entry_point"]
     module_name, class_name = entry_point.split(":")
@@ -331,6 +381,14 @@ def main() -> None:
               f"wz={pending_command[2]:g}")
 
     timestep = 0
+    wheel_ids = None
+    if args_cli.status_every:
+        try:
+            ids, _ = env.unwrapped.scene["robot"].find_joints(
+                [".*_wheel_joint"], preserve_order=True)
+            wheel_ids = ids or None
+        except Exception as exc:  # noqa: BLE001 - status line is diagnostics only
+            print(f"[WARN] Could not resolve wheel joint ids: {exc}")
     while simulation_app.is_running():
         start = time.time()
         if command_term is not None:
@@ -345,6 +403,8 @@ def main() -> None:
         with torch.inference_mode():
             obs, _, _, _ = env.step(policy(obs))
         timestep += 1
+        if args_cli.status_every and timestep % args_cli.status_every == 0:
+            print(status_line(env, command_term, wheel_ids, timestep), flush=True)
 
         if push_period and timestep % push_period == 0:
             shove(env, args_cli.push_speed)

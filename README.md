@@ -159,6 +159,7 @@ tensorboard --logdir logs/rsl_rl --bind_all --port 6006
 | `--real_time` / `--no-real-time` | 有窗口时开 | 按仿真步长节流 |
 | `--cmd_vx` `--cmd_vy` `--cmd_wz` | 全 `0` | 固定速度指令（m/s、m/s、rad/s）；不传则用键盘 |
 | `--cmd_step` | `0.25` | 键盘每次按键给指令加多少 |
+| `--status_every` | `50` | 每 N 个策略步打印一行 `[status]`（50 步 = 1 s）：指令缓冲、`|v_xy|`、高度、倾角、腿/轮最大关节速度、`standing`。用来区分"指令没进环境"和"轮子空转"；`0` 关闭 |
 | `--push_speed` | `1.0` | 按键/自动推力的大小（m/s 的水平速度冲量） |
 | `--push_every` | `0.0` | 每 N 秒仿真时间自动推一次（`0` 关闭），做视频用 |
 

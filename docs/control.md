@@ -175,6 +175,17 @@ q̇_eq = 5.3 × 0.09 / (4 × 2) = 0.06 rad/s ≈ 5.4 mm/s
 
 ## 7. 调试清单
 
+先分清这几行诊断输出**分别由谁打印**：
+
+| 输出 | 由谁打印 | 内容 |
+| --- | --- | --- |
+| `[health] ...` | `train.py`（训练时） | `max|qdot|`、`max|v|`、`z` 区间、`|v_xy|`、`standing`、`rew`、`neg`、`fall_rew`、`timeout_rew` |
+| `[terms] ...` | `train.py`（`--per_term_every`，默认 200 轮） | 每个奖励项的每步贡献与回合累计 |
+| `[status] ...` | `play.py`（`--status_every`，默认 50 步 = 1 s） | 指令缓冲、`|v_xy|`、`wz`、高度、倾角、`qdot_leg`、`qdot_wheel`、`standing` |
+| 表格 | `eval.py` | 12 组固定指令的 RMSE / 倾角 / 摔倒率 / `drift` |
+
+`play` 里"给了指令但不动"，先看 `[status]` 的三个数：`standing=1.00` 说明指令根本没进缓冲（此时驻车环也还锁着轮子）；`standing=0.00` 但 `|v_xy|` 仍 ≈0、而 `qdot_wheel` 很大 `qdot_leg` 很小时，是轮子在转但没抓地（腿把机身撑住了）。
+
 | 现象 | 先看 | 处理 |
 | --- | --- | --- |
 | 零指令还在溜 | `eval` 第 9 行 `mean_speed` / `drift`；`[health] |v_xy|` | 先确认 `standing=1.00`；再确认驻车环没有打 WARN 自动禁用；仍溜就 `wheel_park_kp` 15 → 25 |
