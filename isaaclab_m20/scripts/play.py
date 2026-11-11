@@ -103,6 +103,7 @@ from rsl_rl.runners import OnPolicyRunner
 from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 
 import isaaclab_m20.tasks  # noqa: F401 - registers both M20 task ids
+from isaaclab_m20.tasks.commands import freeze_command_resampling
 from isaaclab_m20.tasks.m20_env_cfg import fit_viewer_to_grid
 
 
@@ -353,13 +354,11 @@ def main() -> None:
         ranges = command_term.cfg.ranges
         print(f"[INFO] Command ranges: vx {ranges.lin_vel_x}  vy {ranges.lin_vel_y}  "
               f"wz {ranges.ang_vel_z}")
-        # Training resamples the command every 4 s. Stop it here so the operator
-        # owns the command; the per-step write below is the backstop.
-        try:
-            command_term.cfg.resampling_time_range = (1.0e6, 1.0e6)
-            command_term.time_left.fill_(1.0e6)
-        except Exception:
-            pass
+        # Training resamples the command every few seconds and on every reset.
+        # Stop that here, otherwise the term overwrites the operator's command
+        # right after we write it (a zero-range stage then looks like "the
+        # command never arrived"). The per-step write below is the backstop.
+        freeze_command_resampling(command_term)
 
     keyboard = None
     if not args_cli.headless:
@@ -381,6 +380,7 @@ def main() -> None:
               f"wz={pending_command[2]:g}")
 
     timestep = 0
+    overwrite_reports = 0
     wheel_ids = None
     if args_cli.status_every:
         try:
@@ -391,17 +391,29 @@ def main() -> None:
             print(f"[WARN] Could not resolve wheel joint ids: {exc}")
     while simulation_app.is_running():
         start = time.time()
+        intended = None
         if command_term is not None:
             if keyboard is not None:
+                intended = list(keyboard.command)
                 write_command(command_term, keyboard.command)
                 if keyboard.command_changed:
                     print(f"[INFO] command -> vx={keyboard.command[0]:+.2f}  "
                           f"vy={keyboard.command[1]:+.2f}  wz={keyboard.command[2]:+.2f}")
                     keyboard.command_changed = False
             else:
+                intended = list(pending_command)
                 write_command(command_term, pending_command)
         with torch.inference_mode():
             obs, _, _, _ = env.step(policy(obs))
+        if intended is not None and overwrite_reports < 3:
+            buffer = getattr(command_term, "vel_command_b", None)
+            if buffer is not None:
+                written = torch.tensor(intended, device=buffer.device, dtype=buffer.dtype)
+                if not torch.allclose(buffer[0, :3], written, atol=1.0e-3):
+                    print("[WARN] The command was overwritten inside env.step: wrote "
+                          f"{written.tolist()} but read {buffer[0, :3].tolist()}. "
+                          "Something is still resampling the command term.")
+                    overwrite_reports += 1
         timestep += 1
         if args_cli.status_every and timestep % args_cli.status_every == 0:
             print(status_line(env, command_term, wheel_ids, timestep), flush=True)

@@ -118,6 +118,49 @@ class MixedVelocityCommand(UniformVelocityCommand):
         self.is_heading_env[env_ids] = False
 
 
+def freeze_command_resampling(term) -> None:
+    """Stop a command term from ever resampling over a command written from outside.
+
+    ``play`` and ``eval`` own the command: they overwrite it every step. The term
+    would still resample on its own timer -- ``UniformVelocityCommand`` resamples
+    every ``resampling_time_range`` seconds *and* on every reset -- and that write
+    lands after ours, so the robot silently follows a freshly sampled command
+    instead of the one on the command line. With a zero-range stage (stage 1) the
+    sampled command is zero, which reads as "the command never arrived".
+
+    Setting ``cfg.resampling_time_range`` alone is not enough: the term copies it
+    into ``_resampling_time_range`` in ``__init__`` and keeps a separate
+    ``time_left`` countdown. So rewrite the config, the cached tuple and the
+    countdown, and finally make ``_resample_command`` a no-op -- that is what
+    covers the reset path, which is what zeroes the buffer at every episode end.
+
+    Being a no-op, ``is_standing_env`` / ``is_heading_env`` keep their initial
+    values. Nothing in this project reads them any more (the reward and the parking
+    brake both read the command buffer), so that is fine.
+    """
+    if term is None:
+        return
+
+    infinite = (1.0e9, 1.0e9)
+    try:
+        term.cfg.resampling_time_range = infinite
+    except Exception as exc:  # noqa: BLE001 - the no-op below is the real fix
+        print(f"[WARN] Could not rewrite resampling_time_range: {exc}")
+    if hasattr(term, "_resampling_time_range"):
+        try:
+            term._resampling_time_range = infinite
+        except Exception:  # noqa: BLE001
+            pass
+    for attribute in ("time_left", "_time_left"):
+        countdown = getattr(term, attribute, None)
+        if torch.is_tensor(countdown):
+            countdown.fill_(1.0e9)
+    try:
+        term._resample_command = lambda env_ids=None: None
+    except Exception as exc:  # noqa: BLE001 - fall back to the timer above
+        print(f"[WARN] Could not disable command resampling: {exc}")
+
+
 @configclass
 class MixedVelocityCommandCfg(UniformVelocityCommandCfg):
     """``UniformVelocityCommandCfg`` plus the axis-mix shares."""

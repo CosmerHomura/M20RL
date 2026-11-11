@@ -186,6 +186,14 @@ q̇_eq = 5.3 × 0.09 / (4 × 2) = 0.06 rad/s ≈ 5.4 mm/s
 
 `play` 里"给了指令但不动"，先看 `[status]` 的三个数：`standing=1.00` 说明指令根本没进缓冲（此时驻车环也还锁着轮子）；`standing=0.00` 但 `|v_xy|` 仍 ≈0、而 `qdot_wheel` 很大 `qdot_leg` 很小时，是轮子在转但没抓地（腿把机身撑住了）。
 
+### 7.1 谁拥有指令
+
+`play` 与 `eval` 里指令归**人**（或测试表），不归命令采样器。命令项本身会在两处自行动手：每隔 `resampling_time_range` 秒、以及**每次回合重置**（摔倒、20 s 超时）时重采样一次。它的写入发生在我们写入之后，于是表现成"命令行给了 2.0 m/s，机器人却在原地站着"——尤其阶段 1 的采样范围是全零，重采样就等于把指令清零。
+
+所以两边都调 `isaaclab_m20.tasks.commands.freeze_command_resampling(term)`：改 `cfg.resampling_time_range`、改它缓存下来的 `_resampling_time_range`、把 `time_left` 倒计时填满，最后把 `_resample_command` 换成空函数（这一条同时覆盖重置路径）。改成空函数后 `is_standing_env` 保持初值 False 也无所谓——奖励和驻车环读的都是命令缓冲，不是这个标志。
+
+另加两道自证：`play` 每步写完后比对"写入值 vs `env.step` 之后读回值"，不一致就 `[WARN] The command was overwritten inside env.step`；`eval` 在第 1 组测试前额外走一步，同时检查命令项里的值和**策略观测里 `obs[37:40]` 的值**，任一不符就报警。看到这两条 WARN 才是"指令没送进去"，否则问题在策略或抓地，不在指令链路。
+
 | 现象 | 先看 | 处理 |
 | --- | --- | --- |
 | 零指令还在溜 | `eval` 第 9 行 `mean_speed` / `drift`；`[health] |v_xy|` | 先确认 `standing=1.00`；再确认驻车环没有打 WARN 自动禁用；仍溜就 `wheel_park_kp` 15 → 25 |

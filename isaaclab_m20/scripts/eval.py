@@ -108,6 +108,7 @@ from rsl_rl.runners import OnPolicyRunner
 from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 
 import isaaclab_m20.tasks  # noqa: F401 - registers the task ids
+from isaaclab_m20.tasks.commands import freeze_command_resampling
 
 
 # --------------------------------------------------------------------------- #
@@ -149,6 +150,11 @@ MAX_STILL_YAW = 0.10        # rad/s, zero-command test
 # speed check and still walks 0.4 m in an 8 s window. 0.25 m is "no net travel",
 # not "no motion" -- the legs are allowed to work to keep balance.
 MAX_STILL_DRIFT = 0.25      # m, mean distance from the start of the settled window
+
+# Where the velocity command sits in the 56-dim policy observation:
+# ang_vel(3) + gravity(3) + lin_vel(3) + leg_q(12) + leg_qd(12) + wheel_qd(4) = 37.
+# Used by the one-shot probe that proves the test command reached the policy.
+COMMAND_OBS_SLICE = slice(37, 40)
 
 # Switching test (course stage 4): alternate "go" and "stop" commands and check
 # that the policy both reaches the speed and comes back to rest, within one run.
@@ -246,8 +252,13 @@ class Result:
 
 
 def run_test(env, policy, test: Test, steps: int, settle_steps: int,
-             device: torch.device) -> Result:
-    """Hold one command for ``steps`` policy steps and collect the metrics."""
+             device: torch.device, probe: bool = False) -> Result:
+    """Hold one command for ``steps`` policy steps and collect the metrics.
+
+    ``probe`` runs one extra step first and checks that the command survived it --
+    a command term that keeps resampling would silently replace the test command
+    with a sampled one, and every row would then measure the wrong thing.
+    """
     command = torch.tensor(test.command, dtype=torch.float, device=device).expand(
         env.unwrapped.num_envs, 3)
     term = env.unwrapped.command_manager.get_term("base_velocity")
@@ -268,6 +279,21 @@ def run_test(env, policy, test: Test, steps: int, settle_steps: int,
     falls = 0
 
     obs = env.get_observations()
+
+    if probe:
+        term.vel_command_b[:, :3] = command
+        with torch.inference_mode():
+            obs, _, _, _ = env.step(policy(obs))
+        live = term.vel_command_b[0, :3]
+        if not torch.allclose(live, command[0], atol=1.0e-3):
+            print("[WARN] The test command did not survive env.step: wrote "
+                  f"{command[0].tolist()} but the term holds {live.tolist()}. "
+                  "The command term is still resampling.")
+        seen = obs[0, COMMAND_OBS_SLICE]
+        if not torch.allclose(seen, command[0], atol=5.0e-2):
+            print("[WARN] The policy sees a different command than the test wrote: "
+                  f"wrote {command[0].tolist()} but the observation holds {seen.tolist()}. "
+                  "Check the observation term order in observations.py.")
 
     for step in range(steps + settle_steps):
         # The command manager resamples on resets even with resampling disabled,
@@ -489,6 +515,13 @@ def main() -> None:
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode=None)
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
     device = torch.device(agent_cfg.device)
+    # Every test writes its own command every step; the term must never resample
+    # over it. Without this a zero-range stage resamples to zero and the robot
+    # stands still no matter what the table says.
+    try:
+        freeze_command_resampling(env.unwrapped.command_manager.get_term("base_velocity"))
+    except KeyError:
+        pass
 
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     runner.load(str(checkpoint))
@@ -502,7 +535,8 @@ def main() -> None:
 
     results: list[Result] = []
     for test in TESTS:
-        result = run_test(env, policy, test, steps, settle_steps, device)
+        result = run_test(env, policy, test, steps, settle_steps, device,
+                          probe=(test is TESTS[0]))
         results.append(result)
         print_result(result)
 

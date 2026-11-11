@@ -165,6 +165,8 @@ tensorboard --logdir logs/rsl_rl --bind_all --port 6006
 
 键盘：`W/S` 前后、`A/D` 左右、`Q/E` 偏航、`空格` 指令清零、`P` 推一下、`R` 重置。
 
+**指令归谁**：`play`（以及 `eval`）里指令归人，不归采样器。命令项本身每 2–4 s 和**每次回合重置**都会重采样，写入发生在我们之后，于是会出现"命令行给了 2.0 m/s，机器人却站着"——阶段 1 的采样范围是全零，重采样就等于清零。两边都调 `freeze_command_resampling()` 把它冻住，并在每步比对"写入值 vs 读回值"：只有看到 `[WARN] The command was overwritten inside env.step` 或 `[WARN] The policy sees a different command` 才是指令链路有问题；没有这两条就说明指令进去了，问题在策略或抓地。详见 `docs/control.md` §7.1。
+
 ### eval.py —— 验收（固定指令序列）
 
 | 参数 | 默认 | 作用 |
