@@ -102,6 +102,39 @@ class M20VelocityEnv(ManagerBasedRLEnv):
         self._init_wheel_park()
 
     # -- wheel parking brake --------------------------------------------------
+    def _iter_action_terms(self) -> list[tuple[str, object]]:
+        """Return ``(name, term)`` pairs in action-vector order.
+
+        IsaacLab keeps the terms in a dict keyed by name (``_terms``) next to an
+        ordered ``_term_names`` list. Iterating that dict yields its *keys*, which
+        is how ``'str' object has no attribute 'action_dim'`` happens, so walk the
+        names and look each term up instead. Both the dict form and a plain
+        sequence are accepted, because the container changed shape between
+        IsaacLab releases; the public ``active_terms`` API is the last resort.
+        """
+        manager = self.action_manager
+        names = list(getattr(manager, "_term_names", []) or [])
+        terms = getattr(manager, "_terms", None)
+
+        pairs: list[tuple[str, object]] = []
+        if isinstance(terms, dict):
+            pairs = [(name, terms.get(name)) for name in names] if names else list(terms.items())
+        elif terms is not None:
+            terms = list(terms)
+            if names and len(names) == len(terms):
+                pairs = list(zip(names, terms))
+            else:
+                pairs = [(f"term_{index}", item) for index, item in enumerate(terms)]
+        if pairs:
+            return pairs
+
+        for name in list(getattr(manager, "active_terms", []) or []):
+            try:
+                pairs.append((name, manager.get_term(name)))
+            except Exception:  # noqa: BLE001 - a disabled term must not break startup
+                continue
+        return pairs
+
     def _init_wheel_park(self) -> None:
         """Resolve the wheel columns of the action vector and the hold buffers.
 
@@ -113,7 +146,7 @@ class M20VelocityEnv(ManagerBasedRLEnv):
         training run.
         """
         self._park_enabled = bool(getattr(self.cfg, "wheel_park_enabled", True))
-        self._park_kp = float(getattr(self.cfg, "wheel_park_kp", 25.0))
+        self._park_kp = float(getattr(self.cfg, "wheel_park_kp", 15.0))
         self._park_omega_max = float(getattr(self.cfg, "wheel_park_omega_max", 3.0))
         self._park_error_clamp = float(getattr(self.cfg, "wheel_park_error_clamp", 0.3))
         self._park_slice: slice | None = None
@@ -129,7 +162,7 @@ class M20VelocityEnv(ManagerBasedRLEnv):
         # Walk the action terms in configuration order, because the action vector is
         # the concatenation of their outputs; the wheel columns start wherever the
         # leg term ends. Inactive terms are ``None`` and contribute nothing.
-        for name, candidate in zip(self.action_manager._term_names, self.action_manager._terms):
+        for name, candidate in self._iter_action_terms():
             if candidate is None:
                 continue
             if name == term_name:
