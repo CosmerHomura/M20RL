@@ -369,6 +369,8 @@ def status_line(env, command_term, wheel_ids, timestep: int, obs=None) -> str:
         heading = math.degrees(float(control.heading_from_quat(data.root_quat_w[0:1])[0]))
         frame_text = (f"v_b=({float(body[0]):+.2f},{float(body[1]):+.2f}) "
                       f"v_w=({float(world[0]):+.2f},{float(world[1]):+.2f}) psi={heading:+.0f}deg ")
+    except Exception:  # noqa: BLE001 - a status line must never stop playback
+        pass
 
     seconds = timestep * unwrapped.step_dt
     return (f"[status] t={seconds:5.1f}s {command}{mode_text}{targets_text}{observed}"
