@@ -357,9 +357,22 @@ def status_line(env, command_term, wheel_ids, timestep: int, obs=None) -> str:
         ox, oy, ow = (float(value) for value in policy_obs[0, 37:40])
         observed = f"obs_cmd=({ox:+.2f},{oy:+.2f},{ow:+.2f}) "
 
+    # Signed velocities in both frames plus the heading. The norm alone cannot
+    # tell "forward" from "backward", and that is exactly the question when the
+    # robot appears to drive against its command: if ``v_b.x`` and ``v_w`` point
+    # the same way while the robot visibly goes the other way, the body frame of
+    # the asset is rotated 180 deg from the operator's idea of the front.
+    frame_text = ""
+    try:
+        body = data.root_lin_vel_b[0, :2]
+        world = data.root_lin_vel_w[0, :2]
+        heading = math.degrees(float(control.heading_from_quat(data.root_quat_w[0:1])[0]))
+        frame_text = (f"v_b=({float(body[0]):+.2f},{float(body[1]):+.2f}) "
+                      f"v_w=({float(world[0]):+.2f},{float(world[1]):+.2f}) psi={heading:+.0f}deg ")
+
     seconds = timestep * unwrapped.step_dt
     return (f"[status] t={seconds:5.1f}s {command}{mode_text}{targets_text}{observed}"
-            f"|v_xy|={speed:.3f} wz={wz:+.2f} "
+            f"|v_xy|={speed:.3f} {frame_text}wz={wz:+.2f} "
             f"h={height:.3f} tilt={tilt:4.1f}deg qdot_leg={qdot_leg:5.1f} "
             f"qdot_wheel={qdot_wheel:6.2f}{wheels_text} standing={standing}")
 
