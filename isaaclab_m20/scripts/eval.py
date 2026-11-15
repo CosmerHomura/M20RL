@@ -36,7 +36,7 @@ Acceptance (from the plan):
 * zero command: body speed near 0 **and** net displacement near 0 -- 0.05 m/s of
   creep passes a speed check and still walks 0.4 m in the 8 s window
 * switch test: go-phase speed error < 0.12 m/s and, once a stop phase has
-  settled, residual speed < 0.08 m/s (course stage 4)
+  settled, residual speed < 0.08 m/s (course stage 6)
 
 The fall rate is reported per 1000 policy steps. An episode is 20 s at 50 Hz,
 i.e. 1000 steps, so "2% of episodes fall" and "20 falls per 1000 steps" are the
@@ -44,14 +44,14 @@ same threshold.
 
 Usage::
 
-    python -m isaaclab_m20.scripts.eval --stage 4        # that stage of the newest run
+    python -m isaaclab_m20.scripts.eval --stage 6        # that stage of the newest run
     python -m isaaclab_m20.scripts.eval --stage 2        # look at one stage on its own
-    python -m isaaclab_m20.scripts.eval --checkpoint logs/rsl_rl/m20_velocity/<run>/stage4_agile
+    python -m isaaclab_m20.scripts.eval --checkpoint logs/rsl_rl/m20_velocity/<run>/stage6_agile
     python -m isaaclab_m20.scripts.eval            # newest checkpoint of the newest run
     python -m isaaclab_m20.scripts.eval --seconds 10 --num_envs 32 --strict
 
 ``--checkpoint`` takes a ``model_*.pt`` file or a directory (stage or run); the
-file names carry the cumulative iteration count, so stage 4 ends around 4200.
+file names carry the cumulative iteration count, so stage 6 ends around 4900.
 ``--stage N`` picks the highest checkpoint of ``<newest run>/stageN_*`` instead,
 which is the "check this stage before spending the next one" entry point.
 """
@@ -73,8 +73,9 @@ if str(REPO_ROOT) not in sys.path:
 VELOCITY_TASK = "Isaac-M20-Wheeled-Velocity-v0"
 POLICY_DT = 0.02          # 50 Hz
 
-# Course order of the stage directory suffixes: <run>/stage3_multi_direction/ ...
-STAGE_SLUGS = ("stand", "forward_backward", "multi_direction", "agile")
+# Course order of the stage directory suffixes: <run>/stage5_multi_direction/ ...
+STAGE_SLUGS = ("stand", "forward_low", "forward_mid", "forward_high",
+               "multi_direction", "agile")
 
 parser = argparse.ArgumentParser(description="Fixed-command acceptance test for M20.")
 parser.add_argument("--task", type=str, default=VELOCITY_TASK)
@@ -157,7 +158,7 @@ MAX_STILL_DRIFT = 0.25      # m, mean distance from the start of the settled win
 # Used by the one-shot probe that proves the test command reached the policy.
 COMMAND_OBS_SLICE = slice(37, 40)
 
-# Switching test (course stage 4): alternate "go" and "stop" commands and check
+# Switching test (course stage 6): alternate "go" and "stop" commands and check
 # that the policy both reaches the speed and comes back to rest, within one run.
 SWITCH_COMMAND = (0.30, 0.00, 0.00)
 SWITCH_PHASE_S = 2.0        # each command holds this long
@@ -187,7 +188,7 @@ def resolve_checkpoint(log_root: Path, explicit: str | None) -> Path:
 
     ``explicit`` may be a ``model_*.pt`` file, a stage directory, or the whole
     run directory: pointing at a directory takes its highest iteration number,
-    so ``--checkpoint logs/rsl_rl/m20_velocity/m20_v1/stage4_agile``
+    so ``--checkpoint logs/rsl_rl/m20_velocity/m20_v1/stage6_agile``
     works without spelling out which ``model_<n>.pt`` that stage ended on.
     """
 
@@ -405,7 +406,7 @@ def run_switching_test(env, policy, device: torch.device,
                        label: str = "10") -> Result:
     """Alternate go/stop commands and check both halves of the switch.
 
-    Course stage 4 trains exactly this: the same policy has to hold a speed when
+    Course stage 6 trains exactly this: the same policy has to hold a speed when
     the command is non-zero and come back to rest when it becomes zero. A policy
     that only ever sees long holds can pass tests 1-9 and still creep for a metre
     after every stop, which is what this row is for.
@@ -563,7 +564,7 @@ def main() -> None:
         results.append(result)
         print_result(result)
 
-    # Course stage 4's own acceptance: does the same policy also stop when told?
+    # Course stage 6's own acceptance: does the same policy also stop when told?
     switching = run_switching_test(env, policy, device)
     results.append(switching)
     print_result(switching)

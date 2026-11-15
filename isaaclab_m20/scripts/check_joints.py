@@ -259,16 +259,15 @@ def main() -> None:
     # A fresh, resolved SceneEntityCfg: the default argument inside rewards.py has
     # joint_ids = slice(None) until the manager resolves it, which would silently
     # include the four (unbounded) wheel angles in this number.
-    leg_cfg = SceneEntityCfg("robot", joint_names=LEG_JOINT_NAMES)
-    leg_cfg.resolve(unwrapped.scene)
-    new_form = rewards.joint_deviation_l2(unwrapped, scale=1.0, asset_cfg=leg_cfg).mean().item()
-    # The old code summed over the 12 leg joints, so its value is 12x this mean.
-    old_form = 12.0 * rewards.joint_deviation_l2(unwrapped, scale=0.3, asset_cfg=leg_cfg).mean().item()
     dt = unwrapped.step_dt
-    print(f"  new form mean_legs((dq/1.0)^2) = {new_form:.3f}  -> per-step "
-          f"{-1.0 * new_form * dt:+.4f} at weight -1.0")
-    print(f"  old form sum_legs((dq/0.3)^2)  = {old_form:.1f}  -> per-step "
-          f"{-0.05 * old_form * dt:+.4f} at the old weight -0.05")
+    hip = rewards.joint_pos_deviation_l1(
+        unwrapped, joint_names=[".*_hipx_joint"], scale=1.0).mean().item()
+    legs = rewards.joint_pos_deviation_l1(
+        unwrapped, joint_names=[".*_hipy_joint", ".*_knee_joint"], scale=1.0).mean().item()
+    print(f"  hip_pos  sum_4 |dq|/1.0      = {hip:.3f} rad  -> per-step "
+          f"{-0.08 * hip * dt:+.5f} at weight -0.08")
+    print(f"  joint_pos sum_8 |dq|/1.0     = {legs:.3f} rad  -> per-step "
+          f"{-0.01 * legs * dt:+.5f} at weight -0.01")
     print(f"  the per-step positive side caps at {(2.0 + 1.0) * dt:.3f} "
           "(tracking + yaw, both <= 1.0)")
 

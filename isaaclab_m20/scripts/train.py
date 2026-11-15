@@ -12,18 +12,19 @@ Isaac Sim's app has to be running before anything imports ``isaaclab_m20.tasks``
 
 Course at a glance (see ``training/stages.py`` for the ranges and the reasoning):
 
-    1 stand 900 -> 2 forward/back 700 -> 3 all directions 1200 -> 4 agile 1400
+    1 stand 900 -> 2 vx 0.5 400 -> 3 vx 1.2 400 -> 4 vx 2.5 600
+    -> 5 all directions 1200 -> 6 agile 1400
 
 Typical use::
 
-    # the whole course, ~4200 iterations
-    python -m isaaclab_m20.scripts.train --run_name m20_v8
+    # the whole course, ~4900 iterations
+    python -m isaaclab_m20.scripts.train --run_name m20_v10
 
     # one stage, look at it in the simulator before spending the next one
-    python -m isaaclab_m20.scripts.train --stage 1 --iterations 900 --run_name m20_v8
+    python -m isaaclab_m20.scripts.train --stage 1 --iterations 900 --run_name m20_v10
     python -m isaaclab_m20.scripts.play  --stage 1
     python -m isaaclab_m20.scripts.eval  --stage 1
-    python -m isaaclab_m20.scripts.train --stage 2 --iterations 1200
+    python -m isaaclab_m20.scripts.train --stage 2 --iterations 400
 """
 from __future__ import annotations
 

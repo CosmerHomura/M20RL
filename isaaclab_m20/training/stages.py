@@ -9,21 +9,33 @@ same table.
 stage                         iters     command range (half-widths)       zero cmd
 ============================  ========  ================================  =========
 1  stand                       900       vx 0,     vy 0,    wz 0           100%
-2  forward_backward            700       vx +-2.5, vy 0,    wz 0            50%
-3  multi_direction            1200       vx +-2.5, vy +-0.4, wz +-0.8       30%
-4  agile                      1400       vx +-2.5, vy +-0.5, wz +-1.0       20%
+2  forward_low                 400       vx +-0.5, vy 0,    wz 0            50%
+3  forward_mid                 400       vx +-1.2, vy 0,    wz 0            50%
+4  forward_high                600       vx +-2.5, vy 0,    wz 0            50%
+5  multi_direction            1200       vx +-2.5, vy +-0.4, wz +-0.8       30%
+6  agile                      1400       vx +-2.5, vy +-0.5, wz +-1.0       20%
 ============================  ========  ================================  =========
 
-4200 iterations in total, in the order "stand -> forward/back -> everything ->
-faster and stop/go", one axis group introduced per stage. The 2.5 m/s envelope is
-set by the wheel action scale (``scale=27.78`` rad/s per unit times the 0.09 m
-wheel) and is a policy choice, not a hardware limit: the actuator allows
-200 rad/s and 240 N per wheel against a 338 N friction ceiling.
+4900 iterations in total, in the order "stand -> forward/back in three bands ->
+everything -> faster and stop/go". The 2.5 m/s envelope is set by the wheel
+action scale (``scale=27.78`` rad/s per unit times the 0.09 m wheel) and is a
+policy choice, not a hardware limit: the actuator allows 200 rad/s and 240 N per
+wheel against a 338 N friction ceiling.
+
+Why forward/backward is three stages and not one. The tracking kernel is
+``exp(-e^2 / 0.5^2)``: at 2.5 m/s of error (the command on the table, the robot
+standing still) it returns 1e-5, so **a stage that samples the full envelope from
+a policy that can only stand has no gradient at all** -- that is not a tuning
+problem, it is a structural one. legbot_lab trains +-0.5 for 20k iterations
+before it ever raises the range; this course does the same thing with three
+bands and a budget sized for 4096 envs x 24 steps per iteration. Each band starts
+from the previous band's width (``ranges_from``), so the axes already learned
+keep their full width while the new one grows in.
 
 Every stage after the first keeps a share of zero commands, so standing is
 rehearsed while the moving skills are learned -- without it the later stages
 train the "stop" behaviour out of the actor and it has to be relearned. The share
-shrinks stage by stage and stage 4 also shortens the hold (1.5-3 s), so one 20 s
+shrinks stage by stage and stage 6 also shortens the hold (1.5-3 s), so one 20 s
 episode contains several start/stop switches instead of two long holds.
 
 Stage 1 is 100% zero command: the tracking terms then mean "be still", which
@@ -70,17 +82,24 @@ class Stage:
 STAGES: tuple[Stage, ...] = (
     # Zero command: the standing baseline under the 56-dim observation layout.
     Stage("1_stand", 900, (0.00, 0.0, 0.0), (0.00, 0.0, 0.0), 0, zero_prob=1.0),
-    # Half the commands stay zero, so standing is rehearsed while vx grows all
-    # the way to the envelope.
-    Stage("2_forward_backward", 700, (0.00, 0.0, 0.0), (2.50, 0.0, 0.0), 350,
+    # Band 1: 0 -> 0.5 m/s. Inside the exp kernel's band on purpose (sigma 0.5),
+    # so the first moving stage always has gradient.
+    Stage("2_forward_low", 400, (0.00, 0.0, 0.0), (0.50, 0.0, 0.0), 200,
+          zero_prob=0.5),
+    # Band 2: 0.5 -> 1.2 m/s. Start from the width band 1 reached, not from zero.
+    Stage("3_forward_mid", 400, (0.50, 0.0, 0.0), (1.20, 0.0, 0.0), 200,
+          zero_prob=0.5),
+    # Band 3: 1.2 -> 2.5 m/s, the envelope. Only now does the command leave the
+    # kernel's band at the top, and by now the policy can already do 1.2.
+    Stage("4_forward_high", 600, (1.20, 0.0, 0.0), (2.50, 0.0, 0.0), 300,
           zero_prob=0.5),
     # Lateral and yaw arrive together: the two axes the wheels cannot produce on
     # their own, and the ones that break the standing skill first.
-    Stage("3_multi_direction", 1200, (2.50, 0.0, 0.0), (2.50, 0.40, 0.80), 400,
+    Stage("5_multi_direction", 1200, (2.50, 0.0, 0.0), (2.50, 0.40, 0.80), 400,
           zero_prob=0.3),
     # 20% stops and shorter holds: accelerate, stop, turn and side-step several
     # times per episode, at the top of the envelope.
-    Stage("4_agile", 1400, (2.50, 0.40, 0.80), (2.50, 0.50, 1.00), 300,
+    Stage("6_agile", 1400, (2.50, 0.40, 0.80), (2.50, 0.50, 1.00), 300,
           zero_prob=0.2, resampling=(1.5, 3.0)),
 )
 

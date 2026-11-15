@@ -123,8 +123,10 @@ def tracking_by_mode(env) -> str | None:
         parts = []
         for name, mask in groups:
             share = mask.float().mean().item()
-            mean = value[mask].mean().item() if bool(mask.any()) else float("nan")
-            parts.append(f"{name}={mean:.2f}({share * 100:.0f}%)")
+            # An empty group prints ``n/a``, not ``nan``: early stages have no
+            # ROTATE envs at all, and a ``nan`` there reads like a broken kernel.
+            label = f"{value[mask].mean().item():.2f}" if bool(mask.any()) else "n/a "
+            parts.append(f"{name}={label}({share * 100:.0f}%)")
         # Per-step credit = value * weight * dt, the scale the terms line uses.
         weight = float(env.cfg.rewards.track_lin_vel_xy.weight)
         dt = float(getattr(env, "step_dt", 0.02))

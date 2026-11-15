@@ -14,13 +14,15 @@ observation         56 dims, body frame (see ``observations.py``)
 action              16 dims: 12 leg position targets + 4 wheel speed targets
 control rate        50 Hz (decimation 4 on 200 Hz physics)
 episode             20 s
-rewards             11 weighted per-step terms (see ``rewards.py``) and a
-                    terminal -10 applied by ``M20VelocityEnv`` on falls only;
-                    the perception is ``tasks/control.py``'s resolved target,
-                    not the raw command
+rewards             18 weighted per-step terms, aligned term-for-term with
+                    legbot_lab's 16 (see ``rewards.py``) and a terminal -10
+                    applied by ``M20VelocityEnv`` on falls only; the perception
+                    is ``tasks/control.py``'s resolved target, not the raw
+                    command
 command mix         50% single axis / 30% two axes / 10% three / 10% zero,
-                    held 2-4 s; stages 2-4 keep 50/30/20% zero commands
-                    (stage 4 also shortens the hold to 1.5-3 s)
+                    held 2-4 s; every stage keeps a zero-command share
+                    (100/50/50/50/30/20%) and the last stage shortens the
+                    hold to 1.5-3 s
 domain random.      OFF: nominal friction, mass and CoM, no pushes
 terrain             flat plane
 ==================  ==========================================================
@@ -33,13 +35,14 @@ still"), not the final one, so a plain
 policy for anything above zero on the first step. ``isaaclab_m20.training.
 curriculum.CommandSchedule`` rewrites these ranges per stage through
 ``dr.set_command_ranges``, and applies the command distribution through
-``apply_sampling``; the four stages themselves live in
+``apply_sampling``; the six stages themselves live in
 ``isaaclab_m20.training.stages.STAGES``.
 
 Wheel action scale
 ------------------
 27.78 rad/s per unit action against a 0.09 m wheel radius is **2.5 m/s at full
-action**, which is the top speed stage 2 already commands and stages 3-4 hold.
+action**, which is the top speed the last two stages command and the whole course
+ramps up to in three forward bands.
 That is the speed envelope the whole course is built around. It is a policy
 choice, not a hardware one: the wheel actuator allows 200 rad/s (18 m/s at the
 contact) and its 21.6 N*m is 240 N per wheel against a 338 N friction ceiling for
@@ -60,6 +63,7 @@ from isaaclab.managers import (
     TerminationTermCfg,
 )
 from isaaclab.envs import ManagerBasedRLEnvCfg
+from isaaclab.sensors import ContactSensorCfg
 from isaaclab.utils import configclass
 
 from isaaclab_m20.tasks import commands, control, dr, observations, rewards
@@ -200,13 +204,19 @@ class ObservationsCfg:
 
 @configclass
 class RewardsCfg:
-    """Eleven per-step channels: two tracking, four base-state, three regularisers
-    and **two mode-gated terms**. The fall penalty is *not* here -- it is applied by
+    """Eighteen per-step channels, aligned with legbot_lab's sixteen plus two of
+    our own. The fall penalty is *not* here -- it is applied by
     ``isaaclab_m20.envs.M20VelocityEnv`` from the termination flags (see
     ``fall_penalty`` on the env cfg).
 
-    Weights are the plan's; every penalty term returns a positive magnitude and
-    carries its sign here (see the module docstring of ``rewards.py``).
+    Weights are legbot_lab's (README_cn.md, "奖励函数 16 项"), re-expressed in our
+    normalisation so that a weight means the same thing on both sides: their
+    ``1e-7 * sum(qdd^2)`` is our ``-0.4 * sum((qdd/2000)^2)``, their
+    ``1e-4 * sum(tau^2)`` is our ``-1e-4 * sum(tau^2 / 1^2)``. Where we keep a
+    different number it is noted next to the term.
+
+    Every penalty term returns a positive magnitude and carries its sign here (see
+    the module docstring of ``rewards.py``).
 
     The revision that came before this one had a pair of channels for each axis
     group -- an exp kernel *and* a quadratic for linear velocity, again for yaw --
@@ -215,23 +225,34 @@ class RewardsCfg:
     attributed or tuned, which is why the table kept growing. This set replaces
     pairs instead of adding to them:
 
-    * one bounded kernel per axis group (``track_lin_vel_xy``, ``track_ang_vel_z``,
-      Cauchy form ``1/(1+e^2/sigma^2)``): it keeps a usable gradient across the
-      whole command range, where exp is already flat at 0.018 by the far end;
+    * one exp kernel per axis group (``track_lin_vel_xy``, ``track_ang_vel_z``,
+      ``exp(-e^2/sigma^2)`` with ``sigma = 0.5`` -- legged_gym's
+      ``tracking_sigma = 0.25`` written in this form): the standard shape, and
+      honest about its band -- beyond ~1 m/s of error it gives nothing, so the
+      course ramps the command range instead of sampling the envelope from the
+      start;
     * height is a quadratic error, not an exp bonus -- on flat ground 0.50 m is a
       set point, so the channel wants stiffness around it and no ceiling;
     * ``leg_joint_acc`` replaces the leg joint-velocity channel and
       ``action_rate`` is normalised, so joint chatter is no longer free.
 
-    Two mode-gated terms, both reading the label the sampler wrote (never a float
-    re-test here):
+    The wheeled-legged channels are the ones a legged stack does not have:
+    ``wheel_axis_alignment`` (a wheel rolled onto its edge is invisible to every
+    body-frame term) and ``undesired_contacts`` (resting on a knee keeps the base
+    high and level, so neither termination fires).
 
-    * ``wheel_speed`` -- STAND: legs holding the body up while the wheels spin.
-      The body does not move, so every body-frame channel is satisfied; only the
-      wheel rate exposes it.
+    **Two mode-gated terms**, both reading the label the sampler wrote (never a
+    float re-test here):
+
+    * ``wheel_axis_alignment`` -- weighted 100 % STAND / 25 % MOVE / 0 % otherwise
+      by the function itself: a turn or a strafe *needs* a misaligned axle.
     * ``zero_xy_speed`` -- ROTATE: a pure yaw command must not translate. The
       tracking kernel only asks for a zero *linear* target, which is a soft way to
       say "stay put"; this is the hard one that the spin task is actually about.
+
+    ``standing_joint_vel`` uses a looser gate on purpose (``|v*| < 0.1`` and
+    ``|wz*| < 0.1`` rather than exact zero): it is pricing the twitch that makes a
+    stopped robot creep, not the label of the moment.
 
     Everything else is ungated because it is either relative to the command or
     meaningful while driving.
@@ -269,9 +290,9 @@ class RewardsCfg:
     # velocity rotated into the body frame, and the outer loop's yaw-rate target.
     # That is the only definition of "on target" in this project.
     track_lin_vel_xy = RewardTermCfg(
-        func=rewards.track_lin_vel_xy, weight=2.0, params={"sigma": 0.25})
+        func=rewards.track_lin_vel_xy, weight=2.0, params={"sigma": 0.5})
     track_ang_vel_z = RewardTermCfg(
-        func=rewards.track_ang_vel_z, weight=1.0, params={"sigma": 0.3})
+        func=rewards.track_ang_vel_z, weight=1.0, params={"sigma": 0.5})
     # The third gate: a pure spin must not translate. Zero linear target alone does
     # not express that strongly enough, and "stay in place while spinning" is the
     # whole task of the ROTATE mode rather than a side condition.
@@ -279,47 +300,77 @@ class RewardsCfg:
         func=rewards.zero_xy_speed_l2, weight=-1.0, params={"scale": 0.15})
 
     # -- base state ----------------------------------------------------------
-    # Quadratic, not exp: on flat ground the tilt and the ride height should be
-    # near their set points at all times, and a hold-still command needs stiffness
-    # there rather than a bonus with a ceiling (see rewards.py).
+    # Quadratic, not exp, and in raw SI units like legbot_lab's: the terms below
+    # carry their own scale factor (metres, m/s, rad/s squared), so the weight is
+    # the only number to compare against theirs. ``base_height`` at -10 and the
+    # 0.50 m target are theirs (-10, 0.49 m) with our ride height; the first
+    # version of this file had it at -200 equivalent, twenty times stiffer, which
+    # is why a 8 cm sag used to cost more than everything the policy could earn.
     base_height = RewardTermCfg(
-        func=rewards.base_height_l2, weight=-0.5,
-        params={"target_height": BASE_HEIGHT, "scale": 0.05})
+        func=rewards.base_height_l2, weight=-10.0,
+        params={"target_height": BASE_HEIGHT, "scale": 1.0})
     flat_orientation = RewardTermCfg(
         func=rewards.orientation_sq, weight=-0.5, params={"scale": 0.2})
     # Vertical bounce: with no foot contacts, a bouncing body is the cheapest way
     # to look like it is walking, and neither the tilt nor the height term sees it.
     lin_vel_z = RewardTermCfg(
-        func=rewards.lin_vel_z_l2, weight=-0.2, params={"scale": 0.2})
+        func=rewards.lin_vel_z_l2, weight=-1.0, params={"scale": 1.0})
     # Attitude *rate*, which the quadratic tilt does not cover: a small-amplitude
     # wobble keeps the mean tilt near zero and is otherwise almost free.
     ang_vel_xy = RewardTermCfg(
-        func=rewards.ang_vel_xy_l2, weight=-0.2, params={"scale": 1.0})
+        func=rewards.ang_vel_xy_l2, weight=-0.05, params={"scale": 1.0})
 
-    # -- wheels under a parked body -----------------------------------------
-    # Gated on the STAND label. The body-frame channels cannot see this: with the
-    # legs holding the base up, the wheels can be commanded to any speed without
-    # moving the robot. Gated because when a command is present the wheels are
-    # *supposed* to spin -- an ungated version taxes every in-place turn.
-    wheel_speed = RewardTermCfg(
-        func=rewards.wheel_speed_l2, weight=-0.2, params={"scale": 2.0})
+    # -- wheels and contacts (the wheeled-legged channels) --------------------
+    # Wheel axle alignment, gated by mode inside the function: square to the body
+    # when parked (100 %), worth something while driving straight (25 %), off when
+    # the command requires a misaligned axle (turn / strafe).
+    wheel_axis_alignment = RewardTermCfg(
+        func=rewards.wheel_axis_alignment_l2, weight=-0.6)
+    # Leg links touching the ground. The height and tilt terminations do not catch
+    # a robot resting on a knee with the base still level and high enough.
+    undesired_contacts = RewardTermCfg(
+        func=rewards.undesired_contacts_legs, weight=-1.0,
+        params={"threshold": 5.0})
 
-    # -- posture and smoothness ----------------------------------------------
-    # mean over the twelve leg joints, 1 rad scale: -0.0005/step at the nominal
-    # sag (0.15 rad) and -0.054/step with a leg folded 1.65 rad, i.e. the same
-    # order as the +0.06/step the tracking channels can pay. The first version
-    # summed 12 terms over 0.3 rad and charged -0.367/step for the same pose,
-    # which made "unfold the legs" the only gradient the policy could see.
-    joint_deviation = RewardTermCfg(
-        func=rewards.joint_deviation_l2, weight=-1.0, params={"scale": 1.0})
+    # -- posture, smoothness, effort -----------------------------------------
+    # L1 and split by joint group, the way legbot_lab does it: -0.08 for the four
+    # hips (they set how wide the stance is), -0.01 for thighs/shins (they are
+    # expected to move), and both doubled when the command is "stand". The earlier
+    # L2 sum over 12 joints at 0.3 rad charged -0.367/step for a pose that is
+    # merely sagging under its own weight, i.e. more than the whole positive side
+    # of the reward -- "unfold the legs" became the only gradient.
+    hip_pos = RewardTermCfg(
+        func=rewards.joint_pos_deviation_l1, weight=-0.08,
+        params={"joint_names": [".*_hipx_joint"], "scale": 1.0, "stand_scale": 2.0})
+    joint_pos = RewardTermCfg(
+        func=rewards.joint_pos_deviation_l1, weight=-0.01,
+        params={"joint_names": [".*_hipy_joint", ".*_knee_joint"],
+                "scale": 1.0, "stand_scale": 2.0})
     # acc_scale 2000 and action_scale 1.0 are *not* arbitrary: the exploration
-    # noise is what these two terms mostly price early on (see rewards.py), and at
-    # 200 / 0.05 the noise alone cost ~-30/step -- more than the whole positive
-    # side of the reward, which left the policy with nothing to learn from.
+    # noise is what these terms mostly price early on (see rewards.py), and at
+    # 200 / 0.05 the noise alone cost ~-30/step. The weights below are
+    # legbot_lab's, expressed in our normalisation, so they are 20x (-0.02 ->
+    # -0.4) and 10x (-0.005 -> -0.05 via 1e-4) heavier than before -- the point
+    # of that is that a jittering leg is no longer cheaper than a still one.
     leg_joint_acc = RewardTermCfg(
-        func=rewards.leg_joint_acc_l2, weight=-0.02, params={"acc_scale": 2000.0})
+        func=rewards.leg_joint_acc_l2, weight=-0.4, params={"acc_scale": 2000.0})
+    joint_torques = RewardTermCfg(
+        func=rewards.joint_torques_l2, weight=-1e-4, params={"torque_scale": 1.0})
+    joint_power = RewardTermCfg(
+        func=rewards.joint_power, weight=-2e-5)
     action_rate = RewardTermCfg(
         func=rewards.action_rate_l2, weight=-0.01, params={"action_scale": 1.0})
+    action_smoothness = RewardTermCfg(
+        func=rewards.action_smoothness_l2, weight=-0.01, params={"action_scale": 1.0})
+    # Soft-limit violations on the twelve leg joints only: a wheel's angle is
+    # unbounded, so testing its limit would be meaningless.
+    joint_pos_limits = RewardTermCfg(
+        func=mdp.joint_pos_limits, weight=-2.0, params={"asset_cfg": leg_obs_cfg()})
+    # Leg and wheel velocity while the command asks for nothing. Gated on a looser
+    # threshold than the parking brake (0.1 m/s / 0.1 rad/s vs exact zero): a
+    # leftover twitch under a stop command is what makes the robot creep.
+    standing_joint_vel = RewardTermCfg(
+        func=rewards.standing_joint_vel_l2, weight=-0.02)
 
     # The fall penalty is not a reward term: ``isaaclab_m20.envs.M20VelocityEnv``
     # adds it on the steps where ``terminated & ~truncated``, i.e. exactly the
@@ -347,10 +398,11 @@ class TerminationsCfg:
     keep in sync: the fall that ends the episode is exactly the fall that is
     penalised.
 
-    The plan also lists "unexpected contact". M20's articulation config carries
-    no contact sensor, so there is nothing to test against; a collision is
-    instead caught by the two terms above, which is what the height and
-    orientation limits do in practice.
+    The plan also lists "unexpected contact", and the scene now has a contact
+    sensor for it: a net force above ``10 N`` on the base means the body took a
+    hit rather than the legs. legbot_lab terminates on exactly this (their only
+    other termination is the timeout); here it is added on top of the height and
+    tilt tests, which catch the slow failures a single contact event does not.
     """
 
     time_out = TerminationTermCfg(func=mdp.time_out, time_out=True)
@@ -358,6 +410,13 @@ class TerminationsCfg:
         func=mdp.root_height_below_minimum, params={"minimum_height": MIN_BASE_HEIGHT})
     bad_orientation = TerminationTermCfg(
         func=mdp.bad_orientation, params={"limit_angle": MAX_TILT_RAD})
+    illegal_contact = TerminationTermCfg(
+        func=mdp.illegal_contact,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*base.*"]),
+            "threshold": 10.0,
+        },
+    )
 
 
 @configclass
@@ -498,8 +557,32 @@ def set_domain_randomization(env_cfg: ManagerBasedRLEnvCfg, enabled: bool) -> bo
 
 
 @configclass
+class VelocitySceneCfg(M20SceneCfg):
+    """``M20SceneCfg`` plus a contact sensor over the robot's bodies.
+
+    Two reward channels and one termination need contact forces: leg links that
+    should not touch the ground, and the base taking a net hit. The standing task
+    has no use for them, and a sensor costs a PhysX query patch per step, so it
+    lives here rather than in the shared scene: subclassing keeps the standing
+    task's ``M20SceneCfg`` byte-identical.
+
+    ``history_length=3`` is what ``undesired_contacts_legs`` reads (it takes the
+    max over the window); ``update_period=0.0`` makes the sensor run every physics
+    step, which is what makes that window meaningful at 200 Hz.
+    """
+
+    contact_forces = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/.*",
+        history_length=3,
+        track_air_time=False,
+        update_period=0.0,
+        debug_vis=False,
+    )
+
+
+@configclass
 class M20WheeledVelocityEnvCfg(ManagerBasedRLEnvCfg):
-    scene: M20SceneCfg = M20SceneCfg(num_envs=4096, env_spacing=2.5)
+    scene: VelocitySceneCfg = VelocitySceneCfg(num_envs=4096, env_spacing=2.5)
     commands: VelocityCommandsCfg = VelocityCommandsCfg()
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()

@@ -107,8 +107,8 @@ class M20VelocityRslRlPpoRunnerCfg(M20RslRlPpoRunnerCfg):
     """
 
     experiment_name = "m20_velocity"
-    # 900 + 700 + 1200 + 1400, see scripts/train.py
-    max_iterations = 4200
+    # 900 + 400 + 400 + 600 + 1200 + 1400, see training/stages.py
+    max_iterations = 4900
     save_interval = 50
 
     policy = RslRlPpoActorCriticCfg(

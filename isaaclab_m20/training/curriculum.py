@@ -35,7 +35,7 @@ class CommandSchedule:
         self._steps = 0
         self._applied: tuple[float, float, float] | None = None
         # Sampling defaults, restored for stages that do not override them: a
-        # stage 4 override must not leak into a later run of another stage.
+        # last-stage override must not leak into a later run of another stage.
         self._base_zero_prob = getattr(command_term.cfg, "zero_prob", None)
         self._base_resampling = command_term.cfg.resampling_time_range
         dr.register_command_term(command_term)

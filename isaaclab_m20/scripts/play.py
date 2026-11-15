@@ -34,10 +34,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# Stage directory suffixes, in course order: <run>/stage3_multi_direction/ ...
+# Stage directory suffixes, in course order: <run>/stage5_multi_direction/ ...
 # Kept here as plain data so play.py never imports train.py (which builds an
 # argparse parser and starts the Isaac app at import time).
-STAGE_SLUGS = ("stand", "forward_backward", "multi_direction", "agile")
+STAGE_SLUGS = ("stand", "forward_low", "forward_mid", "forward_high",
+               "multi_direction", "agile")
 
 parser = argparse.ArgumentParser(description="Play a trained M20 policy.")
 parser.add_argument("--task", type=str, default=None,
@@ -128,7 +129,7 @@ def newest_run(experiment_dir: Path) -> Path:
 def resolve_stage_checkpoint(experiment_name: str, stage: int) -> Path:
     """Checkpoint of one curriculum stage of the newest run.
 
-    ``--stage 3`` means "<newest run>/stage3_multi_direction/model_<highest>.pt",
+    ``--stage 3`` means "<newest run>/stage3_forward_mid/model_<highest>.pt",
     which is the model that stage ended on -- the loop is "train a stage, look at
     it, decide", and looking at it should not require reading the directory
     listing to find out which iteration number the stage stopped at.
@@ -160,10 +161,10 @@ def resolve_checkpoint(experiment_name: str) -> Path:
     to the velocity env and crash on a shape mismatch.
 
     The velocity run nests its checkpoints one level deeper, one directory per
-    curriculum stage (``<run>/stage4_agile/model_4200.pt``), so the search is
+    curriculum stage (``<run>/stage6_agile/model_4900.pt``), so the search is
     recursive and ordered by modification time: the newest stage wins. The
     iteration number in those names is cumulative over the whole run, not the
-    stage's own budget -- stage 4 ends around 4200, not 1400.
+    stage's own budget -- stage 6 ends around 4900, not 1400.
 
     ``--checkpoint`` may also be a directory (a stage directory or the run
     directory), in which case its highest iteration number is used.
@@ -295,11 +296,18 @@ def status_line(env, command_term, wheel_ids, timestep: int, obs=None) -> str:
     )
 
     qdot = data.joint_vel.abs()
+    wheels_text = ""
     if wheel_ids is not None and len(wheel_ids) > 0:
         is_wheel = torch.zeros(qdot.shape[1], dtype=torch.bool, device=qdot.device)
         is_wheel[wheel_ids] = True
         qdot_wheel = float(qdot[:, is_wheel].max()) if bool(is_wheel.any()) else 0.0
         qdot_leg = float(qdot[:, ~is_wheel].max()) if bool((~is_wheel).any()) else 0.0
+        # Signed speeds of the four wheels of env 0: equal signs mean the robot is
+        # rolling, alternating signs mean the policy is scrubbing the wheels in
+        # opposite directions and no net force can appear.
+        index = torch.as_tensor(list(wheel_ids), device=qdot.device)
+        speeds = data.joint_vel[0, index]
+        wheels_text = " w=[" + ",".join(f"{float(v):+.1f}" for v in speeds) + "]"
     else:
         qdot_wheel = 0.0
         qdot_leg = float(qdot.max())
@@ -353,7 +361,7 @@ def status_line(env, command_term, wheel_ids, timestep: int, obs=None) -> str:
     return (f"[status] t={seconds:5.1f}s {command}{mode_text}{targets_text}{observed}"
             f"|v_xy|={speed:.3f} wz={wz:+.2f} "
             f"h={height:.3f} tilt={tilt:4.1f}deg qdot_leg={qdot_leg:5.1f} "
-            f"qdot_wheel={qdot_wheel:6.2f} standing={standing}")
+            f"qdot_wheel={qdot_wheel:6.2f}{wheels_text} standing={standing}")
 
 
 def main() -> None:

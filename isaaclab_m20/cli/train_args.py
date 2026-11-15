@@ -42,8 +42,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage_scale", type=float, default=1.0,
                         help="Multiply every stage's iteration budget (e.g. 0.05 for a smoke test).")
     parser.add_argument("--cmd_scale", type=float, default=1.0,
-                        help="Multiply every stage's command range on all three axes (e.g. 0.7 "
-                             "makes stage 2 ask for +-1.75 m/s instead of +-2.5). Budget, "
+                        help="Multiply every stage's command range on all three axes (e.g. 0.6 "
+                             "makes the +-2.5 m/s band ask for +-1.5 instead). Budget, "
                              "zero-command share and hold time are untouched. This is the "
                              "'the policy cannot hold that speed yet' knob -- --stage_scale only "
                              "shrinks the number of iterations.")
