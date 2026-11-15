@@ -62,6 +62,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import math
+
 import torch
 
 # Command modes.  The sampler writes one of these into the command buffer next to
@@ -141,6 +143,9 @@ class CommandTargetsComputer:
         self.reverse = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
         self._stamp = -1
         self._zeros = torch.zeros(num_envs, device=self.device)
+        # ``command_frame_yaw`` in radians: rotates the operator's (vx, vy) into
+        # the asset's frame.  0 by default; see ``_command`` for when to set 180.
+        self.frame_yaw = math.radians(self._knob("command_frame_yaw", 0.0))
         self.targets = CommandTargets(
             v_body=torch.zeros(num_envs, 2, device=self.device),
             omega=torch.zeros(num_envs, device=self.device),
@@ -162,7 +167,18 @@ class CommandTargetsComputer:
         return self.env.scene["robot"]
 
     def _command(self) -> torch.Tensor:
-        """(n, 3) twist in the command frame; zeros when there is no term."""
+        """(n, 3) twist in the command frame; zeros when there is no term.
+
+        ``command_frame_yaw`` rotates the incoming (vx, vy) before anything else
+        looks at it.  It exists for one specific situation: if the asset's +x is
+        not the end the operator calls the front, then "+vx" as typed would drive
+        the robot the other way, and every diagnostic (observation, reward,
+        ``eval`` row 1) is consistent with the *asset's* convention rather than
+        the operator's.  Leaving this at 0 keeps the asset convention; set it to
+        180 and everything downstream -- target, reward, embedded observation --
+        flips together.  Changing it means the policy's task changed, so it has
+        to be retrained from stage 1; it is not a display tweak.
+        """
         manager = getattr(self.env, "command_manager", None)
         term = manager.get_term(COMMAND_TERM) if manager is not None else None
         if term is None:
@@ -172,7 +188,16 @@ class CommandTargetsComputer:
             buffer = getattr(term, "command", None)
         if buffer is None:
             return torch.zeros(self.env.num_envs, 3, device=self.device)
-        return buffer[:, :3]
+        command = buffer[:, :3]
+        frame_yaw = getattr(self, "frame_yaw", 0.0)
+        if abs(frame_yaw) < 1e-9:
+            return command
+        # Rotate only the translation: the yaw-rate command is about the vertical
+        # axis, which a rotation about that same axis does not change.
+        cos_yaw, sin_yaw = math.cos(frame_yaw), math.sin(frame_yaw)
+        vx = cos_yaw * command[:, 0] - sin_yaw * command[:, 1]
+        vy = sin_yaw * command[:, 0] + cos_yaw * command[:, 1]
+        return torch.stack((vx, vy, command[:, 2]), dim=1)
 
     def _mode(self, command: torch.Tensor) -> torch.Tensor:
         """Mode label from the term if it publishes one, else derived from the twist."""

@@ -302,12 +302,15 @@ class RewardsCfg:
     # -- base state ----------------------------------------------------------
     # Quadratic, not exp, and in raw SI units like legbot_lab's: the terms below
     # carry their own scale factor (metres, m/s, rad/s squared), so the weight is
-    # the only number to compare against theirs. ``base_height`` at -10 and the
-    # 0.50 m target are theirs (-10, 0.49 m) with our ride height; the first
-    # version of this file had it at -200 equivalent, twenty times stiffer, which
-    # is why a 8 cm sag used to cost more than everything the policy could earn.
+    # the only number to compare against theirs.  ``base_height`` is theirs (-10,
+    # 0.49 m) raised to -25: at -10 the first stage-2 run settled at h = 0.396 m
+    # (10 cm low, 0.108/step, which is 1.8x everything the positive side can
+    # earn) and still moved, so the crouch was not a deliberate trade -- the term
+    # simply was not paying for it.  -25 makes 10 cm cost 0.27/step and 5 cm
+    # 0.068/step: stiff enough to hold ride height, still an order of magnitude
+    # softer than the -200 equivalent this file started with.
     base_height = RewardTermCfg(
-        func=rewards.base_height_l2, weight=-10.0,
+        func=rewards.base_height_l2, weight=-25.0,
         params={"target_height": BASE_HEIGHT, "scale": 1.0})
     flat_orientation = RewardTermCfg(
         func=rewards.orientation_sq, weight=-0.5, params={"scale": 0.2})
@@ -642,6 +645,15 @@ class M20WheeledVelocityEnvCfg(ManagerBasedRLEnvCfg):
     yaw_alpha_tau: float = 0.05
     yaw_alpha_rate: float = 3.0
     yaw_branch_hysteresis: float = 0.15
+
+    # Where the operator's "+vx" lives, in degrees, relative to the asset's +x.
+    # 0 keeps the asset convention: the vendor URDF puts ``fl/fr`` and the
+    # ``front_camera`` site at +x, so "+vx" drives toward that end.  If the real
+    # robot's nose is the other end, set 180 and everything downstream (the
+    # target, the reward, the embedded observation slice 37:40) flips together --
+    # but the policy is then solving a different task, so retrain from stage 1.
+    # It is a task definition, not a display setting.
+    command_frame_yaw: float = 0.0
 
     def __post_init__(self) -> None:
         # 200 Hz physics, 50 Hz policy.

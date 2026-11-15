@@ -234,7 +234,7 @@ tensorboard --logdir logs/rsl_rl --bind_all --port 6006
 - **指令**：机体系 `(vx, vy, ωz)`，每 2–4 s 重采样，混合采样 50% 单轴 / 30% 双轴 / 10% 三轴 / 10% 零指令。
 - **奖励 18 项每步 + 摔倒 −10**（18 项里 16 项与 [legbot_lab](https://github.com/Robot-Nav/legbot_lab) 的"奖励函数 16 项"逐项对齐，权重照抄、只换成本项目的归一化：他们的 `1e-7·Σq̈²` = 我们的 `−0.4·Σ(q̈/2000)²`，`1e-4·Στ²` = `−1e-4·Σ(τ/1)²`）：
   - **任务项**：`track_lin_vel_xy +2.0`（σ 0.5，标准指数核 `exp(−e²/σ²)`，等价 legged_gym 的 `tracking_sigma=0.25`，比的是机体系解算目标 `v_body`）、`track_ang_vel_z +1.0`（σ 0.5，比外环 `ω*`）。
-  - **机身状态**：`base_height −10`（`(h−0.50)²`，平方误差不是奖金，−10 是 legbot 的数；我们早先等效 −200，硬 20 倍）、`flat_orientation −0.5`（姿态平方，0.2）、`lin_vel_z −1.0`（上下弹跳）、`ang_vel_xy −0.05`（姿态角速度，补"幅度小但抖得快"）。
+  - **机身状态**：`base_height −25`（`(h−0.50)²`，平方误差不是奖金；legbot 用 −10，但阶段 2 实测 `h=0.396` 还在跑、10 cm 只值 0.108/步而正项上限 0.06，说明 −10 不够；−25 让 10 cm 值 0.27/步，仍比早期等效的 −200 软一个量级）、`flat_orientation −0.5`（姿态平方，0.2）、`lin_vel_z −1.0`（上下弹跳）、`ang_vel_xy −0.05`（姿态角速度，补"幅度小但抖得快"）。
   - **轮足特有**：`wheel_axis_alignment −0.6`（轮轴对不齐就滚在边上——轮压歪了四个机体系通道全都看不见；STAND 100% / MOVE 25% 加权）、`undesired_contacts −1.0`（hip/knee 连杆接触力 >5 N 的刚体数，允许"撑在膝盖上"这种高度/倾角都看不出的故障）。
   - **姿态与平滑**：`hip_pos −0.08`（4 个 hipx 的 L1 偏离）、`joint_pos −0.01`（hipy+knee 的 L1 偏离），两者站立时 ×2；`leg_joint_acc −0.4`（/2000，比上一版硬 20 倍——上一轮"抖是免费的"就是关节抖的直接原因）、`action_rate −0.01`、`action_smoothness −0.01`（二阶差分，抓两步振荡）、`joint_pos_limits −2.0`（只腿）。
   - **门控项**：`wheel_axis_alignment`（STAND/MOVE 加权）、`zero_xy_speed −1.0`（**ROTATE 门**：纯旋转不许平移，`‖v_xy/0.15‖²`）、`standing_joint_vel −0.02`（`|v*|<0.1` 且 `|ωz*|<0.1` 的宽松门，腿速 /1、轮速 /5）。
