@@ -54,10 +54,11 @@ def build_parser() -> argparse.ArgumentParser:
                              "--iters_stageN is only for --stage all, "
                              "where several stages run back to back with different budgets.")
     parser.add_argument("--warmup_frac", type=float, default=None,
-                        help="Length of the command ramp as a fraction of this stage's budget "
-                             "(0.5 = the first half grows linearly, the rest samples across the "
-                             "full range). Default: the stage's own warmup, capped at half the "
-                             "budget. Only stages that declare a warmup are affected.")
+                        help="Override the command-ramp share of every stage. The ramp is always "
+                             "a fraction of the stage's budget (0.5 = the first half grows "
+                             "linearly, the rest samples across the full range); each stage in "
+                             "training/stages.py declares its own, e.g. 0.5 for the forward "
+                             "bands. Set this only to force one number on all of them.")
     for _number, _course_stage in enumerate(STAGES, start=1):
         parser.add_argument(
             f"--iters_stage{_number}", type=int, default=None,

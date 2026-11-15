@@ -45,9 +45,11 @@ class CommandSchedule:
                     resume_iteration: int = 0) -> None:
         """Enter ``stage``, optionally continuing it from ``resume_iteration``.
 
-        ``warmup`` overrides the stage's own (possibly ``--stage_scale``-trimmed)
-        warmup; when continuing, pass the *untrimmed* one so the ramp the stage
-        was climbing stays the same ramp. Pass ``resume_iteration=0`` for a
+        The ramp length is ``stage.warmup``, i.e. the stage's own ``warmup_frac``
+        resolved against the budget this run gives it (``select_stages`` does that
+        arithmetic). ``warmup`` is only an override for callers that need a
+        different span; when continuing, pass the stage's value so the ramp the
+        stage was climbing stays the same ramp. Pass ``resume_iteration=0`` for a
         fresh stage.
         """
         self.stage = stage

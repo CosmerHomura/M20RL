@@ -16,6 +16,12 @@ stage                         iters     command range (half-widths)       zero c
 6  agile                      1400       vx +-2.5, vy +-0.5, wz +-1.0       20%
 ============================  ========  ================================  =========
 
+The command ramp is a **fraction of each stage's own budget** (``warmup_frac``):
+0.50 for the three forward bands, 0.33 for stage 5, 0.21 for stage 6. A stage
+given 4000 iterations therefore spends its first 2000 growing the range instead
+of reaching full width in 5 % of its life, and a 40-iteration smoke run spends
+20. ``--warmup_frac`` forces one fraction on all of them.
+
 4900 iterations in total, in the order "stand -> forward/back in three bands ->
 everything -> faster and stop/go". The 2.5 m/s envelope is set by the wheel
 action scale (``scale=27.78`` rad/s per unit times the 0.09 m wheel) and is a
@@ -53,7 +59,7 @@ so judge by the curve, not by the budget.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 @dataclass(frozen=True)
@@ -61,10 +67,16 @@ class Stage:
     """One stage of the course.
 
     ``ranges_from`` -> ``ranges_to`` are (vx, vy, wz) half-widths in m/s, m/s and
-    rad/s. The warmup interpolates linearly between them over ``warmup``
-    iterations and then holds ``ranges_to``. ``ranges_from`` is written as the
-    previous stage's ``ranges_to`` -- not as zeros -- because the axes learned
+    rad/s. The warmup interpolates linearly between them over ``warmup_frac`` of
+    the stage's budget and then holds ``ranges_to``. ``ranges_from`` is written as
+    the previous stage's ``ranges_to`` -- not as zeros -- because the axes learned
     earlier must keep their full width while the new axis grows in.
+
+    The ramp is a *fraction* of the budget on purpose: the same stage run for 400
+    or 4000 iterations should spend the same share of its life growing the
+    command, not reach the full width in the first 5 % and then sample there for
+    the rest. ``warmup`` holds the absolute number resolved against the budget
+    (``select_stages`` fills it in); nothing else should read it.
 
     ``zero_prob`` and ``resampling`` override the command term's sampling for this
     stage (``None`` keeps the config default: 0.10 and 2-4 s).
@@ -74,32 +86,33 @@ class Stage:
     iterations: int
     ranges_from: tuple[float, float, float]
     ranges_to: tuple[float, float, float]
-    warmup: int
+    warmup_frac: float
     zero_prob: float | None = None
     resampling: tuple[float, float] | None = None
+    warmup: int = 0
 
 
 STAGES: tuple[Stage, ...] = (
     # Zero command: the standing baseline under the 56-dim observation layout.
-    Stage("1_stand", 900, (0.00, 0.0, 0.0), (0.00, 0.0, 0.0), 0, zero_prob=1.0),
+    Stage("1_stand", 900, (0.00, 0.0, 0.0), (0.00, 0.0, 0.0), 0.0, zero_prob=1.0),
     # Band 1: 0 -> 0.5 m/s. Inside the exp kernel's band on purpose (sigma 0.5),
     # so the first moving stage always has gradient.
-    Stage("2_forward_low", 400, (0.00, 0.0, 0.0), (0.50, 0.0, 0.0), 200,
+    Stage("2_forward_low", 400, (0.00, 0.0, 0.0), (0.50, 0.0, 0.0), 0.50,
           zero_prob=0.5),
     # Band 2: 0.5 -> 1.2 m/s. Start from the width band 1 reached, not from zero.
-    Stage("3_forward_mid", 400, (0.50, 0.0, 0.0), (1.20, 0.0, 0.0), 200,
+    Stage("3_forward_mid", 400, (0.50, 0.0, 0.0), (1.20, 0.0, 0.0), 0.50,
           zero_prob=0.5),
     # Band 3: 1.2 -> 2.5 m/s, the envelope. Only now does the command leave the
     # kernel's band at the top, and by now the policy can already do 1.2.
-    Stage("4_forward_high", 600, (1.20, 0.0, 0.0), (2.50, 0.0, 0.0), 300,
+    Stage("4_forward_high", 600, (1.20, 0.0, 0.0), (2.50, 0.0, 0.0), 0.50,
           zero_prob=0.5),
     # Lateral and yaw arrive together: the two axes the wheels cannot produce on
     # their own, and the ones that break the standing skill first.
-    Stage("5_multi_direction", 1200, (2.50, 0.0, 0.0), (2.50, 0.40, 0.80), 400,
+    Stage("5_multi_direction", 1200, (2.50, 0.0, 0.0), (2.50, 0.40, 0.80), 0.33,
           zero_prob=0.3),
     # 20% stops and shorter holds: accelerate, stop, turn and side-step several
     # times per episode, at the top of the envelope.
-    Stage("6_agile", 1400, (2.50, 0.40, 0.80), (2.50, 0.50, 1.00), 300,
+    Stage("6_agile", 1400, (2.50, 0.40, 0.80), (2.50, 0.50, 1.00), 0.21,
           zero_prob=0.2, resampling=(1.5, 3.0)),
 )
 
@@ -139,10 +152,9 @@ def select_stages(
     (``--iters_stageN``), then ``iterations`` (``--iterations`` for every selected
     stage), then the stage's default budget times ``--stage_scale``.
 
-    ``warmup_frac`` turns the ramp into a fraction of that budget, which is what a
-    stage given a much bigger budget than planned needs: stage 2 over 4000
-    iterations should spend the first 2000 growing the range instead of reaching
-    the full width after 150 and sampling there for the rest.
+    ``warmup_frac`` overrides every stage's own fraction -- it is the "this run is
+    much longer than planned, spend proportionally more on the ramp" knob. The
+    resolved absolute warmup is written into the returned ``Stage.warmup``.
 
     ``cmd_scale`` multiplies the *command ranges* -- all three axes, both ends of
     the ramp -- and leaves the budget, the zero-command share and the hold time
@@ -155,6 +167,8 @@ def select_stages(
     per_stage = per_stage or {}
     if cmd_scale <= 0.0:
         raise SystemExit(f"--cmd_scale must be positive, got {cmd_scale}")
+    if warmup_frac is not None and not 0.0 <= warmup_frac <= 1.0:
+        raise SystemExit(f"--warmup_frac must be in [0, 1], got {warmup_frac}")
     if selector == "all":
         indices = list(range(len(STAGES)))
     else:
@@ -182,17 +196,16 @@ def select_stages(
             budget = int(round(stage.iterations * scale))
         if budget <= 0:
             raise SystemExit(f"stage {stage.name} would run {budget} iterations")
-        # Never spend more than half of a trimmed stage on the warmup: with
-        # --stage_scale 0.05 the budget is 35 iterations for stage 2 and a
-        # 300-iteration warmup would hold the new axis near zero the whole run.
-        # A stage with no warmup (stage 1) keeps 0, so it never steals iterations.
-        if warmup_frac is not None and stage.warmup:
-            warmup = min(int(round(budget * warmup_frac)), budget)
-        else:
-            warmup = min(stage.warmup, budget // 2) if stage.warmup else 0
-        out.append((index, Stage(stage.name, budget, _scaled(stage.ranges_from),
-                                 _scaled(stage.ranges_to), warmup, stage.zero_prob,
-                                 stage.resampling)))
+        # The ramp is a share of whatever budget this run gives the stage, so a
+        # 40-iteration smoke run spends 20 on the ramp and a 4000-iteration run
+        # spends 2000 -- same shape, same fraction of life.
+        frac = stage.warmup_frac if warmup_frac is None else warmup_frac
+        warmup = min(int(round(budget * frac)), budget) if frac > 0.0 else 0
+        out.append((index, replace(stage,
+                                   iterations=budget,
+                                   ranges_from=_scaled(stage.ranges_from),
+                                   ranges_to=_scaled(stage.ranges_to),
+                                   warmup=warmup)))
     return out
 
 
@@ -204,6 +217,10 @@ def interpolate_ranges(stage: Stage, done: int,
     the env is built with equals the range the schedule applies on step one.
     """
     span = stage.warmup if warmup is None else max(int(warmup), 0)
+    if span <= 0 and stage.warmup_frac > 0.0:
+        # Raw STAGES entries are not resolved against a budget; fall back to the
+        # published one so a caller that skips select_stages still gets a ramp.
+        span = max(int(round(stage.iterations * stage.warmup_frac)), 0)
     if span <= 0:
         return stage.ranges_to
     t = min(max(done / span, 0.0), 1.0)

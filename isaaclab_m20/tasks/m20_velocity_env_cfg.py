@@ -433,7 +433,18 @@ class EventCfg:
 
     Reset spread is kept even with DR off. It is not domain randomization of the
     robot -- it is the initial condition: without it the policy memorises one
-    exact starting pose and stumbles the first time a real robot starts 3 cm off.
+    exact starting pose and stumbles the first time a real robot starts a couple
+    of centimetres off.
+
+    What it deliberately does *not* do any more is drop the robot from a height.
+    The spread used to include ``z`` up to 3 cm plus ``+-0.10 rad`` of leg offset;
+    at the nominal stance the wheels only just touch the ground, so both of those
+    lifted them by a centimetre or two. The policy sees a speed command from step
+    zero, spins the wheels up while airborne, and lands with a skid -- an
+    unlearnable transient at the start of every episode, in exactly the episodes
+    where the fast bands need clean data. The spread now stays within 6 mm of
+    contact. If drop robustness is wanted later, add it back as its own curriculum
+    stage (0 cm -> 1 cm -> 2 cm) once the flat-ground tracking works.
     """
 
     # -- reset: initial state (always active, nominal values) ----------------
@@ -445,9 +456,21 @@ class EventCfg:
             "pose_range": {
                 "x": (-0.05, 0.05),
                 "y": (-0.05, 0.05),
-                "z": (0.0, 0.03),
-                "roll": (-0.05, 0.05),
-                "pitch": (-0.05, 0.05),
+                # Spawn *on* the ground, not 0-3 cm above it. With a gap here the
+                # robot free-falls for ~78 ms (4 control steps) while the policy
+                # already sees a speed command and spins the wheels up; the wheels
+                # then touch down with a surface speed of up to 2.5 m/s, the
+                # friction cone saturates for a step or two and the episode starts
+                # with a skid. That transient is unlearnable and it poisons the
+                # first advantage estimates of every episode -- which is exactly
+                # what made the high-speed bands look slow. 5 mm is enough to keep
+                # the solver from starting in penetration.
+                "z": (0.0, 0.005),
+                # Tilt also lifts wheels off the ground (half-track 0.30 m, so
+                # 0.05 rad lifts one side by 1.5 cm); 0.02 rad keeps that under
+                # 6 mm while still randomising the start.
+                "roll": (-0.02, 0.02),
+                "pitch": (-0.02, 0.02),
                 "yaw": (-0.30, 0.30),
             },
             "velocity_range": {
@@ -461,7 +484,10 @@ class EventCfg:
         mode="reset",
         params={
             "asset_cfg": leg_obs_cfg(),
-            "position_range": (-0.10, 0.10),
+            # +-0.05 rad, not +-0.10: at the nominal stance the wheels just touch
+            # the ground, so a 0.10 rad knee offset lifts or buries a wheel by
+            # ~2 cm -- the same drop-then-skid artefact as the spawn gap above.
+            "position_range": (-0.05, 0.05),
             "velocity_range": (-0.5, 0.5),
         },
     )

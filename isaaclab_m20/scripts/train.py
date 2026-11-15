@@ -164,7 +164,8 @@ def main() -> None:
             extra = f"  [{', '.join(sampling)}]" if sampling else ""
             print(f"    {stage_label(number + 1, stage):<24} {stage.iterations:5d} it  "
                   f"vx=+-{stage.ranges_to[0]:.2f} vy=+-{stage.ranges_to[1]:.2f} "
-                  f"wz=+-{stage.ranges_to[2]:.2f}  warmup {stage.warmup}{extra}")
+                  f"wz=+-{stage.ranges_to[2]:.2f}  "
+                  f"ramp {stage.warmup}/{stage.iterations} it ({stage.warmup_frac:.0%}){extra}")
 
     experiment_dir = Path(args_cli.log_root, agent_cfg.experiment_name)
     if args_cli.run_name:

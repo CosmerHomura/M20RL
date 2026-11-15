@@ -89,9 +89,10 @@ def stage_relative_iteration(checkpoint: Path, log_root_path: Path,
     """How many iterations into its own stage ``checkpoint`` was written.
 
     Used only to put the command ramp back where it was: a stage interrupted at
-    iteration 400 of its 1000 must resume on the range it was training at, and one
-    interrupted at 400 of its 150 warmup must resume mid-ramp. It is *not* used to
-    decide how much longer the stage has to run -- that is the operator's call.
+    iteration 400 must resume on the range it was training at, which for a
+    400-iteration budget with a 50 % ramp means "past the ramp", while for a
+    1400-iteration budget it still means "mid-ramp". It is *not* used to decide how
+    much longer the stage has to run -- that is the operator's call.
     """
     baseline = stage_baseline(log_root_path, stage_index)
     base = checkpoint_iteration(baseline) if baseline is not None else 0

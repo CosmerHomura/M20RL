@@ -99,6 +99,12 @@ M20_CFG = ArticulationCfg(
         },
         joint_vel={".*": 0.0},
     ),
+    # Left at 1.0 on purpose. The velocity task's ``joint_pos_limits`` term then
+    # measures "past the hard stop", and PhysX clamps joints at the hard stop,
+    # so the term reads 0 except for an occasional spike -- it is an event
+    # detector, not a shaping term, and that is fine. Narrowing the soft range
+    # would give it a band to work in, but changing the joint range of a
+    # machine that is already being trained is not worth it.
     soft_joint_pos_limit_factor=1.0,
     actuators={
         # PD servo loop, the standard legged-robot arrangement: the policy sends
