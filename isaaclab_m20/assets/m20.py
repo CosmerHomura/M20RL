@@ -66,7 +66,14 @@ else:
 M20_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
         usd_path=M20_USD_PATH,
-        activate_contact_sensors=False,
+        # Contact reporting on every rigid body. The velocity task's
+        # ``ContactSensor`` (``undesired_contacts`` and the ``illegal_contact``
+        # termination) resolves ``{ENV_REGEX_NS}/Robot/.*`` and needs the
+        # contact-reporter API on the bodies; without this flag IsaacLab raises
+        # "could not find any bodies with contact reporter API". The standing
+        # task never reads the sensor, so it just pays the (small) reporting
+        # cost -- enabling it here keeps one asset definition for both tasks.
+        activate_contact_sensors=True,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
             retain_accelerations=False,
