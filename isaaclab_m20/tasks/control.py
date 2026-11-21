@@ -183,12 +183,23 @@ class CommandTargetsComputer:
         term = manager.get_term(COMMAND_TERM) if manager is not None else None
         if term is None:
             return torch.zeros(self.env.num_envs, 3, device=self.device)
-        buffer = getattr(term, "vel_command_b", None)
-        if buffer is None:
-            buffer = getattr(term, "command", None)
-        if buffer is None:
-            return torch.zeros(self.env.num_envs, 3, device=self.device)
-        command = buffer[:, :3]
+
+        # An externally pinned command (play / eval via ``M20VelocityEnv.set_command``)
+        # wins over the term's buffer. The term is free to rewrite its own buffer --
+        # it does so on every reset, and in some IsaacLab versions ``vel_command_b``
+        # is a property that hands out a slice rather than a writable attribute --
+        # so reading the pin directly is the only way the policy, the reward and the
+        # diagnostics are guaranteed to see the same numbers.
+        override = getattr(self.env, "command_override", None)
+        if override is not None:
+            command = override[:, :3]
+        else:
+            buffer = getattr(term, "vel_command_b", None)
+            if buffer is None:
+                buffer = getattr(term, "command", None)
+            if buffer is None:
+                return torch.zeros(self.env.num_envs, 3, device=self.device)
+            command = buffer[:, :3]
         frame_yaw = getattr(self, "frame_yaw", 0.0)
         if abs(frame_yaw) < 1e-9:
             return command

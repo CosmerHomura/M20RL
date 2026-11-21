@@ -297,17 +297,25 @@ def run_test(env, policy, test: Test, steps: int, settle_steps: int,
     counted = 0
     falls = 0
 
+    # Reset before measuring: the spawn state has straight legs (``joint_pos`` is
+    # only written by ``reset``), which puts the wheels ~9 cm inside the floor and
+    # makes the solver launch the robot on the first physics step. That transient
+    # would be measured as a fall / a huge tracking error.
+    env.reset()
     obs = env.get_observations()
 
     if probe:
         send_command(env, term, test.command)
         with torch.inference_mode():
             obs, _, _, _ = env.step(policy(obs))
-        live = term.vel_command_b[0, :3]
+        # The pin is authoritative; the term's own buffer is only a mirror (it is
+        # rewritten on resets and may not even be writable in some IsaacLab
+        # versions), so check the pin, not the buffer.
+        pinned = getattr(env.unwrapped, "command_override", None)
+        live = pinned[0, :3] if pinned is not None else term.vel_command_b[0, :3]
         if not torch.allclose(live, command[0], atol=1.0e-3):
             print("[WARN] The test command did not survive env.step: wrote "
-                  f"{command[0].tolist()} but the term holds {live.tolist()}. "
-                  "The command term is still resampling.")
+                  f"{command[0].tolist()} but the env holds {live.tolist()}.")
         seen = obs[0, COMMAND_OBS_SLICE]
         # The last three observation columns are the *resolved* target (body-frame
         # velocity + outer-loop yaw rate), not the raw twist, so compare against

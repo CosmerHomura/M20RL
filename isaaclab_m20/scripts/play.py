@@ -415,6 +415,17 @@ def main() -> None:
     runner.load(str(checkpoint))
     policy = runner.get_inference_policy(device=env.unwrapped.device)
 
+    # Reset once before the first observation. Without this the articulation is
+    # still in its spawn state -- ``init_state.joint_pos`` is only written by
+    # ``reset()``, so the legs are straight while the body sits at z=0.50. Straight
+    # legs put the wheel centres 0.50 m below the hip instead of 0.41 m, i.e. the
+    # wheels are ~9 cm inside the floor, and the solver launches the robot upwards
+    # on the first physics step. That is the "drops in from above, then walks
+    # strangely" startup. Training barely notices (it costs one transition out of
+    # millions and every later episode starts from an explicit reset), but here it
+    # is the *first* state the policy acts from, and it is what you watch.
+    env.reset()
+
     obs = env.get_observations()
     try:
         sliced = obs["policy"] if isinstance(obs, dict) else obs
@@ -498,14 +509,26 @@ def main() -> None:
             write_checked = True
         with torch.inference_mode():
             obs, _, _, _ = env.step(policy(obs))
-        if intended is not None and overwrite_reports < 3:
-            buffer = getattr(command_term, "vel_command_b", None)
-            if buffer is not None:
-                written = torch.tensor(intended, device=buffer.device, dtype=buffer.dtype)
-                if not torch.allclose(buffer[0, :3], written, atol=1.0e-3):
-                    print("[WARN] The command was overwritten inside env.step: wrote "
-                          f"{written.tolist()} but read {buffer[0, :3].tolist()}. "
-                          "Something is still resampling the command term.")
+        if intended is not None and overwrite_reports < 1:
+            # The pin (``command_override``) is what the policy, the reward and the
+            # status line read, so *that* is what has to match. The command term's
+            # own buffer is only a best-effort mirror: it gets rewritten on resets
+            # and, depending on the IsaacLab version, may not even be writable.
+            pinned = getattr(env.unwrapped, "command_override", None)
+            if pinned is not None:
+                written = torch.tensor(intended, device=pinned.device, dtype=pinned.dtype)
+                if not torch.allclose(pinned[0, :3], written, atol=1.0e-3):
+                    print("[WARN] The pinned command does not match the requested one: "
+                          f"asked {written.tolist()} but the env holds "
+                          f"{pinned[0, :3].tolist()}.")
+                    overwrite_reports += 1
+                else:
+                    buffer = getattr(command_term, "vel_command_b", None)
+                    if buffer is not None and not torch.allclose(
+                            buffer[0, :3], written, atol=1.0e-3):
+                        print("[INFO] command term buffer differs from the pin "
+                              f"({buffer[0, :3].tolist()} vs {written.tolist()}); "
+                              "the policy reads the pin, so this is harmless.")
                     overwrite_reports += 1
         timestep += 1
         if args_cli.status_every and timestep % args_cli.status_every == 0:
