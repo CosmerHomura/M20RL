@@ -212,7 +212,7 @@ q̇_eq = 5.3 × 0.09 / (4 × 2) = 0.06 rad/s ≈ 5.4 mm/s
 | --- | --- | --- |
 | `[health] ...` | `train.py`（`--health_every`） | `max\|qdot\|`、`max\|v\|`、`z` 区间、`\|v_xy\|`、`stand=/move=/rot=`（模式占比）、`w*`、`rew`、`neg`、`lr=`、`sig=`、`fall_rew`、`timeout_rew` |
 | `[terms] ...` | `train.py`（`--per_term_every`，默认 200 轮） | 18 项各自的每步贡献与回合累计（每步贡献 = 原始项 × 权重 × `step_dt`），外加 `[track] stand/move/rot` 分行 |
-| `[status] ...` | `play.py`（`--status_every`，默认 50 步 = 1 s） | `cmd=`（人给的指令）、`obs_cmd=`（策略实际收到的那 3 维）、`mode=`、`v*`/`w*`（解算目标）、`\|v_xy\|`、`wz`、`h`、`tilt`、`qdot_leg`、`qdot_wheel`、`w=[...]`（四个轮子的带符号转速） |
+| `[status] ...` | `play.py`（`--status_every`，默认 50 步 = 1 s） | `cmd=`（人给的指令）、`obs_cmd=`（策略实际收到的那 3 维）、`mode=`、`v*`/`w*`（解算目标）、`\|v_xy\|`、`wz`、`h`、`tilt`、`sym=`（左右对称度：`max\|q_left−q_right\|` over hipx/hipy/knee 的 fl↔fr、hl↔hr，rad）、`qdot_leg`、`qdot_wheel`、`w=[...]`（四个轮子的带符号转速） |
 | 表格 | `eval.py` | 12 组固定指令的 RMSE / 倾角 / 摔倒率 / 零指令 `drift` |
 
 `play` 里"给了指令但不动"，按这个顺序看：`obs_cmd` 是否等于你给的指令（不等 = 指令没进策略）→ `mode=` 是否从 `stand` 变成 `move`（没变 = 模式标签没写进去，驻车环也还锁着轮子）→ `w=[...]` 四个轮子的符号是否一致且同向（交替 = 轮子互相抵消，全 ≈0 = 策略根本没给轮子指令）→ `qdot_wheel` 大而 `|v_xy|` 小 = 轮子在转但没抓地（腿把机身撑住了）。

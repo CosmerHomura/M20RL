@@ -372,10 +372,32 @@ def status_line(env, command_term, wheel_ids, timestep: int, obs=None) -> str:
     except Exception:  # noqa: BLE001 - a status line must never stop playback
         pass
 
+    # Left/right symmetry of the stance: max |q_left - q_right| over the paired
+    # hipx/hipy/knee joints (fl vs fr, hl vs hr). 0 means a perfectly mirrored
+    # pose. Nothing in the reward asks for symmetry, so a policy is free to drive
+    # asymmetrically -- with the two rear wheels at different fore/aft positions,
+    # for instance -- and this is the number that shows it.
+    symmetry = 0.0
+    try:
+        names = list(unwrapped.scene["robot"].joint_names)
+        position = unwrapped.scene["robot"].data.joint_pos[0]
+        worst = 0.0
+        for kind in ("hipx", "hipy", "knee"):
+            for left, right in (("fl", "fr"), ("hl", "hr")):
+                left_name, right_name = f"{left}_{kind}_joint", f"{right}_{kind}_joint"
+                if left_name in names and right_name in names:
+                    delta = abs(float(position[names.index(left_name)]
+                                      - position[names.index(right_name)]))
+                    worst = max(worst, delta)
+        symmetry = worst
+    except Exception:  # noqa: BLE001 - a status line must never stop playback
+        pass
+
     seconds = timestep * unwrapped.step_dt
     return (f"[status] t={seconds:5.1f}s {command}{mode_text}{targets_text}{observed}"
             f"|v_xy|={speed:.3f} {frame_text}wz={wz:+.2f} "
-            f"h={height:.3f} tilt={tilt:4.1f}deg qdot_leg={qdot_leg:5.1f} "
+            f"h={height:.3f} tilt={tilt:4.1f}deg sym={symmetry:4.2f}rad "
+            f"qdot_leg={qdot_leg:5.1f} "
             f"qdot_wheel={qdot_wheel:6.2f}{wheels_text} standing={standing}")
 
 
